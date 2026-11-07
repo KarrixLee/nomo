@@ -23,9 +23,10 @@
 
 import { readdir, readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { antigravityAdapter, claudeAdapter, codexAdapter, cursorAdapter, opencodeAdapter } from "../core/adapter";
+import { antigravityAdapter, claudeAdapter, codexAdapter, cursorAdapter, devinAdapter, opencodeAdapter } from "../core/adapter";
+import { devinInstallerActive, devinPluginInstalled, devinPluginLockPath } from "../core/devin";
 import {
-  AgentKind, ANTIGRAVITY_HOOK_MARKER, antigravityConfigDir, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, CURSOR_HOOK_MARKER, cursorHome, flagExists,
+  AgentKind, ANTIGRAVITY_HOOK_MARKER, antigravityConfigDir, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, CURSOR_HOOK_MARKER, cursorHome, DEVIN_HOOK_MARKER, devinConfigDir, flagExists,
   LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
   opencodeStubPaths, opencodeStubTarget, PLUGIN_VERSION, SESSION_TRACE_PATH, SESSIONS_DIR,
   WATCHDOG_PID_PATH,
@@ -103,6 +104,11 @@ export interface StatusDeps {
   /** Antigravity's global hooks.json and liveness stamp — injected so a test never reads ~/.gemini. */
   antigravityHooksPath?: string;
   lastHookAntigravityPath?: string;
+  /** Devin's user config.json, plugin lock.json and liveness stamp — injected so a test never reads
+   *  ~/.config/devin or ~/.local/share/devin. */
+  devinConfigPath?: string;
+  devinPluginLockPath?: string;
+  lastHookDevinPath?: string;
   isAlive?: (pid: number) => boolean;
   now?: () => number;
   /** Beginner mode (`--plain`, what Antigravity's /nomo-status runs): instead of the readout, a few
@@ -136,10 +142,16 @@ const AGENT_UI: Record<AgentKind, { name: string; pair: string; approvalsOn: str
   cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
   // Antigravity's own /nomo-* skills (the "nomo" plugin the installer puts in ~/.gemini/config/plugins).
   antigravity: { name: "Antigravity", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
+  // Devin via `nomo-ai --devin`: the user-level /nomo-* skills devin-install.mjs writes to
+  // ~/.config/devin/skills. The native plugin's skills are DEVIN_PLUGIN_UI below.
+  devin: { name: "Devin", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
 };
 
+/** Devin with the native plugin (and no nomo-ai checkout): the plugin's own /nomo:* skills. */
+const DEVIN_PLUGIN_UI = { name: "Devin", pair: "/nomo:pair", approvalsOn: "/nomo:approvals on", status: "/nomo:status" };
+
 /** Fixed order, so two runs on the same machine never disagree about where to look. */
-const AGENT_ORDER: AgentKind[] = ["claude", "codex", "opencode", "cursor", "antigravity"];
+const AGENT_ORDER: AgentKind[] = ["claude", "codex", "opencode", "cursor", "antigravity", "devin"];
 
 /** Value column. Top-level rows pad the label to it; an agent's rows indent 2 and pad to it minus 2,
  *  so every value on the screen starts in the same column and the eye can run straight down it. Wide
@@ -461,6 +473,12 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const lastHookCursorPath = deps.lastHookCursorPath ?? cursorAdapter.hookStampPath();
   const antigravityHooksPath = deps.antigravityHooksPath ?? `${antigravityConfigDir()}/hooks.json`;
   const lastHookAntigravityPath = deps.lastHookAntigravityPath ?? antigravityAdapter.hookStampPath();
+  const devinConfigPath = deps.devinConfigPath ?? `${devinConfigDir()}/config.json`;
+  const devinConfigText = await readFile(devinConfigPath, "utf8").catch(() => "");
+  // The same two facts the bundle's stand-down reads (core/devin.ts), so this row cannot disagree with it.
+  const devinViaHooks = devinInstallerActive(devinConfigText);
+  const devinViaPlugin = devinPluginInstalled(await readFile(deps.devinPluginLockPath ?? devinPluginLockPath(), "utf8").catch(() => ""));
+  const lastHookDevinPath = deps.lastHookDevinPath ?? devinAdapter.hookStampPath();
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
@@ -470,7 +488,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   const audience = deps.audience;
   /** The commands to name in a fix. With no calling agent there is no right prefix to suggest, so the
    *  no-argument render falls back to Claude's — the same thing it did before this change. */
-  const ui = AGENT_UI[audience ?? "claude"];
+  const ui = audience === "devin" && devinViaPlugin && !devinViaHooks ? DEVIN_PLUGIN_UI : AGENT_UI[audience ?? "claude"];
 
   // ── header ────────────────────────────────────────────────────────────────────────────────────
   // The build, because every bug report starts with "which version?" and nothing else on this screen
@@ -557,7 +575,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   // Session records, split by the agent that wrote them. "Tracked sessions: 4" was machine-wide and so
   // answered nobody's question; what a reader wants is how many of those are THEIRS. A record with no
   // `agent` key predates the Codex work and is Claude's by definition (same rule the watchdog uses).
-  const perAgent: Record<string, number> = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0 };
+  const perAgent: Record<string, number> = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0, devin: 0 };
   let totalSessions = 0;
   try {
     for (const name of await readdir(sessionsDir)) {
@@ -807,6 +825,27 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     problems: antigravityHooks.problem ? [antigravityHooks.problem] : [],
   };
 
+  // Devin — Cursor's twin. Installed = our status hook named in ~/.config/devin/config.json, or the
+  // native plugin in Devin's lock.json. Both → the plugin stands down (core/devin.ts).
+  const devinInstalled = devinConfigText.includes(DEVIN_HOOK_MARKER) || devinViaPlugin;
+  const devinInstall = devinViaPlugin && devinViaHooks ? "both installed — plugin idle (Nomo uses the nomo-ai hooks)"
+    : devinViaPlugin ? "plugin" : devinConfigText.includes(DEVIN_HOOK_MARKER) ? "hooks (nomo-ai --devin)" : undefined;
+  const devinHooks = await hooksRow("devin", {
+    installed: devinInstalled, sessionsDir: devinAdapter.sessionsDir(),
+    match: devinAdapter.sessionMatch, stampPath: lastHookDevinPath,
+    hint: devinAdapter.hooksNotFiringHint,
+  });
+  const devinReport: AgentReport = {
+    kind: "devin", present: devinInstalled || perAgent.devin! > 0 || devinHooks.stamp > 0,
+    hooksLabel: "Hooks", hooks: devinHooks.value, sessions: sessionText(perAgent.devin!),
+    sessionCount: perAgent.devin!,
+    detail: [
+      ...(devinInstall ? [["Install", devinInstall] as [string, string]] : []),
+      ["Mode", "sessions show on your phone; answer its prompts and questions, or interrupt it"],
+    ],
+    problems: devinHooks.problem ? [devinHooks.problem] : [],
+  };
+
   if (deps.plain) {
     const approvalsOn = await localApprovalsState(noHoldPath) === "on";
     const lastSendTs = await readMsMarker(lastSendPath);
@@ -819,7 +858,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   }
 
   // ── render ────────────────────────────────────────────────────────────────────────────────────
-  const reports: Record<AgentKind, AgentReport> = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport, antigravity: antigravityReport };
+  const reports: Record<AgentKind, AgentReport> = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport, antigravity: antigravityReport, devin: devinReport };
   if (audience) {
     // The subject, in full and immediately under the machine facts.
     renderOwn(reports[audience], `${AGENT_UI[audience].name} — you are here`, print);
@@ -882,14 +921,14 @@ export function plainStatusLines(s: {
  *  hand-run bundle, must keep working exactly as it did. */
 export function parseAudience(argv: readonly string[]): AgentKind | undefined {
   for (const arg of argv) {
-    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor" || arg === "antigravity") return arg;
+    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor" || arg === "antigravity" || arg === "devin") return arg;
   }
   return undefined;
 }
 
 if (import.meta.main) {
   if (process.argv.includes("--check")) {
-    console.log("usage: status [claude|codex|opencode|cursor|antigravity] [--plain] [--check]  — show pairing, delivery and per-agent health (--plain: a few lines in plain words)");
+    console.log("usage: status [claude|codex|opencode|cursor|antigravity|devin] [--plain] [--check]  — show pairing, delivery and per-agent health (--plain: a few lines in plain words)");
     process.exit(0);
   }
   process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)), plain: process.argv.includes("--plain") }));

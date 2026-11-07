@@ -2,19 +2,19 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/status-cmd.ts
-import { readdir as readdir2, readFile as readFile3, stat as stat3 } from "node:fs/promises";
+import { readdir as readdir5, readFile as readFile5, stat as stat5 } from "node:fs/promises";
 import { join as join3 } from "node:path";
 
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
 import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
-import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
-import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -106,7 +106,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.4.0";
+var PLUGIN_VERSION = "2.5.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -290,6 +290,10 @@ function antigravityConfigDir() {
   return `${process.env.HOME}/.gemini/config`;
 }
 var ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
+function devinConfigDir() {
+  return `${process.env.HOME}/.config/devin`;
+}
+var DEVIN_HOOK_MARKER = "devin-status.mjs";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -733,6 +737,7 @@ async function completePendingPairing(pending, configPath, opts = {}) {
     e2eKeyB64: b64url(e2eKey),
     ...pending.machineName ? { machineName: pending.machineName } : {}
   }), CONFIG_MODE);
+  await forgetAllDevinGrants(opts.sessionsDir ?? join(dirname(configPath), "sessions"));
   for (let attempt = 0;attempt < ackAttempts; attempt++) {
     try {
       await fetchFn(`${pending.url}/v1/cc/pair/ack`, {
@@ -960,6 +965,18 @@ async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERR
 }
 async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
   await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
+}
+var DEVIN_GRANTS_SUFFIX = ".devin-allow";
+function devinGrantsPath(sessionsDir, sessionId) {
+  return `${sessionsDir}/${sessionId}${DEVIN_GRANTS_SUFFIX}`;
+}
+async function forgetDevinGrants(recordPath) {
+  if (recordPath.endsWith(".json"))
+    await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
+}
+async function forgetAllDevinGrants(sessionsDir = SESSIONS_DIR) {
+  const files = await readdir(sessionsDir).catch(() => []);
+  await Promise.all(files.filter((f) => f.endsWith(DEVIN_GRANTS_SUFFIX)).map((f) => unlink(`${sessionsDir}/${f}`).catch(() => {})));
 }
 async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
@@ -2086,6 +2103,9 @@ var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
 function cursorHostInvocation(input, env = process.env) {
   return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
 }
+function devinHostInvocation(input, env = process.env) {
+  return env.DEVIN_PROJECT_DIR !== undefined && typeof input === "object" && input !== null && !Array.isArray(input) && !("transcript_path" in input);
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -2193,7 +2213,7 @@ var ROLLOUT_SCAN_MAX_HEADS = 40;
 var ROLLOUT_META_HEAD_BYTES = 64 * 1024;
 async function listNumericDirsDesc(path) {
   try {
-    return (await readdir(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+    return (await readdir2(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
   } catch {
     return [];
   }
@@ -2209,7 +2229,7 @@ async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
           const dir = join2(sessions, y, m, d);
           let names;
           try {
-            names = await readdir(dir);
+            names = await readdir2(dir);
           } catch {
             continue;
           }
@@ -2588,7 +2608,7 @@ async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
       for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
         let names;
         try {
-          names = await readdir(join2(sessions, y, m, d));
+          names = await readdir2(join2(sessions, y, m, d));
         } catch {
           names = [];
         }
@@ -3046,6 +3066,46 @@ var antigravityAdapter = {
   interrupt: "hook-flag",
   interruptFlagSuffix: ".agy-interrupt"
 };
+function devinSessionsDb() {
+  return `${process.env.HOME ?? ""}/.local/share/devin/cli/sessions.db`;
+}
+function devinSessionMeta(sessionId, db = devinSessionsDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return {};
+  const cell = sqliteOne(db, `select json_object('t',title,'m',model,'w',working_directory) from sessions where id='${sessionId}'`, env, true);
+  if (!cell)
+    return {};
+  try {
+    const row = JSON.parse(cell);
+    const s = (v) => typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
+    const title = s(row.t)?.endsWith("...") ? undefined : s(row.t), model = s(row.m), cwd = s(row.w);
+    return {
+      ...title ? { title: truncateOnWord(title.replace(/\s+/g, " ")) } : {},
+      ...model ? { model: model.slice(0, 80) } : {},
+      ...cwd ? { cwd } : {}
+    };
+  } catch {
+    return {};
+  }
+}
+var devinAdapter = {
+  kind: "devin",
+  title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ sessionId }) => devinSessionMeta(sessionId).model,
+  detectInterrupt: () => false,
+  sessionsDir: () => `${process.env.HOME ?? ""}/.local/share/devin/cli`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("devin"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --devin` again, then restart devin (`/hooks` shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => devinSessionMeta(sessionId).title
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "devin" },
+  interrupt: "hook-flag",
+  answerExtras: true
+};
 function unknownAgentAdapter(kind) {
   return {
     kind,
@@ -3071,6 +3131,8 @@ function adapterFor(agent) {
       return cursorAdapter;
     case "antigravity":
       return antigravityAdapter;
+    case "devin":
+      return devinAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -3079,6 +3141,1489 @@ function adapterFor(agent) {
 }
 var allAdapters = [claudeAdapter, codexAdapter];
 
+// src/core/devin.ts
+import { existsSync as existsSync3, readFileSync as readFileSync2 } from "node:fs";
+import { unlink as unlink4 } from "node:fs/promises";
+import { hostname as hostname3 } from "node:os";
+
+// src/core/cursor.ts
+import { hostname as hostname2 } from "node:os";
+import { realpathSync } from "node:fs";
+import { readdir as readdir4, stat as stat4, unlink as unlink3 } from "node:fs/promises";
+
+// src/core/hook.ts
+import { readdir as readdir3, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
+import { hostname } from "node:os";
+import { basename as basename3 } from "node:path";
+
+// src/core/notify-wire.ts
+import { readFile as readFile3, stat as stat3 } from "node:fs/promises";
+var NOMO_NOTIFY_ENTRY = "codex-notify";
+function nomoNotifyProgram(home) {
+  return `${home}/.config/cc-status/hook-shim.sh`;
+}
+function isNomoNotifyChain(arr) {
+  const prog = arr[0] ?? "";
+  if (/(^|\/)notify-chain\.sh$/.test(prog))
+    return true;
+  return /(^|\/)hook-shim\.sh$/.test(prog) && arr[1] === NOMO_NOTIFY_ENTRY;
+}
+function referencesNomoNotify(text) {
+  if (text.includes("notify-chain.sh"))
+    return true;
+  return text.includes("hook-shim.sh") && text.includes(NOMO_NOTIFY_ENTRY);
+}
+function arrayReferencesNomoNotify(arr) {
+  return isNomoNotifyChain(arr) || arr.some((s) => referencesNomoNotify(s));
+}
+function sameCommand(a, b) {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+function unwrapNotify(arr) {
+  if (arr.length === 0)
+    return null;
+  if (isNomoNotifyChain(arr)) {
+    const sep = arr.indexOf("--");
+    if (sep === -1)
+      return null;
+    return unwrapNotify(arr.slice(sep + 1));
+  }
+  const i = arr.indexOf("--previous-notify");
+  if (i !== -1 && i + 1 < arr.length && referencesNomoNotify(arr[i + 1] ?? "")) {
+    const host = [...arr.slice(0, i), ...arr.slice(i + 2)];
+    let embedded = null;
+    try {
+      embedded = JSON.parse(arr[i + 1]);
+    } catch {}
+    if (Array.isArray(embedded) && embedded.every((x) => typeof x === "string")) {
+      const inner = unwrapNotify(embedded);
+      if (inner !== null && inner.length > 0 && !sameCommand(inner, host)) {
+        return [...arr.slice(0, i), "--previous-notify", JSON.stringify(inner), ...arr.slice(i + 2)];
+      }
+    }
+    return host;
+  }
+  return [...arr];
+}
+function wireNotifyArray(existing, program) {
+  const orig = existing && existing.length > 0 ? unwrapNotify(existing) : null;
+  return orig && orig.length > 0 ? [program, NOMO_NOTIFY_ENTRY, "--", ...orig] : [program, NOMO_NOTIFY_ENTRY];
+}
+function parseNotifyFromToml(toml) {
+  for (const line of toml.split(`
+`)) {
+    if (/^\s*\[/.test(line))
+      break;
+    const m = line.match(/^\s*notify\s*=\s*(.*)$/);
+    if (!m)
+      continue;
+    try {
+      const parsed = JSON.parse(m[1]);
+      if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) {
+        return { present: true, value: parsed };
+      }
+    } catch {}
+    return { present: true, value: null };
+  }
+  return { present: false, value: null };
+}
+function replaceNotifyInToml(toml, arr) {
+  const line = `notify = ${JSON.stringify(arr)}`;
+  const lines = toml.split(`
+`);
+  let firstTable = -1;
+  for (let i = 0;i < lines.length; i++) {
+    if (/^\s*\[/.test(lines[i])) {
+      firstTable = i;
+      break;
+    }
+    if (/^\s*notify\s*=/.test(lines[i])) {
+      lines[i] = line;
+      return lines.join(`
+`);
+    }
+  }
+  if (firstTable === -1) {
+    const sep = toml.length === 0 || toml.endsWith(`
+`) ? "" : `
+`;
+    return `${toml}${sep}${line}
+`;
+  }
+  lines.splice(firstTable, 0, line, "");
+  return lines.join(`
+`);
+}
+function tomlMayNeedNotifyRepair(toml, program) {
+  const flat = toml.includes("\\") ? toml.split("\\").join("") : toml;
+  if (flat.includes("notify-chain.sh"))
+    return true;
+  if (!flat.includes("hook-shim.sh"))
+    return false;
+  return !flat.includes(program);
+}
+async function repairNotifyWiring(deps = {}) {
+  try {
+    const home = deps.home ?? process.env.HOME ?? "";
+    if (home.length === 0)
+      return "unchanged";
+    const program = nomoNotifyProgram(home);
+    const tomlPath = deps.tomlPath ?? `${codexHome()}/config.toml`;
+    let toml;
+    try {
+      toml = await readFile3(tomlPath, "utf8");
+    } catch {
+      return "unchanged";
+    }
+    if (!tomlMayNeedNotifyRepair(toml, program))
+      return "unchanged";
+    const parsed = parseNotifyFromToml(toml);
+    if (!parsed.present || parsed.value === null)
+      return "refused";
+    if (!arrayReferencesNomoNotify(parsed.value))
+      return "refused";
+    const next = wireNotifyArray(parsed.value, program);
+    if (sameCommand(next, parsed.value))
+      return "unchanged";
+    const mode = ((await stat3(tomlPath).catch(() => null))?.mode ?? 384) & 511;
+    const bak = `${tomlPath}.bak-nomo`;
+    try {
+      await readFile3(bak);
+    } catch {
+      await atomicWrite(bak, toml, mode);
+    }
+    await atomicWrite(tomlPath, replaceNotifyInToml(toml, next), mode);
+    return "repaired";
+  } catch {
+    return "refused";
+  }
+}
+
+// src/core/session-state.ts
+var SESSION_STATE_STALE_MS = 86400000;
+var STATE_HOLD_MAX_AGE_MS = 600000;
+var CC_STATUS_MAX_AGE_MS = 600000;
+var CC_STATUS_FUTURE_SKEW_MS = 5000;
+var CC_PROC_START_TOLERANCE_MS = 5000;
+var CC_IDLE_DONE_GRACE_MS = 3000;
+var MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+function parseCcProcStart(value) {
+  if (typeof value !== "string")
+    return;
+  const m = /^\s*[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})\s*$/.exec(value);
+  if (!m)
+    return;
+  const month = MONTHS.indexOf(m[1].toLowerCase());
+  if (month < 0)
+    return;
+  const day = Number(m[2]);
+  const utc = Date.UTC(Number(m[6]), month, day, Number(m[3]), Number(m[4]), Number(m[5]));
+  if (!Number.isFinite(utc))
+    return;
+  return new Date(utc).getUTCDate() === day ? utc : undefined;
+}
+function parseCcSessionFile(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+    return null;
+  const f = parsed;
+  if (typeof f.pid !== "number" || !Number.isFinite(f.pid))
+    return null;
+  if (typeof f.sessionId !== "string" || f.sessionId.length === 0)
+    return null;
+  const str = (key) => typeof f[key] === "string" && f[key].length > 0 ? f[key] : undefined;
+  const num = (key) => typeof f[key] === "number" && Number.isFinite(f[key]) ? f[key] : undefined;
+  return {
+    pid: f.pid,
+    sessionId: f.sessionId,
+    ...str("cwd") ? { cwd: str("cwd") } : {},
+    ...num("startedAt") !== undefined ? { startedAt: num("startedAt") } : {},
+    ...str("procStart") ? { procStart: str("procStart") } : {},
+    ...str("version") ? { version: str("version") } : {},
+    ...str("kind") ? { kind: str("kind") } : {},
+    ...str("entrypoint") ? { entrypoint: str("entrypoint") } : {},
+    ...str("name") ? { name: str("name") } : {},
+    ...str("nameSource") ? { nameSource: str("nameSource") } : {},
+    ...str("status") ? { status: str("status") } : {},
+    ...num("updatedAt") !== undefined ? { updatedAt: num("updatedAt") } : {},
+    ...num("statusUpdatedAt") !== undefined ? { statusUpdatedAt: num("statusUpdatedAt") } : {}
+  };
+}
+function ccOpinion(file, join, now) {
+  if (!file)
+    return null;
+  if (typeof join.pid !== "number" || !Number.isFinite(join.pid) || file.pid !== join.pid)
+    return null;
+  if (file.sessionId !== join.sessionId)
+    return null;
+  const probed = join.procStartedAt;
+  if (typeof probed !== "number" || !Number.isFinite(probed))
+    return null;
+  const claimed = typeof file.startedAt === "number" && Number.isFinite(file.startedAt) ? file.startedAt : parseCcProcStart(file.procStart);
+  if (typeof claimed !== "number")
+    return null;
+  if (Math.abs(claimed - probed) > CC_PROC_START_TOLERANCE_MS)
+    return null;
+  if (file.status !== "busy" && file.status !== "idle")
+    return null;
+  const at = file.statusUpdatedAt;
+  if (typeof at !== "number" || !Number.isFinite(at))
+    return null;
+  if (now - at >= CC_STATUS_MAX_AGE_MS)
+    return null;
+  if (at - now > CC_STATUS_FUTURE_SKEW_MS)
+    return null;
+  return {
+    status: file.status,
+    statusUpdatedAt: at,
+    ...file.name && file.nameSource === "derived" ? { name: file.name } : {}
+  };
+}
+var finite = (value) => typeof value === "number" && Number.isFinite(value);
+var filled = (value) => typeof value === "string" && value.length > 0;
+function buildStatePlaintext(record, status, at, titleFallback, sessionId) {
+  const agent = record.agent ?? "claude";
+  const branch = sessionBranch(record);
+  const base = {
+    status,
+    title: filled(record.title) ? record.title : filled(titleFallback) ? titleFallback : "",
+    machine: typeof record.machine === "string" ? record.machine : "",
+    label: typeof record.label === "string" ? record.label : "",
+    ...adapterFor(agent).blobAgentFields,
+    ...finite(record.turnStartedAt) ? { turnStartedAt: record.turnStartedAt } : {},
+    ...filled(record.model) ? { model: record.model } : {},
+    at: Math.floor(at / 1000),
+    ...filled(record.folderKey) ? { folderKey: record.folderKey } : {},
+    ...branch ? { branch } : {},
+    ...sidField(sessionId)
+  };
+  const dbg = agent === "codex" ? formatPlanPickerDebug({
+    event: status === "done" ? "done" : "working",
+    classifier: status === "done" ? "done" : "resolved",
+    marker: "0",
+    by: "wd"
+  }) : undefined;
+  return appendFittedPlanAndDebug(base, adapterFor(agent).ambientPlan ? record.planFull : undefined, dbg);
+}
+function stateHoldLive(hold, holdPidAlive, now) {
+  if (!hold || !filled(hold.blob))
+    return false;
+  if (!finite(hold.at))
+    return false;
+  if (now - hold.at > STATE_HOLD_MAX_AGE_MS)
+    return false;
+  if (!finite(hold.pid) || holdPidAlive !== true)
+    return false;
+  return true;
+}
+function computeSessionState(input) {
+  const { sessionId, record, pairingId, hold, pidAlive, holdPidAlive, cc, ccProcStartedAt, correctives, now } = input;
+  if (record === null) {
+    return { state: "ended", terminal: true, ts: now, why: "reap", blob: { kind: "last" }, agent: "claude" };
+  }
+  if (!filled(record.blob))
+    return null;
+  if (pairingId === undefined || record.pairingId !== pairingId)
+    return null;
+  const agent = record.agent ?? "claude";
+  const ts = finite(record.ts) ? record.ts : now;
+  const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
+  const sealed = { kind: "sealed", value: record.blob };
+  const asking = record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {};
+  const authored = (value) => ({ kind: "plain", value, ...agent === "antigravity" ? { carry: record.blob } : {} });
+  const of = (state, why, blob, at, terminal = false) => ({ state, terminal, ts: at, why, blob, agent, ...startedAt });
+  if (correctives?.ended === true)
+    return of("ended", "end", sealed, ts, true);
+  if (record.op === "end")
+    return of("ended", "end", sealed, ts, true);
+  if (finite(record.ts) && now - record.ts > SESSION_STATE_STALE_MS)
+    return of("ended", "stale", sealed, ts, true);
+  if (!pidAlive)
+    return of("ended", "reap", sealed, ts, true);
+  const ccUsable = agent === "claude" && record.provisional !== true;
+  const opinion = ccUsable ? ccOpinion(cc, { pid: record.pid, sessionId, procStartedAt: ccProcStartedAt }, now) : null;
+  const suffix = (base) => agent === "codex" ? `${base}/cx` : base;
+  const recordDone = correctives?.done === true || record.op === "done" || record.lastEvent === "done";
+  if (recordDone) {
+    const heldBack = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
+    if (!heldBack) {
+      return of("done", opinion?.status === "idle" ? "done+cc" : suffix("done"), authored(buildStatePlaintext(record, "done", ts, opinion?.name, sessionId)), ts, false);
+    }
+  }
+  if (stateHoldLive(hold, holdPidAlive, now)) {
+    return {
+      state: "decisionPending",
+      terminal: false,
+      ts,
+      why: "hold",
+      blob: { kind: "sealed", value: hold.blob },
+      agent,
+      ...startedAt,
+      ...asking
+    };
+  }
+  if (!recordDone && opinion?.status === "idle" && record.prio !== 1 && record.lastEvent !== "needsAttention" && opinion.statusUpdatedAt > ts + CC_IDLE_DONE_GRACE_MS) {
+    return of("done", "done+cc", authored(buildStatePlaintext(record, "done", opinion.statusUpdatedAt, opinion.name, sessionId)), ts, false);
+  }
+  if (record.prio === 1) {
+    const why = finite(record.attentionStalledAt) ? "attn/net" : "attn";
+    return { ...of("needsAttention", why, sealed, ts, false), ...asking };
+  }
+  const busy = opinion?.status === "busy" && opinion.statusUpdatedAt > ts;
+  return of("working", busy ? "work+cc" : suffix("work"), recordDone ? authored(buildStatePlaintext(record, "working", opinion?.statusUpdatedAt ?? ts, opinion?.name, sessionId)) : sealed, ts, false);
+}
+
+// src/core/hook.ts
+var TOOL_DETAIL = { ...claudeToolDetail, ...codexToolDetail };
+function sessionOrigin(input, ppid = process.ppid, command = pidCommand(ppid)) {
+  const stringField = (key) => typeof input[key] === "string" && input[key].length > 0 ? input[key] : undefined;
+  return {
+    hook_event_name: stringField("hook_event_name") ?? "",
+    ...stringField("source") ? { source: stringField("source") } : {},
+    ...stringField("agent_id") ? { agent_id: stringField("agent_id") } : {},
+    ...stringField("agent_type") ? { agent_type: stringField("agent_type") } : {},
+    ...stringField("cwd") ? { cwd: stringField("cwd") } : {},
+    ppid,
+    ...typeof command === "string" && command.length > 0 ? { ppid_command: command } : {}
+  };
+}
+function detailForHook(hookName, toolName, toolInput) {
+  if (hookName === "PreToolUse" && toolName === "request_user_input") {
+    return requestUserInputDetail(toolInput);
+  }
+  if (hookName === "PreToolUse" && toolName === COMPUTER_USE_ACCESS_TOOL) {
+    return computerUseAccessDetail(toolInput);
+  }
+  if (hookName === "PreToolUse")
+    return toolName ? TOOL_DETAIL[toolName] : undefined;
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure")
+    return "thinking";
+  return;
+}
+function isPermissionNotification(i) {
+  const type = typeof i.notification_type === "string" ? i.notification_type : "";
+  if (type.length > 0)
+    return type === "permission_prompt" || type === "worker_permission_prompt";
+  const msg = (typeof i.message === "string" ? i.message : "").toLowerCase();
+  return msg.includes("permission") || msg.includes("approve") || msg.includes("allow");
+}
+var ATTENTION_NOTIFICATIONS = new Set(["elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"]);
+function hasRunningBackgroundAgent(input) {
+  const tasks = input.background_tasks;
+  return Array.isArray(tasks) && tasks.some((t) => {
+    const task = t;
+    return typeof task === "object" && task !== null && task.type === "subagent" && (task.status === "running" || task.status === "pending");
+  });
+}
+var HOLD_YIELDING_EVENTS = new Set([
+  "PostToolUseFailure",
+  "PreCompact",
+  "PostCompact",
+  "Elicitation",
+  "ElicitationResult"
+]);
+function yieldsToLiveHold(hookName, input) {
+  if (HOLD_YIELDING_EVENTS.has(hookName))
+    return true;
+  if (hookName === "Stop")
+    return hasRunningBackgroundAgent(input);
+  if (hookName === "Notification")
+    return !isPermissionNotification(input);
+  return false;
+}
+async function sessionHoldIsLive(sessionsDir, sessionId, now = Date.now(), alive = pidAlive) {
+  const hold = await readDecisionHoldAt(sessionsDir, sessionId);
+  return stateHoldLive(hold, hold !== null && typeof hold.pid === "number" ? alive(hold.pid) : false, now);
+}
+var USER_BLOCKING_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode", "request_user_input", COMPUTER_USE_ACCESS_TOOL]);
+var INTERRUPT_STOP_REASON = "Interrupted from Nomo";
+function interruptHookOutput(hookName) {
+  if (hookName === "PreToolUse") {
+    return JSON.stringify({
+      continue: false,
+      stopReason: INTERRUPT_STOP_REASON,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: INTERRUPT_STOP_REASON
+      }
+    });
+  }
+  if (hookName === "PostToolUse" || hookName === "PostToolUseFailure") {
+    return JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
+  }
+  return null;
+}
+function clearsInterruptFlag(hookName, input = {}) {
+  if (hookName === "Stop")
+    return !hasRunningBackgroundAgent(input);
+  return hookName === "UserPromptSubmit" || hookName === "StopFailure" || hookName === "SessionEnd";
+}
+function interruptedEventInput(input) {
+  return { ...input, hook_event_name: "Stop" };
+}
+function planOp(hookName, input, sentDone) {
+  switch (hookName) {
+    case "SessionStart":
+      if (sentDone && input.source === "compact")
+        return null;
+      return sentDone ? { op: "update", prio: 0, status: "working" } : { op: "start", prio: 0, status: "working" };
+    case "PreToolUse": {
+      const tool = typeof input.tool_name === "string" ? input.tool_name : "";
+      return USER_BLOCKING_TOOLS.has(tool) ? { op: "update", prio: 1, status: "needsAttention" } : { op: "update", prio: 0, status: "working" };
+    }
+    case "UserPromptSubmit":
+    case "PostToolUse":
+      return { op: "update", prio: 0, status: "working" };
+    case "PostToolUseFailure":
+      return input.is_interrupt === true ? null : { op: "update", prio: 0, status: "working" };
+    case "Notification":
+      if (!isPermissionNotification(input) && !(typeof input.notification_type === "string" && ATTENTION_NOTIFICATIONS.has(input.notification_type)))
+        return null;
+      return { op: "update", prio: 1, status: "needsAttention" };
+    case "PermissionRequest":
+    case "Elicitation":
+      return { op: "update", prio: 1, status: "needsAttention" };
+    case "ElicitationResult":
+      return { op: "update", prio: 0, status: "working" };
+    case "PreCompact":
+    case "PostCompact":
+      return input.trigger === "manual" || sentDone ? null : { op: "update", prio: 0, status: "working" };
+    case "Stop":
+      return hasRunningBackgroundAgent(input) ? { op: "update", prio: 0, status: "working" } : { op: "done", prio: 0, status: "done" };
+    case "StopFailure":
+    case "Interrupt":
+      return { op: "done", prio: 0, status: "done" };
+    case "SessionEnd":
+      return { op: "end", prio: 0, status: "done" };
+    default:
+      return null;
+  }
+}
+var TITLE_SCAN_BYTES = 128 * 1024;
+function transcriptStartMs(prefix) {
+  for (const line of prefix.split(`
+`)) {
+    if (!line.includes('"timestamp"'))
+      continue;
+    let row;
+    try {
+      row = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof row !== "object" || row === null)
+      continue;
+    const ts = row.timestamp;
+    if (typeof ts !== "string")
+      continue;
+    const ms = Date.parse(ts);
+    if (Number.isFinite(ms))
+      return ms;
+  }
+  return;
+}
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride) {
+  const folder = folderIdentity(input.cwd, pinnedFolder);
+  const { label, folderKey } = folder;
+  const branch = sessionBranch(folder);
+  const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+  const detail = detailOverride ?? (hookName === "Stop" && hasRunningBackgroundAgent(input) ? TOOL_DETAIL.Task : detailForHook(hookName, typeof input.tool_name === "string" ? input.tool_name : undefined, input.tool_input));
+  const base = {
+    status: plan.status,
+    title: title ?? "",
+    machine,
+    label,
+    ...detail ? { detail } : {},
+    ...agent === "claude" ? {} : { agent },
+    ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
+    ...typeof model === "string" && model.length > 0 ? { model } : {},
+    ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
+    ...folderKey ? { folderKey } : {},
+    ...branch ? { branch } : {},
+    ...sidField(input.session_id)
+  };
+  const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
+    event: hookName || "event",
+    classifier: plan.status === "needsAttention" ? "attn" : plan.status === "working" ? "work" : "done",
+    by: "h"
+  }) : undefined;
+  return appendFittedPlanAndDebug(base, proposedPlan, dbg);
+}
+async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride, extraFields) {
+  if (typeof input !== "object" || input === null)
+    return null;
+  const i = input;
+  if (typeof i.session_id !== "string" || i.session_id.length === 0)
+    return null;
+  const hookName = typeof i.hook_event_name === "string" ? i.hook_event_name : "";
+  const plan = planOverride ?? planOp(hookName, i, sentDone);
+  if (!plan)
+    return null;
+  const base = { v: 2, sessionId: i.session_id, op: plan.op, prio: plan.prio, ts: now };
+  if (typeof startedAt === "number" && Number.isFinite(startedAt))
+    base.startedAt = startedAt;
+  const at = Math.floor(now / 1000);
+  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
+  try {
+    onBlobPlaintext?.(plaintext);
+  } catch {}
+  const blob = await encryptBlob(e2eKey, plaintext);
+  const attentionKind = attentionKindOverride ?? (agent === "codex" && hookName === "PreToolUse" && i.tool_name === "request_user_input" ? "userInput" : undefined);
+  return { ...base, ...attentionKind ? { attentionKind } : {}, blob };
+}
+async function attentionDetailOf(record, e2eKey) {
+  if (record?.lastEvent !== "needsAttention" || typeof record.blob !== "string")
+    return;
+  try {
+    const detail = (await decryptBlob(e2eKey, record.blob)).detail;
+    return typeof detail === "string" && detail.length > 0 ? detail : undefined;
+  } catch {
+    return;
+  }
+}
+function buildPendingStash(input, machine, title, now, pid = process.ppid, agent = "claude", model) {
+  if (typeof input.session_id !== "string" || input.session_id.length === 0)
+    return null;
+  const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+  const plan = planOp(hookName, input, false);
+  if (!plan || plan.op === "end")
+    return null;
+  const turnStartedAt = hookName === "UserPromptSubmit" ? Math.floor(now / 1000) : undefined;
+  const at = Math.floor(now / 1000);
+  return { sessionId: input.session_id, op: plan.op, prio: plan.prio, blob: buildBlob(input, machine, title, plan, agent, turnStartedAt, undefined, model, at), stashedAt: now, pid };
+}
+async function stashPendingEvent(input, machine, title, now, stashPath = PENDING_STASH_PATH, pid = process.ppid, agent = "claude", model) {
+  try {
+    const stash = buildPendingStash(input, machine, title, now, pid, agent, model);
+    if (!stash)
+      return;
+    await atomicWrite(stashPath, JSON.stringify(stash), 384);
+  } catch {}
+}
+async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull, awaitingPrompt = false) {
+  try {
+    const path = `${sessionsDir}/${sessionId}.json`;
+    if (op === "end") {
+      await unlink2(path).catch(() => {});
+      await unlink2(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
+      await unlink2(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+      return;
+    }
+    const recordedAt = Date.now();
+    const { label, folderKey, cwd, gitDir } = typeof folder === "string" ? { label: folder, folderKey: undefined, cwd: undefined, gitDir: undefined } : folder;
+    const record = {
+      pid,
+      machine,
+      label,
+      ...folderKey ? { folderKey } : {},
+      ...cwd ? { cwd } : {},
+      ...gitDir ? { gitDir } : {},
+      ts: recordedAt,
+      transcript,
+      lastEvent: op === "start" ? "sessionStart" : status,
+      sentDone: op === "done",
+      ...op === "done" ? { donePending: true } : {},
+      op,
+      prio,
+      ...blob ? { blob } : {},
+      ...agent === "claude" ? {} : { agent },
+      ...typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {},
+      ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
+      ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},
+      ...typeof title === "string" && title.length > 0 ? { title } : {},
+      ...typeof model === "string" && model.length > 0 ? { model } : {},
+      ...typeof pairingId === "string" && pairingId.length > 0 ? { pairingId } : {},
+      ...pendingPlanPicker ? { pendingPlanPicker: true } : {},
+      ...planPickerVerificationPending ? { planPickerVerificationPending: true } : {},
+      ...pendingPlanPicker || planPickerVerificationPending ? { planPickerPendingSince: recordedAt } : {},
+      ...typeof dbg === "string" && dbg.length > 0 ? { dbg } : {},
+      ...origin ? { origin } : {},
+      ...attentionKind ? { attentionKind } : {},
+      ...typeof planFull === "string" && planFull.length > 0 ? { planFull } : {},
+      ...awaitingPrompt ? { awaitingPrompt: true } : {}
+    };
+    await atomicWrite(path, JSON.stringify(record), 384);
+  } catch {}
+}
+async function trackSession(sessionId, op, prio, status, blob, machine, folder, transcript, agent = "claude", sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker = false, pid = process.ppid, origin, planPickerVerificationPending = false, dbg, attentionKind, planFull, awaitingPrompt = false) {
+  return trackSessionAt(SESSIONS_DIR, sessionId, op, prio, status, blob, machine, folder, transcript, agent, sessionStartedAt, turnStartedAt, turnId, title, pairingId, model, pendingPlanPicker, pid, origin, planPickerVerificationPending, dbg, attentionKind, planFull, awaitingPrompt);
+}
+async function markDoneDeliveredAt(sessionsDir, sessionId) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record || record.donePending !== true)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, donePending: undefined }), 384);
+  } catch {}
+}
+async function markDoneDelivered(sessionId) {
+  return markDoneDeliveredAt(SESSIONS_DIR, sessionId);
+}
+async function markUpdatePendingAt(sessionsDir, sessionId, blob) {
+  try {
+    const record = await readRecord(sessionId, sessionsDir);
+    if (!record || !blob || record.blob !== blob || record.op === "done" || record.updatePending === true)
+      return;
+    await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...record, updatePending: true }), 384);
+  } catch {}
+}
+async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath = LAST_SEND_PATH, trace = traceSession) {
+  try {
+    const stamp = async (path) => {
+      try {
+        return Number.parseInt((await readFile4(path, "utf8")).trim(), 10) || 0;
+      } catch {
+        return 0;
+      }
+    };
+    const streakStart = await stamp(failPath);
+    if (streakStart > 0 && streakStart > await stamp(lastSendPath))
+      return false;
+    await atomicWrite(failPath, String(Date.now()));
+    trace({ event: "post-failed", ...event });
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function reconcileProvisional(config, hookPid) {
+  try {
+    const files = await readdir3(SESSIONS_DIR).catch(() => []);
+    const provisionals = [];
+    for (const f of files) {
+      if (!f.endsWith(".json"))
+        continue;
+      let r;
+      try {
+        r = JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8"));
+      } catch {
+        continue;
+      }
+      if (r.provisional === true && typeof r.pid === "number")
+        provisionals.push({ sessionId: basename3(f, ".json"), pid: r.pid });
+    }
+    if (provisionals.length === 0)
+      return;
+    const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
+    if (!sentinel)
+      return;
+    let delivered = false;
+    try {
+      const res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
+        body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
+        signal: AbortSignal.timeout(2000)
+      });
+      delivered = res.ok;
+    } catch {}
+    if (delivered)
+      await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
+  } catch {}
+}
+async function readTrackedSessions() {
+  const files = await readdir3(SESSIONS_DIR).catch(() => []);
+  const out = [];
+  for (const f of files) {
+    if (!f.endsWith(".json"))
+      continue;
+    try {
+      const r = JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8"));
+      out.push({ sessionId: basename3(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
+    } catch {}
+  }
+  return out;
+}
+async function retireLineageSession(config, sessionId, agent, input, reason) {
+  let delivered = false;
+  try {
+    const res = await fetch(`${config.url}/v1/cc/event`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION,
+        "x-cc-approvals": await localApprovalsState()
+      },
+      body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
+      signal: AbortSignal.timeout(2000)
+    });
+    delivered = res.ok;
+  } catch {}
+  await unlink2(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+  traceSession({
+    event: "retire",
+    sessionId,
+    agent,
+    hook_event_name: input.hook_event_name,
+    source: input.source,
+    reason,
+    delivered
+  });
+}
+async function readStdin() {
+  const chunks = [];
+  for await (const chunk of process.stdin)
+    chunks.push(chunk);
+  return Buffer.concat(chunks).toString("utf8");
+}
+async function runHook(agent) {
+  let fullUpload;
+  try {
+    const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
+    const input = JSON.parse(raw);
+    if (agent === "claude" && cursorHostInvocation(input))
+      return;
+    if (agent === "claude" && devinHostInvocation(input))
+      return;
+    if (typeof input.session_id !== "string" || input.session_id.length === 0)
+      return;
+    if (agent === "claude" && (typeof input.turn_id === "string" && input.turn_id.length > 0 || typeof input.transcript_path === "string" && input.transcript_path.includes("/.codex/"))) {
+      agent = "codex";
+    }
+    const adapter2 = adapterFor(agent);
+    await atomicWrite(lastHookPath(agent), String(Date.now())).catch(() => {});
+    if (agent === "codex" && input.hook_event_name === "SessionStart") {
+      await repairNotifyWiring().catch(() => {});
+    }
+    const transcriptPath = typeof input.transcript_path === "string" ? input.transcript_path : "";
+    let prefixCache;
+    const getPrefix = async () => {
+      if (prefixCache !== undefined)
+        return prefixCache;
+      prefixCache = "";
+      if (transcriptPath.length > 0) {
+        try {
+          prefixCache = await readPrefix(transcriptPath, TITLE_SCAN_BYTES);
+        } catch {}
+      }
+      return prefixCache;
+    };
+    const readTitle = async () => adapter2.title({ sessionId: input.session_id, prefix: await getPrefix(), input, transcriptPath });
+    const readModel = async () => adapter2.model?.({ sessionId: input.session_id, prefix: await getPrefix(), input, transcriptPath });
+    if (!config) {
+      const pending = await loadPendingConfig();
+      if (pending) {
+        const machine = pending.machineName ?? hostname().replace(/\.local$/, "");
+        await stashPendingEvent(input, machine, await readTitle(), Date.now(), PENDING_STASH_PATH, process.ppid, agent, await readModel());
+      }
+      return;
+    }
+    const machine = config.machineName ?? hostname().replace(/\.local$/, "");
+    const reportedSessionId = input.session_id;
+    const hookName = typeof input.hook_event_name === "string" ? input.hook_event_name : "";
+    let interrupted = false;
+    if (adapter2.interrupt === "hook-flag") {
+      if (clearsInterruptFlag(hookName, input)) {
+        await clearInterruptFlagAt(SESSIONS_DIR, reportedSessionId);
+      } else {
+        const line = interruptHookOutput(hookName);
+        if (line !== null && await interruptFlagSetAt(SESSIONS_DIR, reportedSessionId, Date.now())) {
+          interrupted = true;
+          await new Promise((resolve) => {
+            process.stdout.on("error", () => resolve());
+            try {
+              process.stdout.write(`${line}
+`, () => resolve());
+            } catch {
+              resolve();
+            }
+          });
+        }
+      }
+    }
+    const sessionStartSource = typeof input.source === "string" ? input.source : "";
+    const hookPid = process.ppid;
+    const hookCommand = pidCommand(hookPid);
+    let sessionId = reportedSessionId;
+    let eventInput = input;
+    let reusedForkPredecessor = false;
+    let existingRecord = await readRecord(reportedSessionId);
+    if (existingRecord?.agent === "codex" && typeof existingRecord.retiredAt === "number" && Number.isFinite(existingRecord.retiredAt))
+      existingRecord = null;
+    let trackedCache;
+    const trackedSessions = async () => {
+      if (trackedCache === undefined)
+        trackedCache = await readTrackedSessions();
+      return trackedCache;
+    };
+    const suppress = (suppression, extra = {}) => traceSession({
+      event: "suppress",
+      sessionId: reportedSessionId,
+      agent,
+      hook_event_name: hookName,
+      ...sessionStartSource ? { source: sessionStartSource } : {},
+      ...suppression,
+      ...extra
+    });
+    const companionBroker = agent === "codex" ? codexCompanionBrokerEvidence(hookPid, pidAncestors, pidCommand) : null;
+    if (companionBroker) {
+      const reason = `broker ancestry proven by ${companionBroker.matchedBy}`;
+      if (existingRecord) {
+        await retireLineageSession(config, reportedSessionId, agent, input, `codex companion ${reason}`);
+      }
+      suppress({
+        guard: "codex-companion-broker",
+        reason
+      }, {
+        brokerPid: companionBroker.pid,
+        brokerMatch: companionBroker.matchedBy
+      });
+      return;
+    }
+    const clearLineage = !existingRecord && hookName === "SessionStart" && sessionStartSource === "clear" && adapter2.clearPredecessor;
+    if (clearLineage && adapter2.clearPredecessor) {
+      const predecessor = adapter2.clearPredecessor({
+        sessionId: reportedSessionId,
+        hookPid,
+        tracked: await trackedSessions()
+      });
+      if (predecessor) {
+        await retireLineageSession(config, predecessor, agent, input, "claude SessionStart source:clear");
+        trackedCache = trackedCache?.filter((t) => t.sessionId !== predecessor);
+      }
+    }
+    if (!existingRecord && hookName === "SessionStart" && adapter2.forkResumePredecessor) {
+      const predecessor = adapter2.forkResumePredecessor(hookCommand);
+      const predecessorRecord = predecessor ? await readRecord(predecessor) : null;
+      if (predecessor && predecessorRecord) {
+        sessionId = predecessor;
+        eventInput = { ...input, session_id: predecessor };
+        existingRecord = predecessorRecord;
+        reusedForkPredecessor = true;
+        suppress({
+          guard: "claude-fork-reemission",
+          reason: "daemon fork/resume SessionStart reused the already-tracked predecessor row"
+        }, { predecessorSessionId: predecessor, effectiveSessionId: predecessor });
+      }
+    }
+    if (!existingRecord && adapter2.isChildSessionGhost) {
+      const tracked = await trackedSessions();
+      if (tracked.length > 0 && adapter2.isChildSessionGhost({
+        sessionId: reportedSessionId,
+        prefix: await getPrefix(),
+        hookPid,
+        tracked
+      })) {
+        suppress({
+          guard: "codex-child-session",
+          reason: "never-tracked empty child id shares a pid with a tracked Codex session"
+        });
+        return;
+      }
+    }
+    if (!existingRecord && adapter2.sessionCreationSuppression) {
+      const suppression = await adapter2.sessionCreationSuppression({
+        sessionId: reportedSessionId,
+        prefix: await getPrefix(),
+        transcriptPath,
+        input
+      });
+      if (suppression) {
+        suppress(suppression);
+        return;
+      }
+    }
+    const promptBearingHook = hookName === "UserPromptSubmit" && typeof input.prompt === "string" && input.prompt.trim().length > 0;
+    const continuedForkPrompt = promptBearingHook && !!adapter2.forkResumePredecessor?.(hookCommand);
+    if (!existingRecord && !continuedForkPrompt && adapter2.isHeadlessInvocation && adapter2.isHeadlessInvocation({
+      pid: hookPid,
+      ancestorsOf: pidAncestors,
+      commandOf: pidCommand
+    })) {
+      suppress({
+        guard: "claude-headless-invocation",
+        reason: "invoking process or ancestor matches a non-interactive/daemon discriminator"
+      });
+      return;
+    }
+    if (!existingRecord && !promptBearingHook && adapter2.isDesktopInvocation?.({
+      pid: hookPid,
+      ancestorsOf: pidAncestors,
+      commandOf: pidCommand
+    })) {
+      suppress({
+        guard: "claude-desktop-no-prompt",
+        reason: "never-tracked desktop-app session id has not carried a user prompt yet"
+      });
+      return;
+    }
+    const title = await readTitle() ?? existingRecord?.title;
+    if (!existingRecord && clearLineage && !title) {
+      suppress({
+        guard: "claude-clear-untitled",
+        reason: "clear-lineage SessionStart has no prompt/title yet"
+      });
+      return;
+    }
+    const model = await readModel() ?? existingRecord?.model;
+    const sentDone = existingRecord?.sentDone === true;
+    const cachedStart = typeof existingRecord?.sessionStartedAt === "number" && Number.isFinite(existingRecord.sessionStartedAt) ? existingRecord.sessionStartedAt : undefined;
+    const startedAt = cachedStart ?? transcriptStartMs(await getPrefix());
+    const cachedTurn = typeof existingRecord?.turnStartedAt === "number" && Number.isFinite(existingRecord.turnStartedAt) ? existingRecord.turnStartedAt : undefined;
+    const isTurnOpener = hookName === "UserPromptSubmit" || hookName === "SessionStart" && sessionStartSource !== "compact";
+    const turnStartedAt = isTurnOpener ? Math.floor(Date.now() / 1000) : cachedTurn;
+    const awaitingPrompt = hookName === "SessionStart" && !reusedForkPredecessor && (existingRecord ? sentDone || existingRecord.awaitingPrompt === true : sessionStartSource !== "compact");
+    const turnId = typeof input.turn_id === "string" && input.turn_id.length > 0 ? input.turn_id : undefined;
+    if (interrupted)
+      eventInput = interruptedEventInput(eventInput);
+    let plan = planOp(interrupted ? "Stop" : hookName, input, sentDone);
+    if (!plan)
+      return;
+    if (!interrupted && yieldsToLiveHold(hookName, input) && await sessionHoldIsLive(SESSIONS_DIR, sessionId)) {
+      traceSession({ event: "hold-yield", sessionId, agent, hook_event_name: hookName });
+      return;
+    }
+    let pendingPlanPicker = false;
+    let planPickerVerificationPending = false;
+    let attentionKind;
+    let proposedPlan;
+    let pickerClassifier = plan.op === "done" ? "none" : plan.status;
+    if (hookName === "Stop" && plan.op === "done" && adapter2.completedTurnWaitState) {
+      const evidence = adapter2.completedTurnWaitEvidence ? await adapter2.completedTurnWaitEvidence({ pid: hookPid, transcriptPath }) : { state: await adapter2.completedTurnWaitState({ pid: hookPid, transcriptPath }) };
+      const wait = evidence.state;
+      pickerClassifier = wait;
+      if (wait === "pending") {
+        plan = { op: "update", prio: 1, status: "needsAttention" };
+        attentionKind = "userInput";
+        pendingPlanPicker = true;
+        proposedPlan = evidence.plan;
+      } else if (wait === "incomplete") {
+        plan = { op: "update", prio: 0, status: "working" };
+        planPickerVerificationPending = true;
+      }
+    }
+    const folder = folderIdentity(input.cwd, existingRecord);
+    const dbg = agent === "codex" ? formatPlanPickerDebug({
+      event: hookName || "event",
+      classifier: pickerClassifier,
+      marker: pendingPlanPicker ? "p" : planPickerVerificationPending ? "v" : "0",
+      ttl: pendingPlanPicker || planPickerVerificationPending ? "0m" : "-",
+      by: "h"
+    }) : undefined;
+    let planFull;
+    const keptDetail = hookName === "Notification" && plan.status === "needsAttention" ? await attentionDetailOf(existingRecord, config.e2eKey) : undefined;
+    const envelope = await buildEnvelope(eventInput, machine, Date.now(), title, config.e2eKey, sentDone, agent, startedAt, turnStartedAt, folder, model, plan, attentionKind, proposedPlan, dbg, (plaintext) => {
+      planFull = fullTextForRecord(proposedPlan, plaintext.plan);
+    }, keptDetail);
+    if (!envelope)
+      return;
+    fullUpload = postFullText(config, sessionId, "plan", planFull);
+    const createsRecord = !existingRecord && plan.op !== "end";
+    const retiresRecord = !!existingRecord && plan.op === "end";
+    const origin = existingRecord?.origin ?? sessionOrigin(input, hookPid, hookCommand);
+    const recordPid = reusedForkPredecessor ? existingRecord.pid : hookPid;
+    const recordTranscript = reusedForkPredecessor ? existingRecord.transcript ?? transcriptPath : transcriptPath;
+    await trackSession(sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, recordTranscript, agent, startedAt, turnStartedAt, turnId, title, config.pairingId, model, pendingPlanPicker, recordPid, origin, planPickerVerificationPending, dbg, envelope.attentionKind, planFull, awaitingPrompt);
+    const clearedPickerMarker = pendingPlanPicker === false && planPickerVerificationPending === false && (existingRecord?.pendingPlanPicker === true || existingRecord?.planPickerVerificationPending === true || existingRecord?.planPickerSettled === true);
+    if (agent === "codex" && (hookName === "Stop" || pendingPlanPicker || planPickerVerificationPending || clearedPickerMarker)) {
+      tracePlanPickerDecision(sessionId, {
+        source: "hook",
+        classifier: pickerClassifier,
+        marker: pendingPlanPicker ? "set-pending" : planPickerVerificationPending ? "set-verification" : clearedPickerMarker ? "cleared" : "none",
+        correctionPosted: false,
+        ...plan.op === "done" ? { doneBy: "hook" } : {}
+      });
+    }
+    if (createsRecord) {
+      traceSession({
+        event: "create",
+        sessionId,
+        agent,
+        hook_event_name: hookName,
+        ...sessionStartSource ? { source: sessionStartSource } : {},
+        origin
+      });
+    } else if (retiresRecord) {
+      traceSession({
+        event: "retire",
+        sessionId,
+        agent,
+        hook_event_name: hookName,
+        ...sessionStartSource ? { source: sessionStartSource } : {},
+        reason: "hook op:end"
+      });
+    }
+    ensureWatchdog();
+    if (agent === "codex")
+      await reconcileProvisional(config, hookPid);
+    const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
+    const postStarted = Date.now();
+    let res;
+    try {
+      res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          "x-cc-approvals": await localApprovalsState()
+        },
+        body: JSON.stringify(envelope),
+        signal: AbortSignal.timeout(2000)
+      });
+    } catch (e) {
+      if (plan.op !== "done" && plan.op !== "end")
+        await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob);
+      await traceSendFailure({
+        ...failure,
+        ms: Date.now() - postStarted,
+        error: e?.name === "TimeoutError" ? "timeout" : "network"
+      });
+      return;
+    }
+    if (!res.ok)
+      await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
+    if (res.ok) {
+      await atomicWrite(LAST_SEND_PATH, String(Date.now()));
+      await resetGoneStrikes();
+      if (plan.op === "done")
+        await markDoneDelivered(sessionId);
+    } else if (res.status === 404 || res.status === 410) {
+      const strikes = await recordGoneStrike();
+      if (strikes >= GONE_STRIKE_LIMIT) {
+        await removeRevokedConfig();
+        process.stderr.write(`[nomo-cc] pairing gone server-side (HTTP ${res.status}) — removed local pairing; re-pair with \`nomo-cc pair\` to reconnect
+`);
+      }
+    } else {
+      await resetGoneStrikes();
+    }
+  } catch {} finally {
+    await fullUpload;
+  }
+}
+
+// src/opencode/state.ts
+async function postOcEvent(config, envelope) {
+  try {
+    const res = await fetch(`${config.url}/v1/cc/event`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION,
+        "x-cc-approvals": await localApprovalsState()
+      },
+      body: JSON.stringify(envelope),
+      signal: AbortSignal.timeout(2000)
+    });
+    if (!res.ok)
+      return false;
+    await atomicWrite(LAST_SEND_PATH, String(Date.now())).catch(() => {});
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/core/cursor.ts
+var EVENT_KINDS = {
+  sessionStart: "start",
+  beforeSubmitPrompt: "prompt",
+  postToolUse: "tool",
+  postToolUseFailure: "tool",
+  afterShellExecution: "tool",
+  afterFileEdit: "tool",
+  afterMCPExecution: "tool",
+  afterAgentThought: "tool",
+  afterAgentResponse: "tool",
+  stop: "stop",
+  sessionEnd: "end"
+};
+var str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
+function cursorEventKind(input) {
+  const name = str(input.hook_event_name) ?? str(input.hookEventName);
+  if (name)
+    return EVENT_KINDS[name];
+  if (typeof input.prompt === "string")
+    return "prompt";
+  if (typeof input.reason === "string")
+    return "end";
+  if (typeof input.tool_name === "string")
+    return "tool";
+  if (typeof input.status === "string")
+    return "stop";
+  return;
+}
+var SAFE_ID = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/;
+function cursorSessionIds(input) {
+  const out = [];
+  for (const key of ["conversation_id", "conversationId", "session_id", "sessionId"]) {
+    const v = input[key];
+    if (typeof v === "string" && SAFE_ID.test(v) && !out.includes(v))
+      out.push(v);
+  }
+  return out;
+}
+function isCursorInvocation(input, env = process.env) {
+  return cursorHostInvocation(input, env);
+}
+var CURSOR_UNKNOWN_OWNER_PID = 1;
+var CURSOR_OWNER_RETRY_MS = 600000;
+var APP_BUNDLE = /^\/(?:(?! \/).)*\/Cursor\.app\/Contents\/MacOS\/Cursor(?:\s|$)/;
+var CLI_BUNDLED = /\/cursor-agent\/versions\/[^/]+\/[^/]+$/;
+var argv0 = (command) => command.trimStart().split(/\s/, 1)[0] ?? "";
+var basename4 = (path) => path.slice(path.lastIndexOf("/") + 1);
+function isCliProcess(command, resolve) {
+  const exe = argv0(command);
+  const name = basename4(exe);
+  if (name === "cursor-agent" || CLI_BUNDLED.test(exe))
+    return true;
+  return name === "agent" && /\/cursor-agent\//.test(resolve(exe) ?? "");
+}
+function isAppProcess(command) {
+  return APP_BUNDLE.test(command) || /^[Cc]ursor$/.test(basename4(argv0(command)));
+}
+function cursorOwnerPid(chain, resolve = () => {
+  return;
+}) {
+  const cli = chain.find((p) => p.command !== undefined && isCliProcess(p.command, resolve));
+  if (cli)
+    return cli.pid;
+  for (let i = chain.length - 1;i >= 0; i--) {
+    const command = chain[i].command;
+    if (command !== undefined && isAppProcess(command))
+      return chain[i].pid;
+  }
+  return;
+}
+function resolveOwnerPid() {
+  const pids = [process.ppid, ...pidAncestors(process.ppid)];
+  return cursorOwnerPid(pids.map((pid) => ({ pid, command: pidCommand(pid) })), (path) => {
+    try {
+      return path.startsWith("/") ? realpathSync(path) : undefined;
+    } catch {
+      return;
+    }
+  });
+}
+var CURSOR_KEEPALIVE_MS = 15000;
+function planCursor(kind, input, record, now) {
+  const generation = str(input.generation_id) ?? str(input.generationId);
+  const nowSec = Math.floor(now / 1000);
+  if (!record) {
+    return kind === "prompt" ? { op: "start", prio: 0, status: "working", turnStartedAt: nowSec, generation } : null;
+  }
+  const cachedTurn = typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? record.turnStartedAt : undefined;
+  const isDone = record.op === "done" || record.lastEvent === "done";
+  const turn = str(record.turnId);
+  const stopSeen = typeof record.stoppedGeneration === "string";
+  const foreign = generation !== undefined && turn !== undefined && generation !== turn;
+  switch (kind) {
+    case "prompt":
+      return { op: "update", prio: 0, status: "working", turnStartedAt: nowSec, generation };
+    case "tool":
+      if (isDone) {
+        if (stopSeen || foreign)
+          return null;
+        return { op: "update", prio: 0, status: "working", turnStartedAt: cachedTurn, generation: turn };
+      }
+      if (typeof record.ts === "number" && now - record.ts < CURSOR_KEEPALIVE_MS)
+        return null;
+      return { op: "update", prio: 0, status: "working", turnStartedAt: cachedTurn, generation: turn };
+    case "stop":
+      if (foreign)
+        return null;
+      if (isDone && stopSeen && record.donePending !== true)
+        return null;
+      return { op: "done", prio: 0, status: "done", turnStartedAt: cachedTurn, generation: turn, stoppedGeneration: generation ?? turn ?? "" };
+    case "end":
+      return { op: "end", prio: 0, status: "done", turnStartedAt: cachedTurn, generation: turn };
+    default:
+      return null;
+  }
+}
+var CURSOR_IGNORED_DIR = `${CC_DIR}/cursor-ignored`;
+var IGNORED_TTL_MS = 86400000;
+async function markIgnored(dir, ids, now) {
+  for (const id of ids)
+    await atomicWrite(`${dir}/${id}`, "", 384);
+  for (const name of await readdir4(dir).catch(() => [])) {
+    const path = `${dir}/${name}`;
+    const s = await stat4(path).catch(() => null);
+    if (s && now - s.mtimeMs > IGNORED_TTL_MS)
+      await unlink3(path).catch(() => {});
+  }
+}
+async function isIgnored(dir, ids) {
+  for (const id of ids)
+    if (await stat4(`${dir}/${id}`).then(() => true, () => false))
+      return true;
+  return false;
+}
+async function runCursorHook(raw, deps = {}) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+      return;
+    const input = parsed;
+    if (!isCursorInvocation(input, deps.env ?? process.env))
+      return;
+    const now = (deps.now ?? Date.now)();
+    await atomicWrite(deps.stampPath ?? lastHookPath("cursor"), String(now)).catch(() => {});
+    const kind = cursorEventKind(input);
+    const ids = cursorSessionIds(input);
+    if (!kind || ids.length === 0)
+      return;
+    const ignoredDir = deps.ignoredDir ?? CURSOR_IGNORED_DIR;
+    if (input.is_background_agent === true) {
+      await markIgnored(ignoredDir, ids, now).catch(() => {});
+      return;
+    }
+    if (kind === "start")
+      return;
+    const config = deps.config !== undefined ? deps.config : await loadConfig();
+    if (!config)
+      return;
+    const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+    let sessionId = ids[0];
+    let record = null;
+    for (const id of ids) {
+      const found = await readRecord(id, sessionsDir);
+      if (found) {
+        sessionId = id;
+        record = found;
+        break;
+      }
+    }
+    if (record && record.agent !== "cursor")
+      return;
+    const plan = planCursor(kind, input, record, now);
+    if (!plan)
+      return;
+    if (!record && await isIgnored(ignoredDir, ids))
+      return;
+    const machine = config.machineName ?? hostname2().replace(/\.local$/, "");
+    const roots = Array.isArray(input.workspace_roots) ? input.workspace_roots : [];
+    const cwd = str(roots[0]) ?? str(input.cwd);
+    const folder = folderIdentity(cwd, record);
+    const title = (kind === "tool" || kind === "stop" ? (deps.chatTitle ?? cursorChatTitle)(sessionId) : undefined) ?? record?.title ?? await cursorAdapter.title({ sessionId, prefix: "", input });
+    const model = cursorModel(input) ?? record?.model;
+    const startedAt = typeof record?.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt) ? record.sessionStartedAt : now;
+    const transcript = str(input.transcript_path) ?? record?.transcript ?? "";
+    let pid = record?.pid;
+    let ownerCheckedAt = typeof record?.ownerCheckedAt === "number" ? record.ownerCheckedAt : undefined;
+    const retryDue = pid === CURSOR_UNKNOWN_OWNER_PID && kind === "prompt" && (ownerCheckedAt === undefined || now - ownerCheckedAt >= CURSOR_OWNER_RETRY_MS);
+    if (typeof pid !== "number" || retryDue) {
+      pid = (deps.ownerPid ?? resolveOwnerPid)() ?? CURSOR_UNKNOWN_OWNER_PID;
+      if (pid !== CURSOR_UNKNOWN_OWNER_PID && !pidAlive(pid))
+        pid = CURSOR_UNKNOWN_OWNER_PID;
+      ownerCheckedAt = now;
+    }
+    if (pid !== CURSOR_UNKNOWN_OWNER_PID)
+      ownerCheckedAt = undefined;
+    const envelope = await buildEnvelope({ session_id: sessionId, ...cwd ? { cwd } : {} }, machine, now, title, config.e2eKey, false, "cursor", startedAt, plan.turnStartedAt, folder, model, { op: plan.op, prio: plan.prio, status: plan.status });
+    if (!envelope)
+      return;
+    const origin = record?.origin ?? {
+      hook_event_name: str(input.hook_event_name) ?? kind,
+      ...cwd ? { cwd } : {},
+      ppid: process.ppid
+    };
+    await trackSessionAt(sessionsDir, sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, transcript, "cursor", startedAt, plan.turnStartedAt, plan.generation, title, config.pairingId, model, false, pid, origin);
+    const stoppedGeneration = plan.stoppedGeneration ?? (kind === "prompt" ? undefined : record?.stoppedGeneration);
+    if (plan.op !== "end" && (stoppedGeneration !== undefined || ownerCheckedAt !== undefined)) {
+      const written = await readRecord(sessionId, sessionsDir);
+      if (written) {
+        await atomicWrite(`${sessionsDir}/${sessionId}.json`, JSON.stringify({ ...written, stoppedGeneration, ownerCheckedAt }), 384);
+      }
+    }
+    const trace = deps.trace ?? traceSession;
+    if (!record)
+      trace({ event: "create", sessionId, agent: "cursor", hook_event_name: origin.hook_event_name, origin });
+    else if (plan.op === "end")
+      trace({ event: "retire", sessionId, agent: "cursor", reason: "hook op:end" });
+    (deps.ensureWatchdog ?? ensureWatchdog)();
+    const delivered = await (deps.post ?? postOcEvent)(config, envelope);
+    if (delivered && plan.op === "done")
+      await markDoneDeliveredAt(sessionsDir, sessionId);
+  } catch {}
+}
+
+// src/core/devin.ts
+var EVENT_KINDS2 = {
+  UserPromptSubmit: "prompt",
+  PostToolUse: "tool",
+  PermissionRequest: "permission",
+  Stop: "stop",
+  SessionEnd: "end"
+};
+var DEVIN_ASK_TOOL = "ask_user_question";
+var str2 = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
+function devinEventKind(input) {
+  const name = str2(input.hook_event_name);
+  if (name === "PreToolUse")
+    return input.tool_name === DEVIN_ASK_TOOL ? "ask" : undefined;
+  return name ? EVENT_KINDS2[name] : undefined;
+}
+var SAFE_ID2 = /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$/;
+function planDevin(kind, input, record, now) {
+  const promptId = str2(input.prompt_id);
+  const nowSec = Math.floor(now / 1000);
+  if (!record) {
+    return kind === "prompt" ? { op: "start", prio: 0, status: "working", turnStartedAt: nowSec, promptId } : null;
+  }
+  const cachedTurn = typeof record.turnStartedAt === "number" && Number.isFinite(record.turnStartedAt) ? record.turnStartedAt : undefined;
+  const turn = str2(record.turnId);
+  const isDone = record.op === "done" || record.lastEvent === "done";
+  const working = { op: "update", prio: 0, status: "working", turnStartedAt: cachedTurn, promptId: turn };
+  switch (kind) {
+    case "prompt":
+      return { op: "update", prio: 0, status: "working", turnStartedAt: nowSec, promptId };
+    case "tool":
+      if (isDone)
+        return promptId !== undefined && promptId === turn ? working : null;
+      if (record.lastEvent === "needsAttention")
+        return working;
+      if (typeof record.ts === "number" && now - record.ts < CURSOR_KEEPALIVE_MS)
+        return null;
+      return working;
+    case "ask":
+    case "permission":
+      if (isDone && !(promptId !== undefined && promptId === turn))
+        return null;
+      return { op: "update", prio: 1, status: "needsAttention", turnStartedAt: cachedTurn, promptId: turn };
+    case "stop":
+      if (isDone && record.donePending !== true)
+        return null;
+      return { op: "done", prio: 0, status: "done", turnStartedAt: cachedTurn, promptId: turn };
+    case "end":
+      return { op: "end", prio: 0, status: "done", turnStartedAt: cachedTurn, promptId: turn };
+    default:
+      return null;
+  }
+}
+var DEVIN_INSTALLER_COMMAND = /^'([^']+\/)scripts\/run\.sh' '\1dist\/devin-(status|approve)\.mjs'(; exit 0)?$/;
+var DEVIN_PLUGIN_FLAG = "--via=devin-plugin";
+function devinInstallerActive(configText, exists = existsSync3) {
+  for (const m of configText.matchAll(/"((?:[^"\\]|\\.)*)"/g)) {
+    let value;
+    try {
+      value = JSON.parse(`"${m[1]}"`);
+    } catch {
+      continue;
+    }
+    const owned = typeof value === "string" ? DEVIN_INSTALLER_COMMAND.exec(value) : null;
+    if (owned && exists(`${owned[1]}scripts/run.sh`))
+      return true;
+  }
+  return false;
+}
+var devinPluginLockPath = () => `${process.env.HOME ?? ""}/.local/share/devin/cli/plugins/lock.json`;
+function devinPluginInstalled(lockText) {
+  try {
+    const resolved = JSON.parse(lockText)?.resolved;
+    return Array.isArray(resolved) && resolved.some((r) => typeof r === "object" && r !== null && r.name === "nomo");
+  } catch {
+    return false;
+  }
+}
+function devinPluginStandsDown(argv = process.argv, configPath = process.env.NOMO_DEVIN_CONFIG ?? `${devinConfigDir()}/config.json`) {
+  if (!argv.includes(DEVIN_PLUGIN_FLAG))
+    return false;
+  try {
+    return devinInstallerActive(readFileSync2(configPath, "utf8"));
+  } catch {
+    return false;
+  }
+}
+var argv02 = (command) => command.trimStart().split(/\s/, 1)[0] ?? "";
+function devinOwnerPid(chain) {
+  return chain.find((p) => p.command !== undefined && /(^|\/)devin$/.test(argv02(p.command)))?.pid;
+}
+function resolveOwnerPid2() {
+  const pids = [process.ppid, ...pidAncestors(process.ppid)];
+  return devinOwnerPid(pids.map((pid) => ({ pid, command: pidCommand(pid) })));
+}
+var DEVIN_INTERRUPT_LINE = JSON.stringify({ continue: false, stopReason: INTERRUPT_STOP_REASON });
+function printLine(line) {
+  return new Promise((resolve) => {
+    process.stdout.on("error", () => resolve());
+    try {
+      process.stdout.write(`${line}
+`, () => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+async function runDevinHook(raw, deps = {}) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+      return;
+    const input = parsed;
+    const env = deps.env ?? process.env;
+    const projectDir = env.DEVIN_PROJECT_DIR;
+    if (projectDir === undefined)
+      return;
+    const now = (deps.now ?? Date.now)();
+    await atomicWrite(deps.stampPath ?? lastHookPath("devin"), String(now)).catch(() => {});
+    const kind = devinEventKind(input);
+    const sessionId = str2(input.session_id);
+    if (!kind || !sessionId || !SAFE_ID2.test(sessionId))
+      return;
+    const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
+    let interrupted = false;
+    if (kind === "prompt" || kind === "stop" || kind === "end") {
+      await clearInterruptFlagAt(sessionsDir, sessionId);
+      if (kind === "end")
+        await unlink4(devinGrantsPath(sessionsDir, sessionId)).catch(() => {});
+    } else if (kind === "tool" && await interruptFlagSetAt(sessionsDir, sessionId, now)) {
+      interrupted = true;
+      await (deps.print ?? printLine)(DEVIN_INTERRUPT_LINE);
+      (deps.trace ?? traceSession)({ event: "interrupt", sessionId, agent: "devin", result: "stopped" });
+    }
+    const config = deps.config !== undefined ? deps.config : await loadConfig();
+    if (!config)
+      return;
+    const record = await readRecord(sessionId, sessionsDir);
+    if (record && record.agent !== "devin")
+      return;
+    const plan = planDevin(interrupted ? "stop" : kind, input, record, now);
+    if (!plan)
+      return;
+    const meta = kind === "prompt" || kind === "end" ? {} : (deps.sessionMeta ?? devinSessionMeta)(sessionId);
+    const machine = config.machineName ?? hostname3().replace(/\.local$/, "");
+    const cwd = str2(projectDir) ?? meta.cwd;
+    const folder = folderIdentity(cwd, record);
+    const title = meta.title ?? record?.title ?? await devinAdapter.title({ sessionId, prefix: "", input });
+    const model = meta.model ?? record?.model;
+    const startedAt = typeof record?.sessionStartedAt === "number" && Number.isFinite(record.sessionStartedAt) ? record.sessionStartedAt : now;
+    let pid = record?.pid;
+    if (typeof pid !== "number") {
+      pid = (deps.ownerPid ?? resolveOwnerPid2)() ?? CURSOR_UNKNOWN_OWNER_PID;
+      if (pid !== CURSOR_UNKNOWN_OWNER_PID && !pidAlive(pid))
+        pid = CURSOR_UNKNOWN_OWNER_PID;
+    }
+    const hookEventName = interrupted ? "Stop" : str2(input.hook_event_name) ?? kind;
+    const envelope = await buildEnvelope({ session_id: sessionId, ...cwd ? { cwd } : {}, hook_event_name: hookEventName }, machine, now, title, config.e2eKey, false, "devin", startedAt, plan.turnStartedAt, folder, model, { op: plan.op, prio: plan.prio, status: plan.status });
+    if (!envelope)
+      return;
+    const origin = record?.origin ?? { hook_event_name: hookEventName, ...cwd ? { cwd } : {}, ppid: process.ppid };
+    await trackSessionAt(sessionsDir, sessionId, plan.op, plan.prio, plan.status, envelope.blob, machine, folder, "", "devin", startedAt, plan.turnStartedAt, plan.promptId, title, config.pairingId, model, false, pid, origin);
+    const trace = deps.trace ?? traceSession;
+    if (!record)
+      trace({ event: "create", sessionId, agent: "devin", hook_event_name: hookEventName, origin });
+    else if (plan.op === "end")
+      trace({ event: "retire", sessionId, agent: "devin", reason: "hook op:end" });
+    (deps.ensureWatchdog ?? ensureWatchdog)();
+    const delivered = await (deps.post ?? postOcEvent)(config, envelope);
+    if (delivered && plan.op === "done")
+      await markDoneDeliveredAt(sessionsDir, sessionId);
+  } catch {}
+}
+
 // src/entries/status-cmd.ts
 var CODEX_PLUGIN_HOOK_COUNT = 10;
 var AGENT_UI = {
@@ -3086,9 +4631,11 @@ var AGENT_UI = {
   codex: { name: "Codex", pair: "$nomo-pair", approvalsOn: "$nomo-approvals on", status: "$nomo-status" },
   opencode: { name: "OpenCode", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
   cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
-  antigravity: { name: "Antigravity", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" }
+  antigravity: { name: "Antigravity", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
+  devin: { name: "Devin", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" }
 };
-var AGENT_ORDER = ["claude", "codex", "opencode", "cursor", "antigravity"];
+var DEVIN_PLUGIN_UI = { name: "Devin", pair: "/nomo:pair", approvalsOn: "/nomo:approvals on", status: "/nomo:status" };
+var AGENT_ORDER = ["claude", "codex", "opencode", "cursor", "antigravity", "devin"];
 var VALUE_COL = 14;
 var row = (label, value) => `${label.padEnd(VALUE_COL)}${value}`;
 var subRow = (label, value) => `  ${label.padEnd(VALUE_COL - 2)}${value}`;
@@ -3260,7 +4807,7 @@ function hooksAppearStale(now, sessionMtime, hookStamp) {
 async function newestFileMtime(dir, match) {
   let entries;
   try {
-    entries = await readdir2(dir, { withFileTypes: true });
+    entries = await readdir5(dir, { withFileTypes: true });
   } catch {
     return 0;
   }
@@ -3273,7 +4820,7 @@ async function newestFileMtime(dir, match) {
         newest = m;
     } else if (match(e.name)) {
       try {
-        const m = (await stat3(full)).mtimeMs;
+        const m = (await stat5(full)).mtimeMs;
         if (m > newest)
           newest = m;
       } catch {}
@@ -3283,7 +4830,7 @@ async function newestFileMtime(dir, match) {
 }
 async function readMsMarker(path) {
   try {
-    const ts = Number.parseInt((await readFile3(path, "utf8")).trim(), 10);
+    const ts = Number.parseInt((await readFile5(path, "utf8")).trim(), 10);
     return Number.isFinite(ts) && ts > 0 ? ts : 0;
   } catch {
     return 0;
@@ -3322,16 +4869,21 @@ async function statusCmd(deps = {}) {
   const lastHookCursorPath = deps.lastHookCursorPath ?? cursorAdapter.hookStampPath();
   const antigravityHooksPath = deps.antigravityHooksPath ?? `${antigravityConfigDir()}/hooks.json`;
   const lastHookAntigravityPath = deps.lastHookAntigravityPath ?? antigravityAdapter.hookStampPath();
+  const devinConfigPath = deps.devinConfigPath ?? `${devinConfigDir()}/config.json`;
+  const devinConfigText = await readFile5(devinConfigPath, "utf8").catch(() => "");
+  const devinViaHooks = devinInstallerActive(devinConfigText);
+  const devinViaPlugin = devinPluginInstalled(await readFile5(deps.devinPluginLockPath ?? devinPluginLockPath(), "utf8").catch(() => ""));
+  const lastHookDevinPath = deps.lastHookDevinPath ?? devinAdapter.hookStampPath();
   const noHoldPath = deps.noHoldPath ?? NO_HOLD_PATH;
   const isAlive = deps.isAlive ?? pidAlive;
   const now = deps.now ?? Date.now;
   const codexAppServerAvailable = deps.codexAppServerAvailable ?? (() => codexAppServerSocketAvailable());
   const audience = deps.audience;
-  const ui = AGENT_UI[audience ?? "claude"];
+  const ui = audience === "devin" && devinViaPlugin && !devinViaHooks ? DEVIN_PLUGIN_UI : AGENT_UI[audience ?? "claude"];
   print(audience ? `Nomo ${PLUGIN_VERSION} · ${AGENT_UI[audience].name}` : `Nomo ${PLUGIN_VERSION}`);
   let raw = null;
   try {
-    raw = await readFile3(configPath, "utf8");
+    raw = await readFile5(configPath, "utf8");
   } catch {}
   const config = raw !== null ? parseConfig(raw) : null;
   const pending = config === null && raw !== null && parsePendingConfig(raw);
@@ -3354,20 +4906,20 @@ async function statusCmd(deps = {}) {
   if (config) {
     let watchdog = "watchdog idle (the next turn starts it)";
     try {
-      const pid = Number.parseInt((await readFile3(watchdogPidPath, "utf8")).trim(), 10);
+      const pid = Number.parseInt((await readFile5(watchdogPidPath, "utf8")).trim(), 10);
       if (Number.isFinite(pid) && pid > 0 && isAlive(pid))
         watchdog = `watchdog running (pid ${pid})`;
     } catch {}
     let lastSend = "nothing sent yet";
     try {
-      const ts = Number.parseInt((await readFile3(lastSendPath, "utf8")).trim(), 10);
+      const ts = Number.parseInt((await readFile5(lastSendPath, "utf8")).trim(), 10);
       if (Number.isFinite(ts) && ts > 0)
         lastSend = `last event sent ${humanAge(now() - ts)}`;
     } catch {}
     print(row("Delivery", `${lastSend} · ${watchdog}`));
     let lanTrace = "";
     try {
-      lanTrace = await readFile3(sessionTracePath, "utf8");
+      lanTrace = await readFile5(sessionTracePath, "utf8");
     } catch {}
     const lanLines = renderLanTrace(parseLanTrace(lanTrace), now());
     if (lanLines.length > 0) {
@@ -3382,16 +4934,16 @@ async function statusCmd(deps = {}) {
       print(cont(`→ run ${ui.approvalsOn}`));
     }
   }
-  const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0 };
+  const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0, devin: 0 };
   let totalSessions = 0;
   try {
-    for (const name of await readdir2(sessionsDir)) {
+    for (const name of await readdir5(sessionsDir)) {
       if (!name.endsWith(".json"))
         continue;
       totalSessions++;
       let kind = "claude";
       try {
-        const parsed = JSON.parse(await readFile3(join3(sessionsDir, name), "utf8"));
+        const parsed = JSON.parse(await readFile5(join3(sessionsDir, name), "utf8"));
         if (typeof parsed.agent === "string" && parsed.agent.length > 0)
           kind = parsed.agent;
       } catch {}
@@ -3401,11 +4953,11 @@ async function statusCmd(deps = {}) {
   } catch {}
   let plugin = { installed: false, enabled: true, trusted: 0, ccTrusted: 0 };
   try {
-    plugin = parseCodexPluginState(await readFile3(codexConfigPath, "utf8"));
+    plugin = parseCodexPluginState(await readFile5(codexConfigPath, "utf8"));
   } catch {}
   let legacyEvents = 0;
   try {
-    legacyEvents = countCodexHookEvents(await readFile3(codexHooksPath, "utf8"));
+    legacyEvents = countCodexHookEvents(await readFile5(codexHooksPath, "utf8"));
   } catch {}
   async function hooksRow(kind, opts) {
     const stamp = await readMsMarker(opts.stampPath);
@@ -3518,7 +5070,7 @@ async function statusCmd(deps = {}) {
   let opencodeStub;
   let opencodeTarget;
   for (const path of opencodeStubs) {
-    const text = await readFile3(path, "utf8").catch(() => null);
+    const text = await readFile5(path, "utf8").catch(() => null);
     if (text === null)
       continue;
     opencodeStub = path;
@@ -3544,7 +5096,7 @@ async function statusCmd(deps = {}) {
     detail: quiet ? [["", "plugins load once at OpenCode start — restart it if sessions aren't reaching your phone"]] : [],
     problems: opencodeProblems
   };
-  const cursorInstalled = (await readFile3(cursorHooksPath, "utf8").catch(() => "")).includes(CURSOR_HOOK_MARKER);
+  const cursorInstalled = (await readFile5(cursorHooksPath, "utf8").catch(() => "")).includes(CURSOR_HOOK_MARKER);
   const cursorHooks = await hooksRow("cursor", {
     installed: cursorInstalled,
     sessionsDir: cursorProjectsDir,
@@ -3562,7 +5114,7 @@ async function statusCmd(deps = {}) {
     detail: [["Mode", "read-only — sessions show on your phone; approvals stay in Cursor"]],
     problems: cursorHooks.problem ? [cursorHooks.problem] : []
   };
-  const antigravityInstalled = (await readFile3(antigravityHooksPath, "utf8").catch(() => "")).includes(ANTIGRAVITY_HOOK_MARKER);
+  const antigravityInstalled = (await readFile5(antigravityHooksPath, "utf8").catch(() => "")).includes(ANTIGRAVITY_HOOK_MARKER);
   const antigravityHooks = await hooksRow("antigravity", {
     installed: antigravityInstalled,
     sessionsDir: antigravityAdapter.sessionsDir(),
@@ -3580,6 +5132,28 @@ async function statusCmd(deps = {}) {
     detail: [["Mode", "sessions show on your phone; Allow/Deny for shell commands and file writes, and Interrupt"]],
     problems: antigravityHooks.problem ? [antigravityHooks.problem] : []
   };
+  const devinInstalled = devinConfigText.includes(DEVIN_HOOK_MARKER) || devinViaPlugin;
+  const devinInstall = devinViaPlugin && devinViaHooks ? "both installed — plugin idle (Nomo uses the nomo-ai hooks)" : devinViaPlugin ? "plugin" : devinConfigText.includes(DEVIN_HOOK_MARKER) ? "hooks (nomo-ai --devin)" : undefined;
+  const devinHooks = await hooksRow("devin", {
+    installed: devinInstalled,
+    sessionsDir: devinAdapter.sessionsDir(),
+    match: devinAdapter.sessionMatch,
+    stampPath: lastHookDevinPath,
+    hint: devinAdapter.hooksNotFiringHint
+  });
+  const devinReport = {
+    kind: "devin",
+    present: devinInstalled || perAgent.devin > 0 || devinHooks.stamp > 0,
+    hooksLabel: "Hooks",
+    hooks: devinHooks.value,
+    sessions: sessionText(perAgent.devin),
+    sessionCount: perAgent.devin,
+    detail: [
+      ...devinInstall ? [["Install", devinInstall]] : [],
+      ["Mode", "sessions show on your phone; answer its prompts and questions, or interrupt it"]
+    ],
+    problems: devinHooks.problem ? [devinHooks.problem] : []
+  };
   if (deps.plain) {
     const approvalsOn = await localApprovalsState(noHoldPath) === "on";
     const lastSendTs = await readMsMarker(lastSendPath);
@@ -3595,7 +5169,7 @@ async function statusCmd(deps = {}) {
       out(line);
     return 0;
   }
-  const reports = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport, antigravity: antigravityReport };
+  const reports = { claude: claudeReport, codex: codexReport, opencode: opencodeReport, cursor: cursorReport, antigravity: antigravityReport, devin: devinReport };
   if (audience) {
     renderOwn(reports[audience], `${AGENT_UI[audience].name} — you are here`, print);
     const others = AGENT_ORDER.filter((k) => k !== audience && reports[k].present);
@@ -3643,14 +5217,14 @@ function plainStatusLines(s) {
 }
 function parseAudience(argv) {
   for (const arg of argv) {
-    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor" || arg === "antigravity")
+    if (arg === "claude" || arg === "codex" || arg === "opencode" || arg === "cursor" || arg === "antigravity" || arg === "devin")
       return arg;
   }
   return;
 }
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: status [claude|codex|opencode|cursor|antigravity] [--plain] [--check]  — show pairing, delivery and per-agent health (--plain: a few lines in plain words)");
+    console.log("usage: status [claude|codex|opencode|cursor|antigravity|devin] [--plain] [--check]  — show pairing, delivery and per-agent health (--plain: a few lines in plain words)");
     process.exit(0);
   }
   process.exit(await statusCmd({ audience: parseAudience(process.argv.slice(2)), plain: process.argv.includes("--plain") }));

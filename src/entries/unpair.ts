@@ -9,7 +9,8 @@
 // PORTABILITY: bun AND node >= 18 (after Task 2.3 bundles it) — no Bun.* APIs.
 
 import { readFile, unlink } from "node:fs/promises";
-import { CC_DIR, LAST_SEND_PATH, PAIR_HTML_PATH, parseConfig, parsePendingConfig } from "../core/shared";
+import { dirname, join } from "node:path";
+import { CC_DIR, forgetAllDevinGrants, LAST_SEND_PATH, PAIR_HTML_PATH, parseConfig, parsePendingConfig } from "../core/shared";
 
 export interface UnpairDeps {
   fetchFn?: typeof fetch;
@@ -20,6 +21,8 @@ export interface UnpairDeps {
   htmlPath?: string;
   /** Per-request ceiling on the server revoke so a hung socket can't stall the command. */
   revokeTimeoutMs?: number;
+  /** Where Devin's Always-allow grants live; defaults to `sessions/` beside the config (SESSIONS_DIR). */
+  sessionsDir?: string;
 }
 
 /** The minimal auth material a revoke needs — present in BOTH a completed and a pending config. */
@@ -54,6 +57,10 @@ export async function unpair(deps: UnpairDeps = {}): Promise<number> {
   const lastSendPath = deps.lastSendPath ?? LAST_SEND_PATH;
   const htmlPath = deps.htmlPath ?? PAIR_HTML_PATH;
   const revokeTimeoutMs = deps.revokeTimeoutMs ?? 5000;
+
+  // Devin's Always-allow grants go first and always: one left behind (a crashed session, an earlier
+  // unpair) must never grant anything again, paired or not.
+  await forgetAllDevinGrants(deps.sessionsDir ?? join(dirname(configPath), "sessions"));
 
   let raw: string;
   try {

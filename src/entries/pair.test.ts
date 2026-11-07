@@ -12,7 +12,7 @@ import { parseNotifyFromToml } from "../core/notify-wire";
 import { completePendingPairing, PAIR_HTML_FILE, parsePendingConfig, PENDING_STASH_FILE, PLUGIN_VERSION } from "../core/shared";
 import { deriveCodeIkm } from "../core/pair-code";
 import { unpair } from "./unpair";
-import { humanAge, statusCmd as realStatusCmd } from "./status-cmd";
+import { humanAge, parseAudience, statusCmd as realStatusCmd } from "./status-cmd";
 
 // ---------- shared test plumbing -----------------------------------------------------------------
 
@@ -875,6 +875,26 @@ describe("completePendingPairing", () => {
     expect((await stat(configPath)).mode & 0o777).toBe(0o600);
   });
 
+  test("a new pairing forgets every Devin Always-allow grant; a failed pairing keeps them", async () => {
+    const sessionsDir = join(dir, "sessions");
+    await mkdir(sessionsDir, { recursive: true });
+    const grant = join(sessionsDir, "old-devin.devin-allow");
+    await writeFile(grant, JSON.stringify(["exec:git"])); // granted under the OLD pairing
+
+    const failed = scriptedFetch([() => json({ error: "not found" }, 404)]);
+    expect((await completePendingPairing(pending(), configPath, { fetchFn: failed.fn })).state).toBe("gone");
+    expect(await readFile(grant, "utf8")).toContain("exec:git"); // failed pair → grants kept
+
+    const phoneKey = await ratchetK1(QR_SECRET);
+    const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("P")));
+    const { fn } = scriptedFetch([
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
+      () => json({ ok: true }),
+    ]);
+    expect((await completePendingPairing(pending(), configPath, { fetchFn: fn, ackAttempts: 1 })).state).toBe("completed");
+    await expect(stat(grant)).rejects.toBeDefined(); // new pairing → grants gone
+  });
+
   test("deletes the transient pairing page on completion (covers the watchdog self-heal path)", async () => {
     const htmlPath = join(dir, PAIR_HTML_FILE);
     await writeFile(htmlPath, "<html>the pairing QR secret + code</html>"); // what pair left next to config
@@ -1180,6 +1200,8 @@ describe("statusCmd", () => {
     noHoldPath: join(dir, "no-hold"), cursorHooksPath: join(dir, "cursor-hooks.json"),
     cursorProjectsDir: join(dir, "cursor-projects"), lastHookCursorPath: join(dir, "lh-cursor"),
     antigravityHooksPath: join(dir, "agy-hooks.json"), lastHookAntigravityPath: join(dir, "lh-agy"),
+    devinConfigPath: join(dir, "devin-config.json"), lastHookDevinPath: join(dir, "lh-devin"),
+    devinPluginLockPath: join(dir, "devin-lock.json"),
     ...deps,
   });
   // The machine-wide block: pairing, delivery, approvals. True regardless of which agent asked, which
@@ -1231,6 +1253,55 @@ describe("statusCmd", () => {
     expect(out).toContain("2 tracked");
     // `ignore.tmp` is not a session record and must not be counted.
     expect(out).not.toContain("3 tracked");
+  });
+
+  test("status devin: a Devin block, Hooks installed when config.json names our hook, terminal commands", async () => {
+    await writeFile(configPath, JSON.stringify({
+      url: WORKER, pairingId: "abcdef0123456789".repeat(2), pcSecret: "s", e2eKeyB64: b64url(new Uint8Array(32)),
+    }));
+    const now = 1_800_000_000_000;
+    await writeFile(join(dir, "devin-config.json"), JSON.stringify({ version: 1, hooks: { Stop: [{ hooks: [{ type: "command", command: "'/r/scripts/run.sh' '/r/dist/devin-status.mjs'" }] }] } }));
+    await writeFile(join(dir, "lh-devin"), String(now - 60_000));
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    await writeFile(join(dir, "sessions", "brawny-shirt.json"), JSON.stringify({ agent: "devin" }));
+    expect(parseAudience(["devin"])).toBe("devin");
+    expect(await statusCmd({
+      print, audience: "devin", configPath, lastSendPath: join(dir, "last-send"), sessionsDir: join(dir, "sessions"),
+      watchdogPidPath: join(dir, "watchdog.pid"), isAlive: () => false, now: () => now,
+    })).toBe(0);
+    const out = lines.join("\n");
+    expect(out).toContain("Devin — you are here");
+    expect(out).toContain("firing");
+    expect(out).toContain("1 tracked");
+    expect(out).toContain("answer its prompts and questions, or interrupt it");
+    expect(out).not.toContain("not set up here");
+  });
+
+  test("status devin: the Install row says plugin / hooks / both — plugin idle; plugin-only names /nomo:pair, hooks /nomo-pair", async () => {
+    const root = join(dir, "checkout", "plugin");
+    await mkdir(join(root, "scripts"), { recursive: true });
+    await writeFile(join(root, "scripts", "run.sh"), "#!/bin/sh\n");
+    const hooks = JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: `'${root}/scripts/run.sh' '${root}/dist/devin-status.mjs'` }] }] } });
+    const lock = JSON.stringify({ resolved: [{ name: "nomo" }] });
+    const run = async (config: string | null, lockText: string | null): Promise<string> => {
+      lines.length = 0;
+      await rm(join(dir, "devin-config.json"), { force: true });
+      await rm(join(dir, "devin-lock.json"), { force: true });
+      if (config !== null) await writeFile(join(dir, "devin-config.json"), config);
+      if (lockText !== null) await writeFile(join(dir, "devin-lock.json"), lockText);
+      await statusCmd({ print, audience: "devin", configPath, lastSendPath: join(dir, "last-send"), sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"), isAlive: () => false });
+      return lines.join("\n");
+    };
+    const plugin = await run(null, lock);
+    expect(plugin).toMatch(/Install\s+plugin\n/);
+    expect(plugin).toContain("/nomo:pair"); // unpaired → the fix is the plugin's own skill
+    const viaHooks = await run(hooks, null);
+    expect(viaHooks).toMatch(/Install\s+hooks \(nomo-ai --devin\)/);
+    expect(viaHooks).toContain("→ run /nomo-pair"); // installer → the user-level /nomo-* skills it wrote
+    expect(viaHooks).not.toContain("pair.mjs");
+    expect(await run(hooks, lock)).toMatch(/Install\s+both installed — plugin idle/);
+    expect(await run(null, null)).not.toContain("Install");
   });
 
   test("a PENDING config → reports pairing-in-progress, not a flat 'not paired'", async () => {

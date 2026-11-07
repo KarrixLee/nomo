@@ -23,7 +23,7 @@
 
 import { readFile, realpath, unlink } from "node:fs/promises";
 import { appendFileSync, statSync, truncateSync } from "node:fs";
-import { hostname } from "node:os";
+import { homedir, hostname } from "node:os";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
 import {
@@ -37,7 +37,7 @@ import {
 import { b64url, Bytes, decryptBlob, deriveLanKey, encryptBlob } from "./crypto";
 // The ONE transcript classifier for "is Claude still parked on a user-blocking tool" — the watchdog's
 // dropped-PreToolUse backstop (adapter.ts) and this hold's local-answer watch must never drift apart.
-import { adapterFor, claudeTailPendingApproval, cursorHostInvocation } from "./adapter";
+import { adapterFor, claudeTailPendingApproval, cursorHostInvocation, devinHostInvocation } from "./adapter";
 // The relay's timing/give-up rules, shared verbatim with the Codex relay (codex-remote-input.ts) that
 // polls the SAME route with the same credentials. See decision-poll.ts for what is deliberately NOT
 // shared — the first-contact POST ceiling, which each caller bounds by what IT blocks.
@@ -131,6 +131,7 @@ export const HOLD_BLOCKS_DIALOG: Record<AgentKind, boolean> = {
   opencode: false, // resident plugin, fired detached; OpenCode's own prompt is already on screen
   cursor: false,   // NEVER holds: v1 is read-only and registers no permission-class hook at all
   antigravity: true, // PreToolUse hook (core/antigravity-approval) — the tool waits until this process prints
+  devin: true,     // PermissionRequest hook (core/devin-approval) — Devin waits until this process exits
 };
 
 /** The Claude tools whose picker Claude Code renders ITSELF, concurrently with this hook — so the user
@@ -402,6 +403,83 @@ export function sessionScopedSuggestions(suggestions: unknown): Record<string, u
       return false;
     })
     .map((s) => ({ ...s, destination: "session" }));
+}
+
+// ── The grant (`permissionGrant`) ─────────────────────────────────────────────────────────────────
+//
+// What an Always-allow tap REALLY grants, as STRUCTURED data the phone turns into a localized label
+// ("Always allow `bun test` commands (this session)"). Computed here, at hold time, from the SAME inputs
+// the answer line is built from (allowAlwaysLine), so the label and the rule cannot drift.
+// DISPLAY-ONLY: the agent still decides what the rule matches.
+//
+// Wire format (README "Approval holds"): "" | entry ("\n" entry)*, entry = kind | kind ":" literal.
+// The literal is everything after the FIRST ":" (it may hold ":"), has no control characters, and is
+// capped. The phone shows the literal verbatim (never Markdown) and an unknown kind as "similar".
+//   cmd:<prefix>  exact  domain:<host>  edit:<glob>  dir:<path>  dirs:<N>  edits  reads  fetches
+//   searches  commands  planmode  automode  plans  tool:<raw tool id>  similar
+// "" = the tap would only be a one-time allow (CC offered suggestions and none survived the filter, or
+// OpenCode named no `always` pattern), and the phone then hides Always allow.
+
+const GRANT_LITERAL_MAX = 80;
+const GRANT_MAX = 240;
+
+/** One entry: `kind` or `kind:literal` (control chars → space, literal capped). Pure. */
+export function grantEntry(kind: string, literal?: string): string {
+  if (literal === undefined) return kind;
+  const clean = literal.replace(/[\u0000-\u001f\u007f]/g, " ");
+  if (clean.length === 0) return "similar";
+  return `${kind}:${clean.length <= GRANT_LITERAL_MAX ? clean : `${clean.slice(0, GRANT_LITERAL_MAX - 1)}…`}`;
+}
+
+/** Entries → the wire value: deduped, "\n"-joined. Any `similar`, or a value over the cap, collapses to
+ *  `similar` — never a partial list that would understate the grant. Pure. */
+export function joinGrant(entries: string[]): string {
+  const uniq = [...new Set(entries.filter((e) => e.length > 0))];
+  if (uniq.includes("similar")) return "similar";
+  const out = uniq.join("\n");
+  return out.length <= GRANT_MAX ? out : "similar";
+}
+
+/** `/Users/me/x` → `~/x` (display only). */
+export function tildePath(path: string, home: string = homedir()): string {
+  return home && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path;
+}
+
+/** `dir:<path>` for one folder, `dirs:<N>` for more. */
+export function foldersGrant(dirs: string[], home?: string): string {
+  if (dirs.length === 0) return "";
+  return dirs.length === 1 ? grantEntry("dir", tildePath(dirs[0], home)) : grantEntry("dirs", String(dirs.length));
+}
+
+const SHELL_TOOLS = new Set(["Bash", "shell", "local_shell"]);
+const EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+
+function ruleGrant(rule: Record<string, unknown>): string {
+  const tool = typeof rule.toolName === "string" ? rule.toolName : "";
+  const content = typeof rule.ruleContent === "string" ? rule.ruleContent : "";
+  if (!content) return tool === "ExitPlanMode" ? "plans" : grantEntry("tool", tool);
+  if (SHELL_TOOLS.has(tool)) {
+    if (content.endsWith(":*")) return grantEntry("cmd", content.slice(0, -2));
+    // A `*` anywhere else is a wildcard (`npm run *`): never "this command" — show the rule itself.
+    return content.includes("*") ? grantEntry("cmd", content) : "exact";
+  }
+  if (tool === "WebFetch" && content.startsWith("domain:")) return grantEntry("domain", content.slice("domain:".length));
+  if (EDIT_TOOLS.has(tool)) return grantEntry("edit", content);
+  return "similar";
+}
+
+const MODE_GRANT: Record<string, string> = { acceptEdits: "edits", plan: "planmode", auto: "automode" };
+
+/** Claude Code's grant for an Always-allow tap: mirrors allowAlwaysLine exactly. Pure. */
+export function claudeGrantText(toolName: string, suggestions: unknown, home?: string): string {
+  if (!Array.isArray(suggestions) || suggestions.length === 0) {
+    return toolName === "ExitPlanMode" ? "plans" : grantEntry("tool", toolName);
+  }
+  return joinGrant(sessionScopedSuggestions(suggestions).flatMap((s) => {
+    if (s.type === "addRules") return (s.rules as unknown[]).filter((r): r is Record<string, unknown> => !!r && typeof r === "object").map(ruleGrant);
+    if (s.type === "addDirectories") return [foldersGrant((s.directories as unknown[]).filter((d): d is string => typeof d === "string"), home)];
+    return [MODE_GRANT[s.mode as string] ?? "similar"];
+  }));
 }
 
 /** Allow carrying `updatedPermissions`. ExitPlanMode needs the same updatedInput echo as the plain
@@ -1062,11 +1140,16 @@ function permissionFrame(
   omitted: number,
   questions: PermissionQuestion[] = [],
 ): Record<string, unknown> {
+  // `permissionGrant` rides on the base but is always emitted LAST (after permissionQuestions), so the
+  // fit's size prediction and the real seal both carry it in its append-last position. Present only
+  // when the hold computed one; "" is meaningful (the tap is a one-time allow), absent = unknown.
+  const { permissionGrant, ...rest } = base;
   return {
-    ...base,
+    ...rest,
     ...(detail.length > 0 ? { permissionDetail: detail } : {}),
     ...(omitted > 0 ? { permissionDetailOmitted: omitted } : {}),
     ...(questions.length > 0 ? { permissionQuestions: questions } : {}),
+    ...(typeof permissionGrant === "string" ? { permissionGrant } : {}),
   };
 }
 
@@ -1420,6 +1503,11 @@ export interface PermissionHookDeps {
    *  Claude/Codex hooks and for OpenCode's mapped permissions, which all keep the built detail
    *  byte-for-byte. Uncapped, exactly like the built one: `fitPermissionDetail` owns the ceiling. */
   detail?: string;
+  /** OPTIONAL Always-allow grant for the card's `permissionGrant` (wire format: see grantEntry), for a
+   *  caller whose grant is not Claude Code's suggestions: OpenCode (its `always` patterns) and Devin
+   *  (Nomo's own session grant). "" = the tap would be a one-time allow. Absent → derived for Claude
+   *  Code, omitted for every other agent. */
+  grant?: string;
   /** Resolve Codex's effective per-turn approval policy from its rollout. Tests inject this so no
    *  local Codex state is touched; Claude never calls it. */
   loadCodexTurnPolicyFn?: (
@@ -1533,6 +1621,7 @@ export async function runPermissionHook(
       return; // unreadable hook input → fail open, silent
     }
     if (agent === "claude" && cursorHostInvocation(input)) return; // Cursor payload → no decision, no network
+    if (agent === "claude" && devinHostInvocation(input)) return; // Devin payload → Devin's own prompt
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) { trace({ event: "exit", reason: "no-session-id" }); return; }
 
@@ -1612,6 +1701,13 @@ export async function runPermissionHook(
     // CC's own narrowly-scoped rule suggestions (present on the PermissionRequest when it has them);
     // narrowed + forced to destination:session by allowAlwaysLine on an always-allow answer. Absent → whole-tool rule.
     const suggestions = input.permission_suggestions;
+    // The Always-allow grant text: the caller's (OpenCode's `always` patterns, Devin's Nomo-side grant)
+    // or, for Claude Code, derived from the same suggestions allowAlwaysLine will use. Absent for every
+    // agent with no Always allow (Codex degrades it to a plain allow) and for question tools.
+    const grant = isAnswerTool(toolName, agent) ? undefined
+      : deps.grant !== undefined ? deps.grant
+      : agent === "claude" ? claudeGrantText(toolName, suggestions)
+      : undefined;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
     const now = (deps.now ?? Date.now)();
@@ -1655,6 +1751,8 @@ export async function runPermissionHook(
     const permissionBase = {
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
       permissionToolName: toolName,
+      // What Always allow really grants (see claudeGrantText) — moved to the tail by permissionFrame.
+      ...(grant !== undefined ? { permissionGrant: grant } : {}),
     };
     const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
     let fitted = fitPermissionDetail(
@@ -1990,9 +2088,10 @@ export async function runPermissionHook(
       // A WORKING settle also claims a prio:0 record no hook has written since the hold began: an agent
       // whose hold never flipped the record to needsAttention (Antigravity) otherwise keeps a pre-hold
       // stamp the phone's held card outranks — the purple hand outlived an app Stop (NOM-96). Antigravity
-      // ONLY: Claude/Codex holds do flip the record, and their settle stays exactly as it was.
+      // and Devin ONLY (neither hold flips the record): Claude/Codex holds do, and their settle stays
+      // exactly as it was.
       await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(
-        sessionId, patch, settleAsWorking && agent === "antigravity" ? holdAt : undefined);
+        sessionId, patch, settleAsWorking && (agent === "antigravity" || agent === "devin") ? holdAt : undefined);
     };
 
     // HOLD: poll until the phone answers, the request leaves "pending", sustained failure trips the
