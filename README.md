@@ -7,6 +7,8 @@
 <img src="assets/codex.png" height="26" alt="OpenAI Codex">&nbsp;&nbsp;
 <picture><source media="(prefers-color-scheme: dark)" srcset="assets/opencode-dark.png"><img src="assets/opencode-light.png" height="26" alt="OpenCode"></picture>&nbsp;&nbsp;
 <picture><source media="(prefers-color-scheme: dark)" srcset="assets/cursor-dark.png"><img src="assets/cursor-light.png" height="26" alt="Cursor"></picture>&nbsp;&nbsp;
+<img src="assets/antigravity.png" height="26" alt="Antigravity">&nbsp;&nbsp;
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/devin-dark.png"><img src="assets/devin-light.png" height="26" alt="Devin"></picture>&nbsp;&nbsp;
 <img src="https://img.shields.io/badge/License-MIT-blue" alt="License: MIT">
 </p>
 
@@ -62,14 +64,14 @@ install path (`--claude` `--codex` `--opencode` `--cursor` `--antigravity` `--de
 Devin can instead use the plugin: `devin plugins install KarrixLee/nomo`. Remove Nomo from an agent
 with `bunx nomo-ai --uninstall --<agent>`.
 
-Full steps: [Install](https://docs.nomo.gg/setup/install) ·
-[Pairing](https://docs.nomo.gg/setup/pairing) ·
-[Approvals](https://docs.nomo.gg/sessions/approvals) ·
-[Commands, update, uninstall](https://docs.nomo.gg/sessions/commands) ·
-[Codex](https://docs.nomo.gg/sessions/codex) · [OpenCode](https://docs.nomo.gg/sessions/opencode) ·
-[Cursor](https://docs.nomo.gg/sessions/cursor) · [Antigravity](https://docs.nomo.gg/sessions/antigravity) ·
-[Devin](https://docs.nomo.gg/sessions/devin) ·
-[Troubleshooting](https://docs.nomo.gg/sessions/troubleshooting)
+The full guides live at [docs.nomo.gg](https://docs.nomo.gg):
+
+| | |
+| --- | --- |
+| **Get started** | [Install](https://docs.nomo.gg/setup/install) · [Pair your iPhone](https://docs.nomo.gg/setup/pairing) |
+| **Everyday use** | [Answer from your phone](https://docs.nomo.gg/sessions/approvals) · [Commands, update and uninstall](https://docs.nomo.gg/sessions/commands) |
+| **Each agent** | [Codex](https://docs.nomo.gg/sessions/codex) · [OpenCode](https://docs.nomo.gg/sessions/opencode) · [Cursor](https://docs.nomo.gg/sessions/cursor) · [Antigravity](https://docs.nomo.gg/sessions/antigravity) · [Devin](https://docs.nomo.gg/sessions/devin) |
+| **Help** | [Troubleshooting](https://docs.nomo.gg/sessions/troubleshooting) |
 
 ## Architecture
 
