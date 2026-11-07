@@ -458,7 +458,11 @@ function ruleGrant(rule: Record<string, unknown>): string {
   const tool = typeof rule.toolName === "string" ? rule.toolName : "";
   const content = typeof rule.ruleContent === "string" ? rule.ruleContent : "";
   if (!content) return tool === "ExitPlanMode" ? "plans" : grantEntry("tool", tool);
-  if (SHELL_TOOLS.has(tool)) return content.endsWith(":*") ? grantEntry("cmd", content.slice(0, -2)) : "exact";
+  if (SHELL_TOOLS.has(tool)) {
+    if (content.endsWith(":*")) return grantEntry("cmd", content.slice(0, -2));
+    // A `*` anywhere else is a wildcard (`npm run *`): never "this command" — show the rule itself.
+    return content.includes("*") ? grantEntry("cmd", content) : "exact";
+  }
   if (tool === "WebFetch" && content.startsWith("domain:")) return grantEntry("domain", content.slice("domain:".length));
   if (EDIT_TOOLS.has(tool)) return grantEntry("edit", content);
   return "similar";

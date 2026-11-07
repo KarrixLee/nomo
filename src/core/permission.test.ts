@@ -3752,6 +3752,13 @@ describe("claudeGrantText — mirrors allowAlwaysLine (structured permissionGran
     expect(g("Edit", [{ type: "setMode", mode: "someNewMode" }])).toBe("similar");
     expect(g("ExitPlanMode", rule("ExitPlanMode"))).toBe("plans");
   });
+  test("a Bash rule with a `*` anywhere is never \"exact\": the phone shows the rule itself", () => {
+    const rule = (ruleContent: string) => [{ type: "addRules", behavior: "allow", rules: [{ toolName: "Bash", ruleContent }] }];
+    expect(g("Bash", rule("npm run *"))).toBe("cmd:npm run *");
+    expect(g("Bash", rule("git * --force"))).toBe("cmd:git * --force");
+    expect(g("Bash", rule("npm run *:*"))).toBe("cmd:npm run *");
+    expect(g("Bash", rule("npm run test"))).toBe("exact");
+  });
   test("several → \n-joined entries, deduped; any unnamed one collapses the whole grant to similar", () => {
     const rules = [{ type: "addRules", behavior: "allow", rules: [{ toolName: "Bash", ruleContent: "git add:*" }, { toolName: "Bash", ruleContent: "git commit:*" }, { toolName: "Bash", ruleContent: "git add:*" }] }];
     expect(g("Bash", [...rules, { type: "addDirectories", directories: ["/Users/me/x"] }])).toBe("cmd:git add\ncmd:git commit\ndir:~/x");
