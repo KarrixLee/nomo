@@ -1258,7 +1258,7 @@ describe("statusCmd", () => {
     expect(out).not.toContain("not set up here");
   });
 
-  test("status devin: the Install row says plugin / hooks / both — plugin idle; plugin-only names /nomo:pair", async () => {
+  test("status devin: the Install row says plugin / hooks / both — plugin idle; plugin-only names /nomo:pair, hooks /nomo-pair", async () => {
     const root = join(dir, "checkout", "plugin");
     await mkdir(join(root, "scripts"), { recursive: true });
     await writeFile(join(root, "scripts", "run.sh"), "#!/bin/sh\n");
@@ -1276,7 +1276,10 @@ describe("statusCmd", () => {
     const plugin = await run(null, lock);
     expect(plugin).toMatch(/Install\s+plugin\n/);
     expect(plugin).toContain("/nomo:pair"); // unpaired → the fix is the plugin's own skill
-    expect(await run(hooks, null)).toMatch(/Install\s+hooks \(nomo-ai --devin\)/);
+    const viaHooks = await run(hooks, null);
+    expect(viaHooks).toMatch(/Install\s+hooks \(nomo-ai --devin\)/);
+    expect(viaHooks).toContain("→ run /nomo-pair"); // installer → the user-level /nomo-* skills it wrote
+    expect(viaHooks).not.toContain("pair.mjs");
     expect(await run(hooks, lock)).toMatch(/Install\s+both installed — plugin idle/);
     expect(await run(null, null)).not.toContain("Install");
   });

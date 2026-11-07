@@ -4627,19 +4627,9 @@ var AGENT_UI = {
   opencode: { name: "OpenCode", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
   cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
   antigravity: { name: "Antigravity", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
-  devin: {
-    name: "Devin",
-    pair: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs",
-    approvalsOn: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/cc-permission.mjs on",
-    status: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/status-cmd.mjs devin"
-  }
+  devin: { name: "Devin", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" }
 };
-var DEVIN_PLUGIN_UI = {
-  name: "Devin",
-  pair: "/nomo:pair",
-  status: "/nomo:status",
-  approvalsOn: "~/.config/cc-status/hook-shim.sh cc-permission on"
-};
+var DEVIN_PLUGIN_UI = { name: "Devin", pair: "/nomo:pair", approvalsOn: "/nomo:approvals on", status: "/nomo:status" };
 var AGENT_ORDER = ["claude", "codex", "opencode", "cursor", "antigravity", "devin"];
 var VALUE_COL = 14;
 var row = (label, value) => `${label.padEnd(VALUE_COL)}${value}`;

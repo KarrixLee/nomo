@@ -11,7 +11,7 @@
 // with no exports (it runs main() on import) — the same reason hook-shim.test.ts drives the real shell
 // scripts rather than reimplementing them. `--dry-run` guarantees nothing is installed or written.
 
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -146,7 +146,7 @@ describe("bunx nomo-ai --devin", () => {
   test("--devin is a known flag and appears in --help with its uninstall line", async () => {
     const help = await nomoAi(["--help"]);
     expect(help.out).toContain("--devin");
-    expect(help.out).toContain("node ~/.nomo/plugin/scripts/devin-install.mjs --uninstall");
+    expect(help.out).toContain("bunx nomo-ai --uninstall --devin");
     const r = await nomoAi(["--dry-run", "--devin"]);
     expect(r.out).not.toContain("unknown");
     expect(r.code).toBe(0);
@@ -177,6 +177,40 @@ describe("bunx nomo-ai --devin", () => {
     });
     expect(r.out).toContain("already installed");
     expect(r.out).toContain("config.json");
+  });
+
+  test("--uninstall needs an agent flag: no picker, nothing run", async () => {
+    const r = await nomoAi(["--uninstall"]);
+    expect(r.code).toBe(2);
+    expect(r.out).toContain("--uninstall needs to know which agent");
+    expect((await nomoAi(["--uninstall", "-y"])).code).toBe(2);
+  });
+
+  test("--uninstall --devin runs ~/.nomo's devin-install.mjs --uninstall; -y is accepted", async () => {
+    let log = "";
+    const r = await nomoAi(["--uninstall", "--devin", "-y"], async (home) => {
+      const scripts = join(home, ".nomo", "plugin", "scripts");
+      await mkdir(scripts, { recursive: true });
+      log = join(home, "argv.log");
+      await writeFile(join(scripts, "devin-install.mjs"), `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" "));\n`);
+    });
+    expect(r.code).toBe(0);
+    expect(await readFile(log, "utf8")).toBe("--uninstall");
+    expect(r.out).not.toContain("claude plugin");
+  });
+
+  test("--uninstall with no ~/.nomo checkout fails loudly and names the long form", async () => {
+    const r = await nomoAi(["--uninstall", "--cursor"]);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("cursor-install.mjs --uninstall");
+  });
+
+  test("--uninstall for a host-owned install prints the host's command and runs nothing", async () => {
+    const r = await nomoAi(["--uninstall", "--claude", "--codex"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("claude plugin uninstall nomo-cc@nomo");
+    expect(r.out).toContain("codex plugin remove nomo@nomo");
+    expect(r.out).not.toContain("$ claude");
   });
 
   test("--ref note lists Devin among the pinned agents", async () => {

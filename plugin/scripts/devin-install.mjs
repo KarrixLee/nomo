@@ -27,11 +27,18 @@
 // ON PURPOSE: Devin SIGKILLs the hook's direct child when it gives up, so a shell must stay between
 // Devin and the bundle for the bundle to notice (its parent pid changes) and withdraw the phone card.
 //
+// The /nomo-* skills (/nomo-pair, /nomo-status, /nomo-approvals, /nomo-reset, /nomo-unpair) go to
+// Devin's user-level skills folder, ~/.config/devin/skills/<name>/SKILL.md. They are GENERATED from
+// the native plugin's own skills (plugin/devin-skills, which Devin shows as /nomo:*) with this
+// checkout's path in place of the plugin-cache search, so the two never drift. Each carries MARK; a
+// same-named skill without it is the user's and is skipped with a note, never overwritten. Uninstall
+// removes only marked ones.
+//
 // Zero dependencies and no build step: plain node >= 18, so it runs straight out of a fresh clone.
 
 import {
-  accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync,
-  renameSync, rmSync, statSync, writeFileSync,
+  accessSync, chmodSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync,
+  renameSync, rmdirSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -182,6 +189,65 @@ export function removeHooks(config) {
   return out;
 }
 
+// ── the /nomo-* skills ──────────────────────────────────────────────────────────────────────────
+
+/** Says a user-level skill is ours. Never change it without a migration. */
+export const SKILL_MARK = "nomo-devin-install";
+/** The plugin skills' search for the plugin cache — a single quoted checkout path takes its place. */
+const PLUGIN_CACHE_GLOB = '"$HOME"/.local/share/devin/cli/plugins/cache/*nomo*/*/plugin';
+const PLUGIN_SKILLS = join(ROOT, "devin-skills");
+export const devinSkillsDir = () => join(homedir(), ".config", "devin", "skills");
+
+/** The user-level twin of plugin skill `text` for checkout `root`: named nomo-<name>, /nomo:x read as
+ *  /nomo-x, and the plugin-cache loop pointed at `root` alone (`for NOMOR in "<root>"` — one item). */
+export function userSkill(text, root) {
+  if (!text.includes(PLUGIN_CACHE_GLOB) && /dist\//.test(text)) throw new Error("a Devin skill no longer has the plugin-cache search");
+  const body = text
+    .replace(/^name: (\S+)$/m, "name: nomo-$1")
+    .replaceAll("/nomo:", "/nomo-")
+    .replaceAll(PLUGIN_CACHE_GLOB, () => `"${root}"`)
+    .replaceAll("reinstall: devin plugins install KarrixLee/nomo", "re-run: bunx nomo-ai --devin");
+  return `${body.trimEnd()}\n\n<!-- ${SKILL_MARK} -->\n`;
+}
+
+const skillFile = (name) => join(devinSkillsDir(), name, "SKILL.md");
+const oursSkill = (path) => { try { return readFileSync(path, "utf8").includes(SKILL_MARK); } catch { return false; } };
+
+/** Write every plugin skill as nomo-<name>. Returns `{ written, skipped, changed }` (names with the
+ *  slash; `changed` = a file was written). */
+function installSkills(root) {
+  const written = [];
+  const skipped = [];
+  let changed = false;
+  for (const name of readdirSync(PLUGIN_SKILLS)) {
+    const src = join(PLUGIN_SKILLS, name, "SKILL.md");
+    if (!existsSync(src)) continue;
+    const dest = skillFile(`nomo-${name}`);
+    if (existsSync(dest) && !oursSkill(dest)) { skipped.push(`/nomo-${name}`); continue; }
+    const text = userSkill(readFileSync(src, "utf8"), root);
+    if (currentText(dest) !== text) {
+      mkdirSync(dirname(dest), { recursive: true });
+      writeFileSync(dest, text);
+      changed = true;
+    }
+    written.push(`/nomo-${name}`);
+  }
+  return { written, skipped, changed };
+}
+
+function uninstallSkills() {
+  const removed = [];
+  let names = [];
+  try { names = readdirSync(devinSkillsDir()); } catch { return removed; }
+  for (const name of names) {
+    if (!name.startsWith("nomo-") || !oursSkill(skillFile(name))) continue;
+    rmSync(skillFile(name));
+    try { rmdirSync(dirname(skillFile(name))); } catch { /* the user put something else in it */ }
+    removed.push(`/${name}`);
+  }
+  return removed;
+}
+
 // ── the file ─────────────────────────────────────────────────────────────────────────────────────
 
 function fail(msg) {
@@ -284,7 +350,9 @@ function main() {
   try {
     if (UNINSTALL) {
       const r = existsSync(CONFIG) ? updateConfig(CONFIG, removeHooks) : { wrote: false };
+      const removed = uninstallSkills();
       say(r.wrote ? "removed Nomo's hooks from Devin — restart devin" : "no Nomo hooks found in Devin's config");
+      if (removed.length > 0) say(`removed the ${removed.join(" ")} skills`);
       comments(r);
       if (VERBOSE) say(`config -> ${CONFIG}`);
       return;
@@ -306,12 +374,15 @@ function main() {
     }
     if (!existsSync(join(ROOT, "scripts", "run.sh"))) fail(`${join(ROOT, "scripts", "run.sh")} is missing — this does not look like a nomo plugin directory`);
     const r = updateConfig(CONFIG, (doc) => mergeHooks(doc, ROOT));
-    say(r.wrote ? "Devin sessions will now show in Nomo — restart devin (and Devin Desktop)" : "already set up — nothing changed");
+    const skills = installSkills(ROOT);
+    say(r.wrote || skills.changed ? "Devin sessions will now show in Nomo — restart devin (and Devin Desktop)" : "already set up — nothing changed");
+    for (const s of skills.skipped) say(`skipped ${s}: you already have your own skill with that name (${skillFile(s.slice(1))}) — left as is`);
     comments(r);
     if (VERBOSE) {
       say(`config -> ${CONFIG}`);
       say(`status hook   -> ${join(ROOT, "dist", "devin-status.mjs")} (UserPromptSubmit, PostToolUse, Stop, SessionEnd)`);
       say(`approval hook -> ${join(ROOT, "dist", "devin-approve.mjs")} (PermissionRequest, PreToolUse ask_user_question, timeout ${APPROVAL_TIMEOUT}s)`);
+      say(`skills -> ${skills.written.join(" ")} in ${devinSkillsDir()}/`);
     }
   } catch (e) {
     fail(`could not finish — ${e?.message ?? e}`);

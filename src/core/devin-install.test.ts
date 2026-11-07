@@ -53,6 +53,7 @@ async function checkout(tmp: string, name: string): Promise<{ root: string; scri
   await mkdir(join(root, "scripts"), { recursive: true });
   await mkdir(join(root, "dist"), { recursive: true });
   await cp(SCRIPT, join(root, "scripts", "devin-install.mjs"));
+  await cp(join(import.meta.dir, "../../plugin/devin-skills"), join(root, "devin-skills"), { recursive: true });
   await writeFile(join(root, "scripts", "run.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
   for (const f of ["devin-status.mjs", "devin-approve.mjs"]) await writeFile(join(root, "dist", f), "// stub\n");
   return { root, script: join(root, "scripts", "devin-install.mjs") };
@@ -248,6 +249,42 @@ describe("devin-install.mjs", () => {
     expect(r.code).toBe(0);
     expect(r.out.trim()).toBe("devin-install: Nomo is already installed as a Devin plugin — nothing to do");
     expect(await stat(b.config).then(() => true, () => false)).toBe(false);
+    expect(existsSync(join(b.home, ".config", "devin", "skills"))).toBe(false); // the plugin gives /nomo:*
+  });
+
+  const SKILLS = ["approvals", "pair", "reset", "status", "unpair"];
+  const skillPath = (b: Box, name: string) => join(b.home, ".config", "devin", "skills", name, "SKILL.md");
+
+  test("install writes the user-level /nomo-* skills from the plugin's, pointed at this checkout", async () => {
+    const b = await box();
+    expect((await run(b)).code).toBe(0);
+    for (const name of SKILLS) {
+      const text = await readFile(skillPath(b, `nomo-${name}`), "utf8");
+      expect(text).toContain(`name: nomo-${name}\n`);
+      expect(text).toContain(`for NOMOR in "${b.root}"; do`);
+      expect(text).not.toContain("plugins/cache");
+      expect(text).not.toContain("/nomo:");
+      expect(text).not.toContain("devin plugins install");
+      expect(text.trimEnd().endsWith("<!-- nomo-devin-install -->")).toBe(true);
+    }
+    expect(await readFile(skillPath(b, "nomo-status"), "utf8")).toContain("suggest `/nomo-pair`");
+    const again = await run(b);
+    expect(again.out).toContain("already set up — nothing changed");
+  });
+
+  test("a same-named skill of the user's is skipped with a note, and survives uninstall; ours go", async () => {
+    const b = await box();
+    await mkdir(join(b.home, ".config", "devin", "skills", "nomo-reset"), { recursive: true });
+    await writeFile(skillPath(b, "nomo-reset"), "mine\n");
+    const r = await run(b);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("skipped /nomo-reset: you already have your own skill with that name");
+    expect(await readFile(skillPath(b, "nomo-reset"), "utf8")).toBe("mine\n");
+    expect(existsSync(skillPath(b, "nomo-status"))).toBe(true);
+    const u = await run(b, ["--uninstall"]);
+    expect(u.out).toContain("removed the /nomo-approvals /nomo-pair /nomo-status /nomo-unpair skills");
+    expect(await readFile(skillPath(b, "nomo-reset"), "utf8")).toBe("mine\n");
+    for (const name of ["approvals", "pair", "status", "unpair"]) expect(existsSync(join(b.home, ".config", "devin", "skills", `nomo-${name}`))).toBe(false);
   });
 });
 
@@ -271,12 +308,13 @@ describe("native Devin plugin", () => {
     }
   });
 
-  test("manifest: name nomo, local only, skills from plugin/devin-skills (pair + status)", async () => {
+  test("manifest: name nomo, local only, skills from plugin/devin-skills (pair, status, approvals, reset, unpair)", async () => {
     const manifest = await read(join(REPO, ".devin-plugin", "plugin.json"));
     expect(manifest).toMatchObject({ name: "nomo", platforms: ["local"], skills: "plugin/devin-skills" });
     expect(manifest).not.toHaveProperty("hooks"); // hooks come from root hooks.json
-    for (const skill of ["pair", "status"]) {
+    for (const skill of ["approvals", "pair", "reset", "status", "unpair"]) {
       const text = await readFile(join(REPO, "plugin", "devin-skills", skill, "SKILL.md"), "utf8");
+      expect(text).toContain('"$HOME"/.local/share/devin/cli/plugins/cache/*nomo*/*/plugin'); // userSkill() swaps exactly this
       expect(text).toContain(`name: ${skill}`);
       expect(text).not.toContain("__NOMO_ROOT__");
     }

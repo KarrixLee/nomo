@@ -160,6 +160,7 @@ For scripting and CI:
 | `--all` | all of them, detected or not — except Cursor, Antigravity and Devin, which are skipped with a note when they are not on this machine (name `--cursor` / `--antigravity` / `--devin` to try anyway) |
 | `-y`, `--yes` | no prompt; install everything detected |
 | `-n`, `--dry-run` | print the commands, run nothing |
+| `--uninstall` | with `--cursor`, `--antigravity` or `--devin`: remove Nomo from that agent (runs `~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall`). An agent flag is required. For Claude Code, Codex, OpenCode and the Devin plugin it prints the host's own removal command instead |
 | `--ref <branch\|tag>` | **OpenCode, Cursor, Antigravity and Devin only** — install from that ref instead of the default branch |
 | `-h`, `--help` / `-v`, `--version` | |
 
@@ -440,7 +441,7 @@ To update, run `bunx nomo-ai --cursor` again (it pulls `~/.nomo`; the hook entri
 checkout, so a pull is the whole update). To remove it:
 
 ```sh
-node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall
+bunx nomo-ai --uninstall --cursor   # or: node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall
 ```
 
 which removes exactly Nomo's hook entries and skills and leaves everything else in `hooks.json` as it
@@ -554,7 +555,7 @@ A `nomo` folder without that marker is someone else's: the installer refuses and
 To remove it:
 
 ```sh
-node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall
+bunx nomo-ai --uninstall --antigravity   # or: node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall
 ```
 
 which deletes only the `"nomo"` block and the `nomo` plugin folder Nomo installed. Pairing is untouched.
@@ -573,7 +574,8 @@ devin plugins install KarrixLee/nomo
 
 or in Devin Desktop: **Customize → Plugins → From repository** → `KarrixLee/nomo`. The plugin runs only
 in local Devin sessions (the CLI and Devin Desktop), never in Devin cloud sessions. Pair with
-`/nomo:pair` and check with `/nomo:status`. To remove it: `devin plugins remove nomo`.
+`/nomo:pair` and check with `/nomo:status`; `/nomo:approvals`, `/nomo:reset` and `/nomo:unpair` are
+there too. To remove it: `devin plugins remove nomo`.
 
 **Or with the installer:**
 
@@ -582,13 +584,13 @@ bunx nomo-ai --devin     # or, from a checkout: node plugin/scripts/devin-instal
 ```
 
 It merges Nomo's hooks into the `"hooks"` key of `~/.config/devin/config.json` (read by both the CLI
-and Devin Desktop). If the Nomo plugin is already installed, it says so and changes nothing. **Restart
-devin** (and Devin Desktop). Already paired from another agent? Nothing else to do. Otherwise pair from
-a terminal (the installer adds no `/nomo:*` commands):
+and Devin Desktop) and adds Devin skills `/nomo-pair`, `/nomo-status`, `/nomo-approvals`, `/nomo-reset`
+and `/nomo-unpair` (the plugin's `/nomo:*` commands under the same names other agents use). If the Nomo
+plugin is already installed, it says so and changes nothing. **Restart devin** (and Devin Desktop).
+Already paired from another agent? Nothing else to do. Otherwise type **`/nomo-pair`** in devin.
 
-```sh
-~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs
-```
+If a skill can't be used, the same commands run from a terminal, e.g.
+`~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs` (or `status-cmd.mjs devin`).
 
 Either way, Devin Desktop's **Restricted Mode** turns hooks off, and Nomo with them: sessions stop
 reaching the phone until you leave it.
@@ -596,15 +598,17 @@ reaching the phone until you leave it.
 **What the installer writes.** Nomo's entries go into the `"hooks"` key of `config.json`, next to your
 other Devin settings, which are left as they are: a status hook on `UserPromptSubmit`, `PostToolUse`,
 `Stop` and `SessionEnd`, and the phone-approval hook on `PermissionRequest` and on `PreToolUse` (only
-for `ask_user_question`, Devin's question). Running it again changes nothing. If your `config.json` has comments, the
+for `ask_user_question`, Devin's question). The five skills go to `~/.config/devin/skills/nomo-*/SKILL.md`,
+each marked as Nomo's; a skill of yours with the same name is left alone (the installer says it
+skipped it). Running it again changes nothing. If your `config.json` has comments, the
 installer first copies it to `config.json.nomo-backup`, then writes it back without the comments, and
 says so. `devin`'s `/hooks` command shows what it loaded. To remove it:
 
 ```sh
-node ~/.nomo/plugin/scripts/devin-install.mjs --uninstall
+bunx nomo-ai --uninstall --devin   # or: node ~/.nomo/plugin/scripts/devin-install.mjs --uninstall
 ```
 
-which removes only Nomo's entries. Pairing is untouched.
+which removes only Nomo's entries and its marked skills. Pairing is untouched.
 
 A Devin row shows working → needs you → done like the other agents, with Devin's own session title.
 From the phone:
@@ -627,8 +631,8 @@ From the phone:
 **Devin Desktop** (Devin Local) works like the CLI. While your phone holds a prompt or a question,
 Devin Desktop shows **no buttons of its own** for it (the same as Claude Code's terminal). To keep
 answering at the Mac, pause remote approvals on this computer before the next prompt — the
-machine-wide switch behind `/nomo-cc:approvals off`; with the installer,
-`~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/cc-permission.mjs off` (`on` to resume). In
+machine-wide switch: `/nomo-approvals off` (with the Devin plugin: `/nomo:approvals off`; `on` to
+resume). In
 Desktop's default **Code** mode Devin only asks for commands, web fetches and writes outside the
 project, so those are the prompts that reach the phone. **Restricted Mode** turns hooks off, and Nomo
 with them.
@@ -698,7 +702,9 @@ description is dropped before the command is.
   notices its parent shell is gone, withdraws the phone's card and exits. Nomo's Claude Code hooks stand
   down inside Devin (Devin also runs `~/.claude` hooks), so a Devin session never shows up as a
   Claude Code row and never gets its prompts answered by them. The installer writes only its own
-  entries; remove them with `node ~/.nomo/plugin/scripts/devin-install.mjs --uninstall` The Devin
+  entries and the marked `/nomo-*` skills in `~/.config/devin/skills` (they run only Nomo's own local
+  commands from the checkout and never print the pairing link or QR secret); remove them with
+  `bunx nomo-ai --uninstall --devin`. The Devin
   plugin registers the same two bundles through its `hooks.json` (it adds no rules, MCP servers or
   agents, and declares itself local-only); while the installer's entries are present, its copies exit
   without sending anything. Remove it with `devin plugins remove nomo`.
@@ -757,7 +763,7 @@ description is dropped before the command is.
   From Antigravity's `conversation_summaries.db` it reads only the `title`, `status` and
   `last_modified_time` of that one conversation, read-only; the conversation id must be UUID-shaped
   before it is put into the query, and only the two Antigravity data dirs are ever read. Remove it with
-  `node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall` (deletes only that block and the
+  `bunx nomo-ai --uninstall --antigravity` (deletes only that block and the
   marked plugin folder). The `/nomo-*` skills run only Nomo's own local commands (pair, status, the
   approvals switch, reset, unpair) from the checkout; they never print the pairing link or QR secret.
   So that `/nomo-status` doesn't put a card on your phone, the approval hook answers `auto_approve`

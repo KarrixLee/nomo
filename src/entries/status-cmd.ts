@@ -142,22 +142,13 @@ const AGENT_UI: Record<AgentKind, { name: string; pair: string; approvalsOn: str
   cursor: { name: "Cursor", pair: "/nomo-pair", approvalsOn: "/nomo-cc:approvals on (in Claude Code — Cursor sessions are read-only)", status: "/nomo-status" },
   // Antigravity's own /nomo-* skills (the "nomo" plugin the installer puts in ~/.gemini/config/plugins).
   antigravity: { name: "Antigravity", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
-  // Devin via `nomo-ai --devin` has no /nomo-* skills: every command is the bundle itself, typed in a
-  // terminal. The native plugin's skills are DEVIN_PLUGIN_UI below.
-  devin: {
-    name: "Devin",
-    pair: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/pair.mjs",
-    approvalsOn: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/cc-permission.mjs on",
-    status: "~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/status-cmd.mjs devin",
-  },
+  // Devin via `nomo-ai --devin`: the user-level /nomo-* skills devin-install.mjs writes to
+  // ~/.config/devin/skills. The native plugin's skills are DEVIN_PLUGIN_UI below.
+  devin: { name: "Devin", pair: "/nomo-pair", approvalsOn: "/nomo-approvals on", status: "/nomo-status" },
 };
 
-/** Devin with the native plugin (and no nomo-ai checkout): its own skills, and the version-stable
- *  shim for the one command it has no skill for. */
-const DEVIN_PLUGIN_UI = {
-  name: "Devin", pair: "/nomo:pair", status: "/nomo:status",
-  approvalsOn: "~/.config/cc-status/hook-shim.sh cc-permission on",
-};
+/** Devin with the native plugin (and no nomo-ai checkout): the plugin's own /nomo:* skills. */
+const DEVIN_PLUGIN_UI = { name: "Devin", pair: "/nomo:pair", approvalsOn: "/nomo:approvals on", status: "/nomo:status" };
 
 /** Fixed order, so two runs on the same machine never disagree about where to look. */
 const AGENT_ORDER: AgentKind[] = ["claude", "codex", "opencode", "cursor", "antigravity", "devin"];
