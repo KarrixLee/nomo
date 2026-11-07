@@ -167,7 +167,7 @@ computer names from the app's own App Group container. It never leaves the devic
 |---|---|---|
 | `~/.config/cc-status/config.json` (`0600`) | pairing id, computer secret, 32-byte key; deleted by unpair (after a server revoke) | pair |
 | `~/.config/cc-status/sessions/*.json` (`0600`) | one record per live session (agent pid, last sealed blob) | hooks, watchdog |
-| `~/.config/cc-status/sessions/<id>.devin-allow` (owner-only) | Devin "Always allow (this session)" grants | Devin approval hook |
+| `~/.config/cc-status/sessions/<id>.devin-allow` (owner-only) | Devin "Always allow (this session)" grants; deleted by unpair and reset | Devin approval hook |
 | `~/.config/cc-status/sessions/<conv>.<id>.agy-inbox` (owner-only) | queued Antigravity phone replies, deleted after a day | watchdog |
 | `~/.config/cc-status/hook-shim.sh` (`0700`) | version-stable hook launcher | `run.sh`, pair |
 | `~/.config/cc-status/activity-days.json`, `machine-id` | activity summary, per-computer id | watchdog |
@@ -206,7 +206,8 @@ real installs never set it, and anything that can set your agent's environment c
   label in its own language. Format: `""`, or one or more entries joined by `\n`, each `kind` or
   `kind:literal` (the literal is everything after the first `:`, has no control characters, is capped at
   80 characters, and the phone shows it verbatim in monospace, never as Markdown). Kinds: `cmd:<prefix>`
-  (commands starting with it), `exact` (this exact command), `domain:<host>`, `edit:<glob>`,
+  (commands starting with it, or a Claude Code rule with a `*` wildcard shown as written), `exact` (this
+  exact command), `domain:<host>`, `edit:<glob>`,
   `dir:<path>` (one folder), `dirs:<N>` (N folders), `edits`, `reads`, `fetches`, `searches`, `commands`
   (every one of that kind), `planmode`, `automode`, `plans` (plan approvals), `tool:<tool id>` (the whole
   tool) and `similar` (a rule the plugin can't name; also how the phone shows a kind it doesn't know).
@@ -363,11 +364,14 @@ real installs never set it, and anything that can set your agent's environment c
   hook notices its parent shell is gone, withdraws the card and exits.
 - **"Always allow (this session)"** is stored only on this computer in
   `~/.config/cc-status/sessions/<session>.devin-allow` and forgotten when the session ends (or Nomo
-  retires its quiet row). While it exists a matching request in that session is approved at once, even
-  with approvals paused. A shell grant covers the command's name for plain commands only (`touch` covers
+  retires its quiet row), and every one is deleted by unpair and by reset. While it exists, and only
+  while this computer is paired, a matching request in that session is approved at once, even with
+  approvals paused. A shell grant covers the command's name for plain commands only (`touch` covers
   `touch b.txt`, not `touchy`); anything with `&&`, `;`, `|`, `$(…)`, backticks or a redirect is covered
-  only by a grant for that exact text, so `touch x && rm -rf ~` still asks. For any other tool it covers
-  that tool for the session.
+  only by a grant for that exact text, so `touch x && rm -rf ~` still asks. A command that runs other
+  commands or code (`bash`, `sh`, `env`, `sudo`, `xargs`, `npx`, `python3`, `node`, `bun` and similar)
+  never becomes a name grant: the grant is that exact text, so `bash scripts/test.sh` does not cover
+  `bash -c "…"`. For any other tool it covers that tool for the session.
 - **Own commands:** on a paired computer, before any card, Nomo auto-approves exactly six command lines,
   rebuilt in code and matched byte for byte against what the skills run (the plugin's `/nomo:*` and the
   installer's `/nomo-*` forms, with at most Devin Desktop's `workdir` beside them): status, approvals
