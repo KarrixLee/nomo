@@ -729,6 +729,7 @@ async function completePendingPairing(pending, configPath, opts = {}) {
     e2eKeyB64: b64url(e2eKey),
     ...pending.machineName ? { machineName: pending.machineName } : {}
   }), CONFIG_MODE);
+  await forgetAllDevinGrants(opts.sessionsDir ?? join(dirname(configPath), "sessions"));
   for (let attempt = 0;attempt < ackAttempts; attempt++) {
     try {
       await fetchFn(`${pending.url}/v1/cc/pair/ack`, {

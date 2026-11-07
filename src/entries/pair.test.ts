@@ -875,6 +875,26 @@ describe("completePendingPairing", () => {
     expect((await stat(configPath)).mode & 0o777).toBe(0o600);
   });
 
+  test("a new pairing forgets every Devin Always-allow grant; a failed pairing keeps them", async () => {
+    const sessionsDir = join(dir, "sessions");
+    await mkdir(sessionsDir, { recursive: true });
+    const grant = join(sessionsDir, "old-devin.devin-allow");
+    await writeFile(grant, JSON.stringify(["exec:git"])); // granted under the OLD pairing
+
+    const failed = scriptedFetch([() => json({ error: "not found" }, 404)]);
+    expect((await completePendingPairing(pending(), configPath, { fetchFn: failed.fn })).state).toBe("gone");
+    expect(await readFile(grant, "utf8")).toContain("exec:git"); // failed pair → grants kept
+
+    const phoneKey = await ratchetK1(QR_SECRET);
+    const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("P")));
+    const { fn } = scriptedFetch([
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
+      () => json({ ok: true }),
+    ]);
+    expect((await completePendingPairing(pending(), configPath, { fetchFn: fn, ackAttempts: 1 })).state).toBe("completed");
+    await expect(stat(grant)).rejects.toBeDefined(); // new pairing → grants gone
+  });
+
   test("deletes the transient pairing page on completion (covers the watchdog self-heal path)", async () => {
     const htmlPath = join(dir, PAIR_HTML_FILE);
     await writeFile(htmlPath, "<html>the pairing QR secret + code</html>"); // what pair left next to config

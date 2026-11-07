@@ -1653,6 +1653,13 @@ export async function completePendingPairing(
     ...(pending.machineName ? { machineName: pending.machineName } : {}),
   }), CONFIG_MODE);
 
+  // A new pairing starts with no Devin "Always allow" grants: they belong to the pairing that approved
+  // them, and re-pairing over an old config (no unpair first) would otherwise carry them over. Both
+  // completers (`pair wait` and the watchdog self-heal) funnel through here. Only after the new config
+  // is saved — a failed/cancelled pairing returns above and keeps them. Sessions dir sits next to
+  // config.json (as unpair resolves it) unless injected.
+  await forgetAllDevinGrants(opts.sessionsDir ?? join(dirname(configPath), "sessions"));
+
   // Ack so the worker drops the nonce + name blob. Best-effort (pairing is already complete either
   // way); the /cc/event route self-heals a lost ack on the PC's first post-pair hook.
   for (let attempt = 0; attempt < ackAttempts; attempt++) {
