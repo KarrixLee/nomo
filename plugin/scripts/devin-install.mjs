@@ -16,7 +16,8 @@
 //   * Devin's config is JSON "with comment support". A strict-JSON file is merged as is. A file that
 //     only parses once comments are stripped is copied to config.json.nomo-backup first, then written
 //     back without its comments (said in one line);
-//   * unparseable, not an object, a dangling symlink, hard-linked, unwritable → refuse, write nothing;
+//   * unparseable, not an object, a hooks event of ours that is not a list, a dangling symlink,
+//     hard-linked, unwritable → refuse, write nothing;
 //   * written to a temp file (the original's mode; a new file is 0600 in a 0700 dir) and renamed,
 //     through a live symlink; the file is re-read just before the rename and the merge re-applied if
 //     another tool wrote it in between. A file that already says what we want is not rewritten.
@@ -156,6 +157,13 @@ export function mergeHooks(config, root) {
   const out = structuredClone(config);
   const want = devinHooks(root);
   const hooks = (out.hooks ??= {});
+  // An event we write whose value is not a list is the user's data in a shape we don't know: refuse
+  // (main reports it, nothing is written) rather than replace it with [].
+  for (const event of Object.keys(want)) {
+    if (hooks[event] !== undefined && !Array.isArray(hooks[event])) {
+      throw new Error(`"hooks.${event}" in Devin's config.json is not a list — fix or move it, nothing was changed`);
+    }
+  }
   for (const event of Object.keys(hooks)) {
     if (event in want || !Array.isArray(hooks[event])) continue;
     const kept = hooks[event].filter((e) => !isOurs(e));
@@ -164,7 +172,7 @@ export function mergeHooks(config, root) {
     }
   }
   for (const [event, [entry]] of Object.entries(want)) {
-    const list = Array.isArray(hooks[event]) ? hooks[event] : (hooks[event] = []);
+    const list = (hooks[event] ??= []);
     const at = list.findIndex(isOurs);
     if (at === -1) { list.push(entry); continue; }
     list[at] = entry;

@@ -220,6 +220,21 @@ describe("devin-install.mjs", () => {
     expect(await readFile(h.config, "utf8")).toBe("{}");
   });
 
+  test("a hooks event of ours that is not a list is the user's data: refuse, exit 1, file untouched", async () => {
+    const m = await mod();
+    expect(() => m.mergeHooks({ hooks: { PermissionRequest: { mine: true } } }, "/r")).toThrow("hooks.PermissionRequest");
+    // an event we don't write keeps its odd value
+    expect((m.mergeHooks({ hooks: { Custom: { mine: true } } }, "/r").hooks as Record<string, unknown>).Custom).toEqual({ mine: true });
+    const b = await box();
+    const text = JSON.stringify({ theme_mode: "dark", hooks: { Stop: { matcher: "x", hooks: [{ type: "command", command: "./mine.sh" }] } } });
+    await seed(b, text);
+    const r = await run(b);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain('"hooks.Stop"');
+    expect(r.out).toContain("nothing was changed");
+    expect(await readFile(b.config, "utf8")).toBe(text);
+  });
+
   test("writes THROUGH a live symlink (dotfiles), keeping the link", async () => {
     const b = await box();
     const real = join(b.tmp, "dotfiles-devin.json");
