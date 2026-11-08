@@ -60,6 +60,7 @@ import {
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
+import { startActivityLoop } from "../core/activity";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -4416,6 +4417,9 @@ async function run(): Promise<void> {
     void antigravitySettleTick(tickConfig).catch(() => 0).finally(() => { ticking = false; });
   }, ANTIGRAVITY_SETTLE_TICK_MS);
   (settleTimer as unknown as { unref?: () => void }).unref?.();
+  // NOM-142 daily activity summary: scan now, then hourly, off the sweep path (chunked + yielding, so
+  // the first ~2 GB backfill never stalls the 5 s poll). Self-gated on pairing; swallows every error.
+  const stopActivity = startActivityLoop();
   try {
     while (true) {
       // A claim can be stolen or removed after startup (upgrade takeover, reset, racing spawn). An
@@ -4512,6 +4516,7 @@ async function run(): Promise<void> {
     }
   } finally {
     clearInterval(settleTimer);
+    stopActivity();
     shutdown(); // bridge child AND the LAN socket — a retired daemon must leave no listener behind
     activeBridgeShutdown = undefined;
     activeCodexInterrupt = undefined;
