@@ -1,0 +1,235 @@
+{
+  "_provenance": "Live capture: throwaway CODEX_HOME, codex app-server (stdio) driven by a probe client, model gpt-5.6-luna, approval_policy=on-request, sandbox=read-only, approvals_reviewer=user. Hook = tee stdin, exit 0, no decision. app-server traffic for the same two MCP approvals. tool_name + tool_annotations ride in mcpServer/elicitation/request params._meta; mcpToolCall items carry readOnlyHint only.",
+  "_verified_live": true,
+  "codex_cli": "0.167.0",
+  "messages": [
+    {
+      "dir": "in",
+      "method": "item/started",
+      "params": {
+        "item": {
+          "type": "mcpToolCall",
+          "id": "exec-f32990e0-6d7c-4711-8398-54c35032581d",
+          "server": "demo",
+          "tool": "list_notes",
+          "status": "inProgress",
+          "arguments": {
+            "folder": "inbox"
+          },
+          "appContext": null,
+          "mcpAppUi": null,
+          "pluginId": null,
+          "readOnlyHint": true,
+          "result": null,
+          "error": null,
+          "durationMs": null,
+          "startedAtMs": 1794228207919,
+          "completedAtMs": null
+        },
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "turnId": "01a1c055-ab1f-7033-a6e4-43305a0d8fe9",
+        "startedAtMs": 1794228207919
+      },
+      "emittedAtMs": 1794228207919
+    },
+    {
+      "dir": "in",
+      "method": "mcpServer/elicitation/request",
+      "id": 1,
+      "params": {
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "turnId": "01a1c055-ab1f-7033-a6e4-43305a0d8fe9",
+        "serverName": "demo",
+        "mode": "form",
+        "_meta": {
+          "codex_approval_kind": "mcp_tool_call",
+          "tool_name": "list_notes",
+          "tool_annotations": {
+            "readOnlyHint": true,
+            "openWorldHint": false
+          },
+          "tool_title": "List notes",
+          "tool_description": "Lists note titles. Read-only.",
+          "tool_params": {
+            "folder": "inbox"
+          },
+          "tool_params_display": [
+            {
+              "name": "folder",
+              "value": "inbox",
+              "display_name": "folder"
+            }
+          ]
+        },
+        "message": "Allow the demo MCP server to run tool \"list_notes\"?",
+        "requestedSchema": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "dir": "out",
+      "id": 1,
+      "result": {
+        "action": "decline",
+        "content": null
+      }
+    },
+    {
+      "dir": "in",
+      "method": "serverRequest/resolved",
+      "params": {
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "requestId": 1
+      },
+      "emittedAtMs": 1794228207930
+    },
+    {
+      "dir": "in",
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "type": "mcpToolCall",
+          "id": "exec-f32990e0-6d7c-4711-8398-54c35032581d",
+          "server": "demo",
+          "tool": "list_notes",
+          "status": "failed",
+          "arguments": {
+            "folder": "inbox"
+          },
+          "appContext": null,
+          "mcpAppUi": null,
+          "pluginId": null,
+          "readOnlyHint": true,
+          "result": null,
+          "error": {
+            "message": "user rejected MCP tool call"
+          },
+          "durationMs": 0,
+          "startedAtMs": 1794228207919,
+          "completedAtMs": 1794228207931
+        },
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "turnId": "01a1c055-ab1f-7033-a6e4-43305a0d8fe9",
+        "completedAtMs": 1794228207931
+      },
+      "emittedAtMs": 1794228207931
+    },
+    {
+      "dir": "in",
+      "method": "item/started",
+      "params": {
+        "item": {
+          "type": "mcpToolCall",
+          "id": "exec-f70c4565-b2e5-486a-be62-cb633a121998",
+          "server": "demo",
+          "tool": "delete_note",
+          "status": "inProgress",
+          "arguments": {
+            "id": "n1"
+          },
+          "appContext": null,
+          "mcpAppUi": null,
+          "pluginId": null,
+          "readOnlyHint": false,
+          "result": null,
+          "error": null,
+          "durationMs": null,
+          "startedAtMs": 1794228207942,
+          "completedAtMs": null
+        },
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "turnId": "01a1c055-ab1f-7033-a6e4-43305a0d8fe9",
+        "startedAtMs": 1794228207942
+      },
+      "emittedAtMs": 1794228207942
+    },
+    {
+      "dir": "in",
+      "method": "mcpServer/elicitation/request",
+      "id": 2,
+      "params": {
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "turnId": "01a1c055-ab1f-7033-a6e4-43305a0d8fe9",
+        "serverName": "demo",
+        "mode": "form",
+        "_meta": {
+          "codex_approval_kind": "mcp_tool_call",
+          "tool_name": "delete_note",
+          "tool_annotations": {
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": true,
+            "openWorldHint": false
+          },
+          "tool_title": "Delete note",
+          "tool_description": "Deletes a note permanently.",
+          "tool_params": {
+            "id": "n1"
+          },
+          "tool_params_display": [
+            {
+              "name": "id",
+              "value": "n1",
+              "display_name": "id"
+            }
+          ]
+        },
+        "message": "Allow the demo MCP server to run tool \"delete_note\"?",
+        "requestedSchema": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    {
+      "dir": "out",
+      "id": 2,
+      "result": {
+        "action": "decline",
+        "content": null
+      }
+    },
+    {
+      "dir": "in",
+      "method": "serverRequest/resolved",
+      "params": {
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "requestId": 2
+      },
+      "emittedAtMs": 1794228207953
+    },
+    {
+      "dir": "in",
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "type": "mcpToolCall",
+          "id": "exec-f70c4565-b2e5-486a-be62-cb633a121998",
+          "server": "demo",
+          "tool": "delete_note",
+          "status": "failed",
+          "arguments": {
+            "id": "n1"
+          },
+          "appContext": null,
+          "mcpAppUi": null,
+          "pluginId": null,
+          "readOnlyHint": false,
+          "result": null,
+          "error": {
+            "message": "user rejected MCP tool call"
+          },
+          "durationMs": 0,
+          "startedAtMs": 1794228207942,
+          "completedAtMs": 1794228207953
+        },
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "turnId": "01a1c055-ab1f-7033-a6e4-43305a0d8fe9",
+        "completedAtMs": 1794228207953
+      },
+      "emittedAtMs": 1794228207953
+    }
+  ]
+}

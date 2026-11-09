@@ -1,0 +1,235 @@
+{
+  "_provenance": "Live capture, same harness but approvals_reviewer=auto_review (Guardian). Ordered app-server events for one apply_patch: PreToolUse hook -> fileChange item/started -> PermissionRequest hook -> autoApprovalReview started/completed -> item/completed. Hook stdin is identical to the manual case (permission_mode 'default'); turn_context.approvals_reviewer='auto_review' in the rollout is the only signal.",
+  "_verified_live": true,
+  "codex_cli": "0.167.0",
+  "hook_stdin_permission_request": {
+    "session_id": "01a1c058-80ae-7460-82f4-2361cb84d547",
+    "turn_id": "01a1c058-80e6-7ce3-8642-c6ce61f4951c",
+    "transcript_path": "/Users/me/.codex/sessions/2026/11/09/rollout-2026-11-09T20-46-28-01a1c058-80ae-7460-82f4-2361cb84d547.jsonl",
+    "cwd": "/Users/me/project",
+    "hook_event_name": "PermissionRequest",
+    "model": "gpt-5.6-luna",
+    "permission_mode": "default",
+    "tool_name": "apply_patch",
+    "tool_input": {
+      "command": "*** Begin Patch\n*** Update File: /Users/me/project/notes.txt\n@@\n-world\n+there\n*** End Patch"
+    }
+  },
+  "messages": [
+    {
+      "dir": "in",
+      "method": "hook/started",
+      "params": {
+        "threadId": "01a1c058-80ae-7460-82f4-2361cb84d547",
+        "turnId": "01a1c058-80e6-7ce3-8642-c6ce61f4951c",
+        "run": {
+          "id": "pre-tool-use:0:/Users/me/.codex/config.toml:exec-053b63a6-65d8-42ea-80ca-d1df9c4343fc",
+          "eventName": "preToolUse",
+          "handlerType": "command",
+          "executionMode": "sync",
+          "scope": "turn",
+          "sourcePath": "/Users/me/.codex/config.toml",
+          "source": "user",
+          "displayOrder": 0,
+          "status": "running",
+          "statusMessage": null,
+          "startedAt": 1794228395,
+          "completedAt": null,
+          "durationMs": null,
+          "entries": []
+        }
+      },
+      "emittedAtMs": 1794228395960
+    },
+    {
+      "dir": "in",
+      "method": "hook/completed",
+      "params": {
+        "threadId": "01a1c058-80ae-7460-82f4-2361cb84d547",
+        "turnId": "01a1c058-80e6-7ce3-8642-c6ce61f4951c",
+        "run": {
+          "id": "pre-tool-use:0:/Users/me/.codex/config.toml:exec-053b63a6-65d8-42ea-80ca-d1df9c4343fc",
+          "eventName": "preToolUse",
+          "handlerType": "command",
+          "executionMode": "sync",
+          "scope": "turn",
+          "sourcePath": "/Users/me/.codex/config.toml",
+          "source": "user",
+          "displayOrder": 0,
+          "status": "completed",
+          "statusMessage": null,
+          "startedAt": 1794228395,
+          "completedAt": 1794228395,
+          "durationMs": 25,
+          "entries": []
+        }
+      },
+      "emittedAtMs": 1794228395985
+    },
+    {
+      "dir": "in",
+      "method": "item/started",
+      "params": {
+        "item": {
+          "type": "fileChange",
+          "id": "exec-053b63a6-65d8-42ea-80ca-d1df9c4343fc",
+          "changes": [
+            {
+              "path": "/Users/me/project/notes.txt",
+              "kind": {
+                "type": "update",
+                "move_path": null
+              },
+              "diff": "@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+            }
+          ],
+          "status": "inProgress",
+          "startedAtMs": 1794228395985,
+          "completedAtMs": null
+        },
+        "threadId": "01a1c058-80ae-7460-82f4-2361cb84d547",
+        "turnId": "01a1c058-80e6-7ce3-8642-c6ce61f4951c",
+        "startedAtMs": 1794228395985
+      },
+      "emittedAtMs": 1794228395985
+    },
+    {
+      "dir": "in",
+      "method": "hook/started",
+      "params": {
+        "threadId": "01a1c058-80ae-7460-82f4-2361cb84d547",
+        "turnId": "01a1c058-80e6-7ce3-8642-c6ce61f4951c",
+        "run": {
+          "id": "permission-request:1:/Users/me/.codex/config.toml:exec-053b63a6-65d8-42ea-80ca-d1df9c4343fc",
+          "eventName": "permissionRequest",
+          "handlerType": "command",
+          "executionMode": "sync",
+          "scope": "turn",
+          "sourcePath": "/Users/me/.codex/config.toml",
+          "source": "user",
+          "displayOrder": 1,
+          "status": "running",
+          "statusMessage": null,
+          "startedAt": 1794228395,
+          "completedAt": null,
+          "durationMs": null,
+          "entries": []
+        }
+      },
+      "emittedAtMs": 1794228395989
+    },
+    {
+      "dir": "in",
+      "method": "hook/completed",
+      "params": {
+        "threadId": "01a1c058-80ae-7460-82f4-2361cb84d547",
+        "turnId": "01a1c058-80e6-7ce3-8642-c6ce61f4951c",
+        "run": {
+          "id": "permission-request:1:/Users/me/.codex/config.toml:exec-053b63a6-65d8-42ea-80ca-d1df9c4343fc",
+          "eventName": "permissionRequest",
+          "handlerType": "command",
+          "executionMode": "sync",
+          "scope": "turn",
+          "sourcePath": "/Users/me/.codex/config.toml",
+          "source": "user",
+          "displayOrder": 1,
+          "status": "completed",
+          "statusMessage": null,
+          "startedAt": 1794228395,
+          "completedAt": 1794228396,
+          "durationMs": 19,
+          "entries": []
+        }
+      },
+      "emittedAtMs": 1794228396008
+    },
+    {
+      "dir": "in",
+      "method": "item/autoApprovalReview/started",
+      "params": {
+        "threadId": "01a1c058-80ae-7460-82f4-2361cb84d547",
+        "turnId": "01a1c058-80e6-7ce3-8642-c6ce61f4951c",
+        "startedAtMs": 1794228396009,
+        "reviewId": "0a5c81aa-ad21-494a-b76c-37574d4a50af",
+        "targetItemId": "exec-053b63a6-65d8-42ea-80ca-d1df9c4343fc",
+        "review": {
+          "status": "inProgress",
+          "riskLevel": null,
+          "userAuthorization": null,
+          "rationale": null
+        },
+        "action": {
+          "type": "applyPatch",
+          "cwd": "/Users/me/project",
+          "files": [
+            "/Users/me/project/notes.txt"
+          ]
+        }
+      },
+      "emittedAtMs": 1794228396010
+    },
+    {
+      "dir": "in",
+      "method": "guardianWarning",
+      "params": {
+        "threadId": "01a1c058-80ae-7460-82f4-2361cb84d547",
+        "message": "Automatic approval review approved (risk: low, authorization: high): The user explicitly authorized this narrow, reversible one-line edit to notes.txt using apply_patch."
+      },
+      "emittedAtMs": 1794228398897
+    },
+    {
+      "dir": "in",
+      "method": "item/autoApprovalReview/completed",
+      "params": {
+        "threadId": "01a1c058-80ae-7460-82f4-2361cb84d547",
+        "turnId": "01a1c058-80e6-7ce3-8642-c6ce61f4951c",
+        "startedAtMs": 1794228396009,
+        "completedAtMs": 1794228398896,
+        "reviewId": "0a5c81aa-ad21-494a-b76c-37574d4a50af",
+        "targetItemId": "exec-053b63a6-65d8-42ea-80ca-d1df9c4343fc",
+        "decisionSource": "agent",
+        "review": {
+          "status": "approved",
+          "riskLevel": "low",
+          "userAuthorization": "high",
+          "rationale": "The user explicitly authorized this narrow, reversible one-line edit to notes.txt using apply_patch."
+        },
+        "action": {
+          "type": "applyPatch",
+          "cwd": "/Users/me/project",
+          "files": [
+            "/Users/me/project/notes.txt"
+          ]
+        }
+      },
+      "emittedAtMs": 1794228398897
+    },
+    {
+      "dir": "in",
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "type": "fileChange",
+          "id": "exec-053b63a6-65d8-42ea-80ca-d1df9c4343fc",
+          "changes": [
+            {
+              "path": "/Users/me/project/notes.txt",
+              "kind": {
+                "type": "update",
+                "move_path": null
+              },
+              "diff": "@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+            }
+          ],
+          "status": "completed",
+          "startedAtMs": 1794228395985,
+          "completedAtMs": 1794228398943
+        },
+        "threadId": "01a1c058-80ae-7460-82f4-2361cb84d547",
+        "turnId": "01a1c058-80e6-7ce3-8642-c6ce61f4951c",
+        "completedAtMs": 1794228398943
+      },
+      "emittedAtMs": 1794228398945
+    }
+  ]
+}

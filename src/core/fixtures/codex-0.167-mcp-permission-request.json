@@ -1,0 +1,63 @@
+{
+  "_provenance": "Live capture: throwaway CODEX_HOME, codex app-server (stdio) driven by a probe client, model gpt-5.6-luna, approval_policy=on-request, sandbox=read-only, approvals_reviewer=user. Hook = tee stdin, exit 0, no decision. PermissionRequest hook stdin for two MCP tools from a local demo server: list_notes (readOnlyHint:true) and delete_note (destructiveHint:true). Hook gets only mcp__<server>__<tool> + raw arguments; no annotations.",
+  "_verified_live": true,
+  "codex_cli": "0.167.0",
+  "hook_stdin": [
+    {
+      "session_id": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+      "turn_id": "01a1c055-ab1f-7033-a6e4-43305a0d8fe9",
+      "transcript_path": "/Users/me/.codex/sessions/2026/11/09/rollout-2026-11-09T20-43-11-01a1c055-76f8-7221-bd63-8c7dbac584db.jsonl",
+      "cwd": "/Users/me/project",
+      "hook_event_name": "PermissionRequest",
+      "model": "gpt-5.6-luna",
+      "permission_mode": "default",
+      "tool_name": "mcp__demo__list_notes",
+      "tool_input": {
+        "folder": "inbox"
+      }
+    },
+    {
+      "session_id": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+      "turn_id": "01a1c055-ab1f-7033-a6e4-43305a0d8fe9",
+      "transcript_path": "/Users/me/.codex/sessions/2026/11/09/rollout-2026-11-09T20-43-11-01a1c055-76f8-7221-bd63-8c7dbac584db.jsonl",
+      "cwd": "/Users/me/project",
+      "hook_event_name": "PermissionRequest",
+      "model": "gpt-5.6-luna",
+      "permission_mode": "default",
+      "tool_name": "mcp__demo__delete_note",
+      "tool_input": {
+        "id": "n1"
+      }
+    }
+  ],
+  "pre_tool_use_stdin": [
+    {
+      "session_id": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+      "turn_id": "01a1c055-ab1f-7033-a6e4-43305a0d8fe9",
+      "transcript_path": "/Users/me/.codex/sessions/2026/11/09/rollout-2026-11-09T20-43-11-01a1c055-76f8-7221-bd63-8c7dbac584db.jsonl",
+      "cwd": "/Users/me/project",
+      "hook_event_name": "PreToolUse",
+      "model": "gpt-5.6-luna",
+      "permission_mode": "default",
+      "tool_name": "mcp__demo__list_notes",
+      "tool_input": {
+        "folder": "inbox"
+      },
+      "tool_use_id": "exec-f32990e0-6d7c-4711-8398-54c35032581d"
+    },
+    {
+      "session_id": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+      "turn_id": "01a1c055-ab1f-7033-a6e4-43305a0d8fe9",
+      "transcript_path": "/Users/me/.codex/sessions/2026/11/09/rollout-2026-11-09T20-43-11-01a1c055-76f8-7221-bd63-8c7dbac584db.jsonl",
+      "cwd": "/Users/me/project",
+      "hook_event_name": "PreToolUse",
+      "model": "gpt-5.6-luna",
+      "permission_mode": "default",
+      "tool_name": "mcp__demo__delete_note",
+      "tool_input": {
+        "id": "n1"
+      },
+      "tool_use_id": "exec-f70c4565-b2e5-486a-be62-cb633a121998"
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "_provenance": "Live capture: throwaway CODEX_HOME, codex app-server (stdio) driven by a probe client, model gpt-5.6-luna, approval_policy=on-request, sandbox=read-only, approvals_reviewer=user. Hook = tee stdin, exit 0, no decision. PermissionRequest hook stdin for apply_patch. Patch text is tool_input.command (V4A). No tool_input.description, no tool_use_id.",
+  "_verified_live": true,
+  "codex_cli": "0.167.0",
+  "hook_stdin": {
+    "session_id": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+    "turn_id": "01a1c055-80e1-7a91-a8ba-7a5f8ee89348",
+    "transcript_path": "/Users/me/.codex/sessions/2026/11/09/rollout-2026-11-09T20-43-11-01a1c055-76f8-7221-bd63-8c7dbac584db.jsonl",
+    "cwd": "/Users/me/project",
+    "hook_event_name": "PermissionRequest",
+    "model": "gpt-5.6-luna",
+    "permission_mode": "default",
+    "tool_name": "apply_patch",
+    "tool_input": {
+      "command": "*** Begin Patch\n*** Update File: notes.txt\n@@\n-world\n+there\n*** Add File: todo.txt\n+buy milk\n*** End Patch"
+    }
+  }
+}
