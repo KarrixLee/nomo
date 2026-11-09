@@ -5692,7 +5692,7 @@ function diffHunks(oldText, newText) {
   return hunks;
 }
 var count = (hunks, t) => hunks.reduce((n, h) => n + h.lines.filter((l) => l.t === t).length, 0);
-var OVERWRITE_DIFF_MAX_BYTES = 1 << 20;
+var OVERWRITE_DIFF_MAX_BYTES = 2 << 20;
 function readOverwrittenText(path) {
   let fd;
   try {

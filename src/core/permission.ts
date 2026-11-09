@@ -1021,7 +1021,9 @@ const count = (hunks: PermissionDiffHunk[], t: "add" | "del"): number =>
   hunks.reduce((n, h) => n + h.lines.filter((l) => l.t === t).length, 0);
 
 /** A Write over an existing file diffs against it only up to this size; bigger → the all-additions card. */
-export const OVERWRITE_DIFF_MAX_BYTES = 1 << 20;
+// 2 MiB covers a ~12k-line bun.lock (1.4 MB): exact diff in 4-16 ms for 80-600 changed lines; a 2 MiB
+// full rewrite hits the Myers edit cap and falls back to one block in ~60 ms (measured 2026-11-10).
+export const OVERWRITE_DIFF_MAX_BYTES = 2 << 20;
 
 /** The text a Write is about to overwrite: the string, null (no such file — the Write creates it), or
  *  undefined (exists but is not read here → the all-additions card). `file_path` is agent input, so:

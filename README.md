@@ -148,7 +148,7 @@ title, machine name, folder, status, model, tool name, command, file path, plan 
 answers, and which agent produced the event. The diff on an edit approval (patch or edit content,
 line counts) is sealed the same way as a command, in the card and in a full-text pull. For an
 overwrite (a whole-file write onto an existing file) the plugin reads that file from disk — a regular
-UTF-8 text file up to 1 MiB, never a device, FIFO or directory — so the diff also carries the current
+UTF-8 text file up to 2 MiB, never a device, FIFO or directory — so the diff also carries the current
 file's changed lines.
 
 **Daily activity summary — counts only, sealed.** While paired, the watchdog reads your agents' local
