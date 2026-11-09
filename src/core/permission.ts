@@ -22,7 +22,7 @@
 // dist/cc-permission.mjs.
 
 import { readFile, realpath, unlink } from "node:fs/promises";
-import { appendFileSync, existsSync, statSync, truncateSync } from "node:fs";
+import { appendFileSync, closeSync, constants as fsConstants, existsSync, fstatSync, openSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
@@ -940,8 +940,47 @@ function replacementHunk(oldText: string, newText: string): PermissionDiffHunk {
 const count = (hunks: PermissionDiffHunk[], t: "add" | "del"): number =>
   hunks.reduce((n, h) => n + h.lines.filter((l) => l.t === t).length, 0);
 
+/** A Write over an existing file diffs against it only up to this size; bigger → the all-additions card. */
+export const OVERWRITE_DIFF_MAX_BYTES = 1 << 20;
+/** Context lines kept around an overwrite's change (an Edit's context is its own old_string). */
+const OVERWRITE_CONTEXT_LINES = 3;
+
+/** The text a Write is about to overwrite: the string, null (no such file — the Write creates it), or
+ *  undefined (exists but is not read here → the all-additions card). `file_path` is agent input, so:
+ *  stat first (follows a symlink but opens nothing), open only a regular file under the cap, O_NONBLOCK
+ *  so a path swapped for a FIFO after the stat still cannot block the hook, and re-check the opened fd.
+ *  Strict UTF-8 with no NUL, else undefined. Never throws. */
+function readOverwrittenText(path: string): string | null | undefined {
+  let fd: number | undefined;
+  try {
+    const st = statSync(path);
+    if (!st.isFile() || st.size > OVERWRITE_DIFF_MAX_BYTES) return undefined;
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    const fst = fstatSync(fd);
+    if (!fst.isFile() || fst.size > OVERWRITE_DIFF_MAX_BYTES) return undefined;
+    const bytes = readFileSync(fd);
+    if (bytes.length > OVERWRITE_DIFF_MAX_BYTES || bytes.includes(0)) return undefined;
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? null : undefined;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* already closed */ }
+  }
+}
+
+/** A whole-file replacement hunk cut to the changed span plus a few context lines each side. */
+function trimContext(h: PermissionDiffHunk): PermissionDiffHunk {
+  const changed = h.lines.map((l) => l.t !== "ctx");
+  const first = changed.indexOf(true);
+  if (first < 0) return { lines: [] };
+  const last = changed.lastIndexOf(true);
+  return { lines: h.lines.slice(Math.max(0, first - OVERWRITE_CONTEXT_LINES), last + 1 + OVERWRITE_CONTEXT_LINES) };
+}
+
 /** The FULL diff for an edit-shaped tool, or undefined (any other tool, or an input without content —
- *  OpenCode's mapped `Edit` carries only file_path). Pure apart from Write's one existsSync. */
+ *  OpenCode's mapped `Edit` carries only file_path). Pure apart from Write's bounded read of the file it
+ *  overwrites (readOverwrittenText). */
 export function buildPermissionDiff(toolName: string, toolInput: Record<string, unknown>): PermissionDiffFile[] | undefined {
   const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
   const path = str(toolInput.file_path);
@@ -965,10 +1004,14 @@ export function buildPermissionDiff(toolName: string, toolInput: Record<string, 
     case "Write": {
       const content = str(toolInput.content);
       if (!path || content === undefined) return undefined;
-      let exists = false;
-      try { exists = existsSync(path); } catch { /* treat as new */ }
-      // An overwrite's old content is not in the input: all lines read as added, removed unknown.
-      return files([replacementHunk("", content)], exists ? "modified" : "added", exists);
+      // An overwrite's old content is not in the input, so it is read from disk (same E2E blob as an
+      // Edit's old_string). Unreadable/over-cap/binary → all lines read as added, removed unknown.
+      // ponytail: prefix/suffix match (linear), not an LCS — scattered changes count as one span;
+      // swap in Myers if real overwrites show inflated counts.
+      const old = readOverwrittenText(path);
+      if (old === null) return files([replacementHunk("", content)], "added");
+      if (old === undefined) return files([replacementHunk("", content)], "modified", true);
+      return files([trimContext(replacementHunk(old, content))]);
     }
     default: return undefined;
   }

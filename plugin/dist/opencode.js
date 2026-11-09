@@ -1,6 +1,6 @@
 // src/opencode/plugin.ts
 import { spawn as spawn2 } from "node:child_process";
-import { accessSync, constants, readFileSync as readFileSync2 } from "node:fs";
+import { accessSync, constants, readFileSync as readFileSync3 } from "node:fs";
 import { hostname as hostname3 } from "node:os";
 
 // src/core/hook.ts
@@ -3318,7 +3318,7 @@ import { appendFileSync as appendFileSync3, statSync as statSync4, truncateSync 
 
 // src/core/permission.ts
 import { readFile as readFile5, realpath, unlink as unlink3 } from "node:fs/promises";
-import { appendFileSync as appendFileSync2, existsSync as existsSync3, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, closeSync, constants as fsConstants, fstatSync, openSync, readFileSync as readFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname2 } from "node:os";
 import { basename as basename4, isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
 
@@ -3896,6 +3896,40 @@ function replacementHunk(oldText, newText) {
   };
 }
 var count = (hunks, t) => hunks.reduce((n, h) => n + h.lines.filter((l) => l.t === t).length, 0);
+var OVERWRITE_DIFF_MAX_BYTES = 1 << 20;
+var OVERWRITE_CONTEXT_LINES = 3;
+function readOverwrittenText(path) {
+  let fd;
+  try {
+    const st = statSync3(path);
+    if (!st.isFile() || st.size > OVERWRITE_DIFF_MAX_BYTES)
+      return;
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    const fst = fstatSync(fd);
+    if (!fst.isFile() || fst.size > OVERWRITE_DIFF_MAX_BYTES)
+      return;
+    const bytes = readFileSync2(fd);
+    if (bytes.length > OVERWRITE_DIFF_MAX_BYTES || bytes.includes(0))
+      return;
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (e) {
+    const code = e.code;
+    return code === "ENOENT" || code === "ENOTDIR" ? null : undefined;
+  } finally {
+    if (fd !== undefined)
+      try {
+        closeSync(fd);
+      } catch {}
+  }
+}
+function trimContext(h) {
+  const changed = h.lines.map((l) => l.t !== "ctx");
+  const first = changed.indexOf(true);
+  if (first < 0)
+    return { lines: [] };
+  const last = changed.lastIndexOf(true);
+  return { lines: h.lines.slice(Math.max(0, first - OVERWRITE_CONTEXT_LINES), last + 1 + OVERWRITE_CONTEXT_LINES) };
+}
 function buildPermissionDiff(toolName, toolInput) {
   const str = (v) => typeof v === "string" ? v : undefined;
   const path = str(toolInput.file_path);
@@ -3918,11 +3952,12 @@ function buildPermissionDiff(toolName, toolInput) {
       const content = str(toolInput.content);
       if (!path || content === undefined)
         return;
-      let exists = false;
-      try {
-        exists = existsSync3(path);
-      } catch {}
-      return files([replacementHunk("", content)], exists ? "modified" : "added", exists);
+      const old = readOverwrittenText(path);
+      if (old === null)
+        return files([replacementHunk("", content)], "added");
+      if (old === undefined)
+        return files([replacementHunk("", content)], "modified", true);
+      return files([trimContext(replacementHunk(old, content))]);
     }
     default:
       return;
@@ -5343,7 +5378,7 @@ function resolveRuntime() {
   if (env && env.length > 0 && isExecutable(env))
     return env;
   try {
-    const cached = readFileSync2(`${CC_DIR}/runtime`, "utf8").trim();
+    const cached = readFileSync3(`${CC_DIR}/runtime`, "utf8").trim();
     if (cached.length > 0 && !cached.startsWith("NONE:") && isExecutable(cached))
       return cached;
   } catch {}

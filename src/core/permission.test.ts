@@ -1,13 +1,14 @@
 import { mkdir, mkdtemp, readFile, symlink, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   buildPermissionDiff, codexPromptUserRuleMatches, fitPermissionDiff, parseV4APatch,
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
   sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
   codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
   POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL, localAnswerProbe, answerExtrasAccepted,
+  OVERWRITE_DIFF_MAX_BYTES,
 } from "./permission";
 import {
   createPollBudget, MAX_CONSECUTIVE_MISSES, POLL_FIRST_CONTACT_TIMEOUT_MS,
@@ -3725,17 +3726,74 @@ describe("NOM-166 diff parsing", () => {
     expect(buildPermissionDiff("Edit", { file_path: "/p/a.ts" })).toBeUndefined(); // OpenCode's mapped Edit
   });
 
-  test("CC MultiEdit = one hunk per edit; Write = added (new) or modified with removed unknown (overwrite)", async () => {
+  test("CC MultiEdit = one hunk per edit; Write to a missing file = added", () => {
     const multi = buildPermissionDiff("MultiEdit", { file_path: "/p/a.ts", edits: [{ old_string: "a", new_string: "b" }, { old_string: "c", new_string: "" }] })!;
     expect(multi[0]).toMatchObject({ added: 1, removed: 2 });
     expect(multi[0].hunks.length).toBe(2);
     expect(buildPermissionDiff("Write", { file_path: "/does/not/exist/new.txt", content: "x\ny\n" })![0])
       .toMatchObject({ kind: "added", added: 2, removed: 0 });
-    const dir = await mkdtemp(join(tmpdir(), "nomo-write-"));
-    await writeFile(join(dir, "old.txt"), "old");
-    expect(buildPermissionDiff("Write", { file_path: join(dir, "old.txt"), content: "new" })![0])
-      .toMatchObject({ kind: "modified", added: 1, removed: null });
-    await rm(dir, { recursive: true, force: true });
+  });
+
+  describe("CC Write over an EXISTING file diffs against the file on disk", () => {
+    let dir: string;
+    beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "nomo-write-")); });
+    afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+    const at = async (name: string, content: string | Uint8Array): Promise<string> => {
+      await writeFile(join(dir, name), content);
+      return join(dir, name);
+    };
+    const NEW13 = Array.from({ length: 13 }, (_, i) => `new ${i}`).join("\n") + "\n";
+    /** Today's (pre-fix) answer when the old content can't be read: modified, all additions, removed unknown. */
+    const fallback = { kind: "modified", added: 13, removed: null };
+
+    test("16 lines overwritten by 13 different lines → +13 −16, a modified file, red and green in the V4A", async () => {
+      const fp = await at("retry.ts", Array.from({ length: 16 }, (_, i) => `old ${i}`).join("\n") + "\n");
+      const files = buildPermissionDiff("Write", { file_path: fp, content: NEW13 })!;
+      expect(files[0]).toMatchObject({ path: fp, kind: "modified", added: 13, removed: 16 });
+      expect(fitPermissionDiff({}, files).diffSummary).toEqual({ files: 1, added: 13, removed: 16 });
+      const v4a = buildPermissionDetail("Write", { file_path: fp, content: NEW13 });
+      expect(v4a.startsWith(`*** Update File: ${fp}\n@@\n-old 0\n`)).toBe(true);
+      expect(v4a).toContain("\n+new 12");
+      expect(v4a.split("\n").filter((l) => l.startsWith("-")).length).toBe(16);
+    });
+
+    test("one changed line in a big file → +1 −1 with at most 3 context lines each side", async () => {
+      const old = Array.from({ length: 500 }, (_, i) => `line ${i}`);
+      const fp = await at("big.ts", old.join("\n") + "\n");
+      const files = buildPermissionDiff("Write", { file_path: fp, content: old.map((l, i) => (i === 250 ? "CHANGED" : l)).join("\n") + "\n" })!;
+      expect(files[0]).toMatchObject({ kind: "modified", added: 1, removed: 1 });
+      expect(files[0].hunks[0].lines).toEqual([
+        ...[247, 248, 249].map((i) => ({ t: "ctx" as const, s: `line ${i}` })),
+        { t: "del", s: "line 250" }, { t: "add", s: "CHANGED" },
+        ...[251, 252, 253].map((i) => ({ t: "ctx" as const, s: `line ${i}` })),
+      ]);
+    });
+
+    test("a symlink to a regular file diffs the target", async () => {
+      const target = await at("real.ts", "a\nb\n");
+      await symlink(target, join(dir, "link.ts"));
+      expect(buildPermissionDiff("Write", { file_path: join(dir, "link.ts"), content: "a\nc\n" })![0])
+        .toMatchObject({ kind: "modified", added: 1, removed: 1 });
+    });
+
+    test("symlink to /dev/zero, a FIFO, a directory → never read, today's all-additions fallback", async () => {
+      await symlink("/dev/zero", join(dir, "zero"));
+      expect(Bun.spawnSync(["mkfifo", join(dir, "fifo")]).exitCode).toBe(0);
+      await mkdir(join(dir, "sub"));
+      for (const name of ["zero", "fifo", "sub"]) {
+        expect(buildPermissionDiff("Write", { file_path: join(dir, name), content: NEW13 })![0]).toMatchObject(fallback);
+      }
+      expect(buildPermissionDiff("Write", { file_path: "/dev/zero", content: NEW13 })![0]).toMatchObject(fallback);
+    }, 2000);
+
+    test("over the size cap, binary (NUL), or invalid UTF-8 → fallback, never throws", async () => {
+      const big = await at("big.txt", "x\n".repeat(OVERWRITE_DIFF_MAX_BYTES / 2 + 1));
+      const bin = await at("a.png", new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00, 0x0a]));
+      const latin1 = await at("l.txt", new Uint8Array([0x63, 0x61, 0x66, 0xe9, 0x0a])); // "café" in Latin-1
+      for (const fp of [big, bin, latin1]) {
+        expect(buildPermissionDiff("Write", { file_path: fp, content: NEW13 })![0]).toMatchObject(fallback);
+      }
+    });
   });
 
   test("fitPermissionDiff: a huge patch keeps the summary, a truncated preview, and fits the cap", () => {

@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/antigravity-approval.ts
 import { createHash as createHash2 } from "node:crypto";
-import { readFileSync as readFileSync2 } from "node:fs";
+import { readFileSync as readFileSync3 } from "node:fs";
 import { mkdir as mkdir2, readdir as readdir6, readFile as readFile7, unlink as unlink6, writeFile as writeFile2 } from "node:fs/promises";
 import { dirname as dirname2, isAbsolute as isAbsolute5, resolve as resolve4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
@@ -4945,7 +4945,7 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
 
 // src/core/permission.ts
 import { readFile as readFile6, realpath, unlink as unlink5 } from "node:fs/promises";
-import { appendFileSync as appendFileSync2, existsSync as existsSync4, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, closeSync, constants as fsConstants, fstatSync, openSync, readFileSync as readFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname4 } from "node:os";
 import { basename as basename6, isAbsolute as isAbsolute4, relative, resolve as resolve3 } from "node:path";
 
@@ -5580,6 +5580,40 @@ function replacementHunk(oldText, newText) {
   };
 }
 var count = (hunks, t) => hunks.reduce((n, h) => n + h.lines.filter((l) => l.t === t).length, 0);
+var OVERWRITE_DIFF_MAX_BYTES = 1 << 20;
+var OVERWRITE_CONTEXT_LINES = 3;
+function readOverwrittenText(path) {
+  let fd;
+  try {
+    const st = statSync3(path);
+    if (!st.isFile() || st.size > OVERWRITE_DIFF_MAX_BYTES)
+      return;
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    const fst = fstatSync(fd);
+    if (!fst.isFile() || fst.size > OVERWRITE_DIFF_MAX_BYTES)
+      return;
+    const bytes = readFileSync2(fd);
+    if (bytes.length > OVERWRITE_DIFF_MAX_BYTES || bytes.includes(0))
+      return;
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (e) {
+    const code = e.code;
+    return code === "ENOENT" || code === "ENOTDIR" ? null : undefined;
+  } finally {
+    if (fd !== undefined)
+      try {
+        closeSync(fd);
+      } catch {}
+  }
+}
+function trimContext(h) {
+  const changed = h.lines.map((l) => l.t !== "ctx");
+  const first = changed.indexOf(true);
+  if (first < 0)
+    return { lines: [] };
+  const last = changed.lastIndexOf(true);
+  return { lines: h.lines.slice(Math.max(0, first - OVERWRITE_CONTEXT_LINES), last + 1 + OVERWRITE_CONTEXT_LINES) };
+}
 function buildPermissionDiff(toolName, toolInput) {
   const str = (v) => typeof v === "string" ? v : undefined;
   const path = str(toolInput.file_path);
@@ -5602,11 +5636,12 @@ function buildPermissionDiff(toolName, toolInput) {
       const content = str(toolInput.content);
       if (!path || content === undefined)
         return;
-      let exists = false;
-      try {
-        exists = existsSync4(path);
-      } catch {}
-      return files([replacementHunk("", content)], exists ? "modified" : "added", exists);
+      const old = readOverwrittenText(path);
+      if (old === null)
+        return files([replacementHunk("", content)], "added");
+      if (old === undefined)
+        return files([replacementHunk("", content)], "modified", true);
+      return files([trimContext(replacementHunk(old, content))]);
     }
     default:
       return;
@@ -6507,7 +6542,7 @@ function loadAntigravityRules(transcriptPath) {
   const list = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
   for (const dir of known ? [known] : antigravityDataDirs()) {
     try {
-      const p = JSON.parse(readFileSync2(`${dir}/settings.json`, "utf8")).permissions ?? {};
+      const p = JSON.parse(readFileSync3(`${dir}/settings.json`, "utf8")).permissions ?? {};
       out.allow.push(...list(p.allow));
       out.ask.push(...list(p.ask));
       out.deny.push(...list(p.deny));
