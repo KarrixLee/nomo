@@ -5558,7 +5558,70 @@ function parseV4APatch(text) {
   }
   return files;
 }
-function replacementHunk(oldText, newText) {
+var DIFF_CONTEXT_LINES = 3;
+var DIFF_MAX_EDITS = 2000;
+var DIFF_MAX_WORK = 4000000;
+function myers(a, b) {
+  const n = a.length, m = b.length, off = n + m + 1;
+  const v = new Int32Array(2 * off + 1);
+  const trace = [];
+  let work = 0;
+  for (let d = 0;d <= n + m; d++) {
+    if (d > DIFF_MAX_EDITS)
+      return;
+    for (let k = -d;k <= d; k += 2) {
+      let x = k === -d || k !== d && v[off + k - 1] < v[off + k + 1] ? v[off + k + 1] : v[off + k - 1] + 1;
+      let y = x - k;
+      const x0 = x;
+      while (x < n && y < m && a[x] === b[y]) {
+        x++;
+        y++;
+      }
+      work += x - x0 + 1;
+      v[off + k] = x;
+      if (x >= n && y >= m) {
+        trace.push(v.slice(off - d, off + d + 1));
+        return backtrack(trace, n, m);
+      }
+    }
+    if (work > DIFF_MAX_WORK)
+      return;
+    trace.push(v.slice(off - d, off + d + 1));
+  }
+  return;
+}
+function backtrack(trace, n, m) {
+  const ops = [];
+  let x = n, y = m;
+  for (let d = trace.length - 1;d > 0; d--) {
+    const prev = trace[d - 1];
+    const at = (k) => prev[k + d - 1];
+    const k = x - y;
+    const down = k === -d || k !== d && at(k - 1) < at(k + 1);
+    const px = at(down ? k + 1 : k - 1);
+    const mx = down ? px : px + 1;
+    const my = mx - k;
+    while (x > mx && y > my) {
+      ops.push("ctx");
+      x--;
+      y--;
+    }
+    if (down) {
+      ops.push("add");
+      y--;
+    } else {
+      ops.push("del");
+      x--;
+    }
+  }
+  while (x > 0 && y > 0) {
+    ops.push("ctx");
+    x--;
+    y--;
+  }
+  return ops.reverse();
+}
+function diffHunks(oldText, newText) {
   const split = (s) => s.length === 0 ? [] : s.replace(/\n$/, "").split(`
 `);
   const a = split(oldText);
@@ -5569,19 +5632,67 @@ function replacementHunk(oldText, newText) {
   let suf = 0;
   while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf])
     suf += 1;
-  const ctx = (s) => ({ t: "ctx", s });
-  return {
-    lines: [
-      ...a.slice(0, pre).map(ctx),
-      ...a.slice(pre, a.length - suf).map((s) => ({ t: "del", s })),
-      ...b.slice(pre, b.length - suf).map((s) => ({ t: "add", s })),
-      ...a.slice(a.length - suf).map(ctx)
-    ]
+  const am = a.slice(pre, a.length - suf), bm = b.slice(pre, b.length - suf);
+  const ids = new Map;
+  const id = (s) => {
+    let i = ids.get(s);
+    if (i === undefined)
+      ids.set(s, i = ids.size);
+    return i;
   };
+  const ops = am.length > 0 && bm.length > 0 ? myers(Int32Array.from(am, id), Int32Array.from(bm, id)) : undefined;
+  const lines = a.slice(0, pre).map((s) => ({ t: "ctx", s }));
+  if (ops) {
+    let i = 0, j = 0;
+    let run = { del: [], add: [] };
+    const flush = () => {
+      lines.push(...run.del, ...run.add);
+      run = { del: [], add: [] };
+    };
+    for (const op of ops) {
+      if (op === "ctx") {
+        flush();
+        lines.push({ t: "ctx", s: am[i++] });
+        j++;
+      } else if (op === "del")
+        run.del.push({ t: "del", s: am[i++] });
+      else
+        run.add.push({ t: "add", s: bm[j++] });
+    }
+    flush();
+  } else {
+    for (const s of am)
+      lines.push({ t: "del", s });
+    for (const s of bm)
+      lines.push({ t: "add", s });
+  }
+  for (const s of a.slice(a.length - suf))
+    lines.push({ t: "ctx", s });
+  const hunks = [];
+  let cur;
+  let last = -1;
+  const close = () => {
+    if (cur) {
+      cur.push(...lines.slice(last + 1, last + 1 + DIFF_CONTEXT_LINES));
+      hunks.push({ lines: cur });
+    }
+  };
+  lines.forEach((l, c) => {
+    if (l.t === "ctx")
+      return;
+    if (cur && c - last - 1 <= 2 * DIFF_CONTEXT_LINES)
+      cur.push(...lines.slice(last + 1, c + 1));
+    else {
+      close();
+      cur = lines.slice(Math.max(0, c - DIFF_CONTEXT_LINES), c + 1);
+    }
+    last = c;
+  });
+  close();
+  return hunks;
 }
 var count = (hunks, t) => hunks.reduce((n, h) => n + h.lines.filter((l) => l.t === t).length, 0);
 var OVERWRITE_DIFF_MAX_BYTES = 1 << 20;
-var OVERWRITE_CONTEXT_LINES = 3;
 function readOverwrittenText(path) {
   let fd;
   try {
@@ -5606,14 +5717,6 @@ function readOverwrittenText(path) {
       } catch {}
   }
 }
-function trimContext(h) {
-  const changed = h.lines.map((l) => l.t !== "ctx");
-  const first = changed.indexOf(true);
-  if (first < 0)
-    return { lines: [] };
-  const last = changed.lastIndexOf(true);
-  return { lines: h.lines.slice(Math.max(0, first - OVERWRITE_CONTEXT_LINES), last + 1 + OVERWRITE_CONTEXT_LINES) };
-}
 function buildPermissionDiff(toolName, toolInput) {
   const str = (v) => typeof v === "string" ? v : undefined;
   const path = str(toolInput.file_path);
@@ -5625,11 +5728,11 @@ function buildPermissionDiff(toolName, toolInput) {
     }
     case "Edit": {
       const o = str(toolInput.old_string), n = str(toolInput.new_string);
-      return path && o !== undefined && n !== undefined ? files([replacementHunk(o, n)]) : undefined;
+      return path && o !== undefined && n !== undefined ? files(diffHunks(o, n)) : undefined;
     }
     case "MultiEdit": {
       const edits = Array.isArray(toolInput.edits) ? toolInput.edits : [];
-      const hunks = edits.flatMap((e) => typeof e?.old_string === "string" && typeof e.new_string === "string" ? [replacementHunk(e.old_string, e.new_string)] : []);
+      const hunks = edits.flatMap((e) => typeof e?.old_string === "string" && typeof e.new_string === "string" ? diffHunks(e.old_string, e.new_string) : []);
       return path && hunks.length > 0 ? files(hunks) : undefined;
     }
     case "Write": {
@@ -5638,10 +5741,10 @@ function buildPermissionDiff(toolName, toolInput) {
         return;
       const old = readOverwrittenText(path);
       if (old === null)
-        return files([replacementHunk("", content)], "added");
+        return files(diffHunks("", content), "added");
       if (old === undefined)
-        return files([replacementHunk("", content)], "modified", true);
-      return files([trimContext(replacementHunk(old, content))]);
+        return files(diffHunks("", content), "modified", true);
+      return files(diffHunks(old, content));
     }
     default:
       return;
@@ -5726,7 +5829,7 @@ function fitPermissionDiff(frame, files, maxChars = BLOB_FIT_CHARS) {
   const diff = previewDiff(files, lo);
   return diff.files.length > 0 ? { diffSummary, diff } : { diffSummary };
 }
-function buildPermissionDetail(toolName, toolInput) {
+function buildPermissionDetail(toolName, toolInput, precomputedDiff) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
   switch (toolName) {
     case "Bash":
@@ -5740,7 +5843,7 @@ function buildPermissionDetail(toolName, toolInput) {
     case "Edit":
     case "MultiEdit":
     case "Write": {
-      const diff = buildPermissionDiff(toolName, toolInput);
+      const diff = precomputedDiff ?? buildPermissionDiff(toolName, toolInput);
       return diff ? renderV4A(diff) : str(toolInput.file_path) ?? "";
     }
     case "Read":
@@ -6197,8 +6300,9 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionRequestId: requestId,
       permissionToolName: toolName
     };
-    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
-    const diffTail = fitPermissionDiff({ ...permissionBase, permissionDetailOmitted: Array.from(rawDetail).length }, buildPermissionDiff(toolName, toolInput));
+    const diffFiles = buildPermissionDiff(toolName, toolInput);
+    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput, diffFiles);
+    const diffTail = fitPermissionDiff({ ...permissionBase, permissionDetailOmitted: Array.from(rawDetail).length }, diffFiles);
     let fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput), diffTail);
     if (fitted.detail === "" && rawDetail !== "" && summary !== toolName && (toolName === "Bash" || toolName === "shell" || toolName === "local_shell")) {
       permissionBase.permissionSummary = toolName;

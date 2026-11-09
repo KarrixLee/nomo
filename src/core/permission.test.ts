@@ -3726,6 +3726,34 @@ describe("NOM-166 diff parsing", () => {
     expect(buildPermissionDiff("Edit", { file_path: "/p/a.ts" })).toBeUndefined(); // OpenCode's mapped Edit
   });
 
+  test("Edit diff is a minimal edit script (vs an LCS table) with hunks that are real slices of each side", () => {
+    let seed = 7;
+    const rnd = (n: number) => Math.floor(((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648) * n);
+    const isSlice = (part: string[], whole: string[]) =>
+      whole.some((_, i) => part.every((p, j) => whole[i + j] === p)) || part.length === 0;
+    for (let c = 0; c < 300; c++) {
+      const a = Array.from({ length: rnd(14) }, () => "abcd"[rnd(4)]);
+      const b = Array.from({ length: rnd(14) }, () => "abcd"[rnd(4)]);
+      const lcs = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+      for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--)
+        lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+      const diff = buildPermissionDiff("Edit", { file_path: "/p", old_string: a.join("\n"), new_string: b.join("\n") })![0];
+      expect(diff.added + diff.removed!).toBe(a.length + b.length - 2 * lcs[0][0]);
+      for (const h of diff.hunks) {
+        expect(isSlice(h.lines.filter((l) => l.t !== "add").map((l) => l.s), a)).toBe(true);
+        expect(isSlice(h.lines.filter((l) => l.t !== "del").map((l) => l.s), b)).toBe(true);
+      }
+    }
+  });
+
+  test("CC Edit with scattered changes inside a big old_string → exact counts, one hunk per change", () => {
+    const old = Array.from({ length: 60 }, (_, i) => `row ${i}`);
+    const next = old.map((l, i) => (i === 5 || i === 30 || i === 55 ? `${l}!` : l));
+    const diff = buildPermissionDiff("Edit", { file_path: "/p/a.ts", old_string: old.join("\n"), new_string: next.join("\n") })!;
+    expect(diff[0]).toMatchObject({ added: 3, removed: 3 });
+    expect(diff[0].hunks.length).toBe(3);
+  });
+
   test("CC MultiEdit = one hunk per edit; Write to a missing file = added", () => {
     const multi = buildPermissionDiff("MultiEdit", { file_path: "/p/a.ts", edits: [{ old_string: "a", new_string: "b" }, { old_string: "c", new_string: "" }] })!;
     expect(multi[0]).toMatchObject({ added: 1, removed: 2 });
@@ -3767,6 +3795,48 @@ describe("NOM-166 diff parsing", () => {
         { t: "del", s: "line 250" }, { t: "add", s: "CHANGED" },
         ...[251, 252, 253].map((i) => ({ t: "ctx" as const, s: `line ${i}` })),
       ]);
+    });
+
+    test("10 scattered one-line changes in 1,000 lines → exactly +10 −10 in 10 hunks, 10 @@ sections in one V4A block", async () => {
+      const old = Array.from({ length: 1000 }, (_, i) => `line ${i}`);
+      const fp = await at("scatter.ts", old.join("\n") + "\n");
+      const content = old.map((l, i) => (i % 100 === 50 ? `CHANGED ${i}` : l)).join("\n") + "\n";
+      const files = buildPermissionDiff("Write", { file_path: fp, content })!;
+      expect(files[0]).toMatchObject({ kind: "modified", added: 10, removed: 10 });
+      expect(files[0].hunks.length).toBe(10);
+      expect(files[0].hunks[3].lines).toEqual([
+        ...[347, 348, 349].map((i) => ({ t: "ctx" as const, s: `line ${i}` })),
+        { t: "del", s: "line 350" }, { t: "add", s: "CHANGED 350" },
+        ...[351, 352, 353].map((i) => ({ t: "ctx" as const, s: `line ${i}` })),
+      ]);
+      const v4a = buildPermissionDetail("Write", { file_path: fp, content });
+      expect(v4a.split("\n").filter((l) => l.startsWith("*** ")).length).toBe(1);
+      expect(v4a.split("\n").filter((l) => l === "@@").length).toBe(10);
+    });
+
+    test("changes whose context overlaps merge into one hunk; inserts and deletes count exactly", async () => {
+      const old = Array.from({ length: 40 }, (_, i) => `line ${i}`);
+      const fp = await at("merge.ts", old.join("\n") + "\n");
+      // delete line 10, insert two lines after 15 (gap of 5 ≤ 6 → one hunk), replace line 30 (own hunk)
+      const next = [...old.slice(0, 10), ...old.slice(11, 16), "ins a", "ins b", ...old.slice(16, 30), "THIRTY", ...old.slice(31)];
+      const files = buildPermissionDiff("Write", { file_path: fp, content: next.join("\n") + "\n" })!;
+      expect(files[0]).toMatchObject({ added: 3, removed: 2 });
+      expect(files[0].hunks.length).toBe(2);
+      expect(files[0].hunks[0].lines.map((l) => l.t).join(",")).toBe("ctx,ctx,ctx,del,ctx,ctx,ctx,ctx,ctx,add,add,ctx,ctx,ctx");
+    });
+
+    test("over the diff work cap (20k lines shuffled) → today's one block, fast, never hangs", async () => {
+      let seed = 42;
+      const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+      const old = Array.from({ length: 20_000 }, (_, i) => `l${i}`);
+      const shuffled = [...old];
+      for (let i = shuffled.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]]; }
+      const fp = await at("shuffled.txt", old.join("\n") + "\n");
+      const t0 = performance.now();
+      const files = buildPermissionDiff("Write", { file_path: fp, content: shuffled.join("\n") + "\n" })!;
+      expect(performance.now() - t0).toBeLessThan(400); // budget ~150 ms; slack for a loaded CI box
+      expect(files[0]).toMatchObject({ kind: "modified", added: 20_000, removed: 20_000 });
+      expect(files[0].hunks.length).toBe(1);
     });
 
     test("a symlink to a regular file diffs the target", async () => {

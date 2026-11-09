@@ -916,9 +916,64 @@ export function parseV4APatch(text: string): PermissionDiffFile[] {
   return files;
 }
 
-/** One old→new replacement as a hunk: shared leading/trailing lines become context, so a one-line change
- *  inside a 5-line old_string counts +1 −1, not +5 −5. */
-function replacementHunk(oldText: string, newText: string): PermissionDiffHunk {
+/** Context lines kept around each change; changes whose context would overlap share one hunk. */
+const DIFF_CONTEXT_LINES = 3;
+/** Myers is abandoned past this many edits (≈1,000 changed lines). It bounds the O(D²) trace memory
+ *  (~16 MB at the cap) and is the cap that bites in practice: a 20k-line shuffle hits it in ~35 ms
+ *  (M-series Mac, bun). The work cap is the backstop for the O((N+M)·D) snake-following worst case; no
+ *  realistic input measured reaches it. Over either cap → the one-block diff (see diffHunks). */
+const DIFF_MAX_EDITS = 2000;
+const DIFF_MAX_WORK = 4_000_000;
+
+/** Myers O(ND) shortest edit script between two id arrays, or undefined when it would exceed the caps.
+ *  Ops are ctx/del/add over indices into a and b. */
+function myers(a: Int32Array, b: Int32Array): ("ctx" | "del" | "add")[] | undefined {
+  const n = a.length, m = b.length, off = n + m + 1;
+  const v = new Int32Array(2 * off + 1);
+  const trace: Int32Array[] = [];
+  let work = 0;
+  for (let d = 0; d <= n + m; d++) {
+    if (d > DIFF_MAX_EDITS) return undefined;
+    for (let k = -d; k <= d; k += 2) {
+      let x = k === -d || (k !== d && v[off + k - 1] < v[off + k + 1]) ? v[off + k + 1] : v[off + k - 1] + 1;
+      let y = x - k;
+      const x0 = x;
+      while (x < n && y < m && a[x] === b[y]) { x++; y++; }
+      work += x - x0 + 1;
+      v[off + k] = x;
+      if (x >= n && y >= m) {
+        trace.push(v.slice(off - d, off + d + 1));
+        return backtrack(trace, n, m);
+      }
+    }
+    if (work > DIFF_MAX_WORK) return undefined;
+    trace.push(v.slice(off - d, off + d + 1));
+  }
+  return undefined; // unreachable: d = n + m always ends
+}
+
+function backtrack(trace: Int32Array[], n: number, m: number): ("ctx" | "del" | "add")[] {
+  const ops: ("ctx" | "del" | "add")[] = [];
+  let x = n, y = m;
+  for (let d = trace.length - 1; d > 0; d--) {
+    const prev = trace[d - 1];
+    const at = (k: number): number => prev[k + d - 1];
+    const k = x - y;
+    const down = k === -d || (k !== d && at(k - 1) < at(k + 1));
+    const px = at(down ? k + 1 : k - 1);
+    const mx = down ? px : px + 1;            // the point right after this edit…
+    const my = mx - k;                        // …lies on diagonal k, where the snake to (x, y) starts
+    while (x > mx && y > my) { ops.push("ctx"); x--; y--; }
+    if (down) { ops.push("add"); y--; } else { ops.push("del"); x--; }
+  }
+  while (x > 0 && y > 0) { ops.push("ctx"); x--; y--; }
+  return ops.reverse();
+}
+
+/** The old→new line diff as hunks: shared leading/trailing lines are trimmed first, the middle gets a
+ *  bounded Myers diff, and each change keeps DIFF_CONTEXT_LINES of context (overlapping ones merge). Past
+ *  the caps the middle is one del block + one add block — every line still real, counts inflated. */
+function diffHunks(oldText: string, newText: string): PermissionDiffHunk[] {
   const split = (s: string): string[] => (s.length === 0 ? [] : s.replace(/\n$/, "").split("\n"));
   const a = split(oldText);
   const b = split(newText);
@@ -926,15 +981,40 @@ function replacementHunk(oldText: string, newText: string): PermissionDiffHunk {
   while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre += 1;
   let suf = 0;
   while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf += 1;
-  const ctx = (s: string): PermissionDiffLine => ({ t: "ctx", s });
-  return {
-    lines: [
-      ...a.slice(0, pre).map(ctx),
-      ...a.slice(pre, a.length - suf).map((s): PermissionDiffLine => ({ t: "del", s })),
-      ...b.slice(pre, b.length - suf).map((s): PermissionDiffLine => ({ t: "add", s })),
-      ...a.slice(a.length - suf).map(ctx),
-    ],
-  };
+  const am = a.slice(pre, a.length - suf), bm = b.slice(pre, b.length - suf);
+  const ids = new Map<string, number>();
+  const id = (s: string): number => { let i = ids.get(s); if (i === undefined) ids.set(s, (i = ids.size)); return i; };
+  const ops = am.length > 0 && bm.length > 0
+    ? myers(Int32Array.from(am, id), Int32Array.from(bm, id)) : undefined;
+  const lines: PermissionDiffLine[] = a.slice(0, pre).map((s) => ({ t: "ctx", s }));
+  if (ops) {
+    let i = 0, j = 0;
+    let run: { del: PermissionDiffLine[]; add: PermissionDiffLine[] } = { del: [], add: [] };
+    const flush = (): void => { lines.push(...run.del, ...run.add); run = { del: [], add: [] }; };
+    for (const op of ops) {
+      if (op === "ctx") { flush(); lines.push({ t: "ctx", s: am[i++] }); j++; }
+      else if (op === "del") run.del.push({ t: "del", s: am[i++] });
+      else run.add.push({ t: "add", s: bm[j++] });
+    }
+    flush();
+  } else {
+    for (const s of am) lines.push({ t: "del", s });
+    for (const s of bm) lines.push({ t: "add", s });
+  }
+  for (const s of a.slice(a.length - suf)) lines.push({ t: "ctx", s });
+  // Group: a change within 2×context of the previous one extends its hunk.
+  const hunks: PermissionDiffHunk[] = [];
+  let cur: PermissionDiffLine[] | undefined;
+  let last = -1;
+  const close = (): void => { if (cur) { cur.push(...lines.slice(last + 1, last + 1 + DIFF_CONTEXT_LINES)); hunks.push({ lines: cur }); } };
+  lines.forEach((l, c) => {
+    if (l.t === "ctx") return;
+    if (cur && c - last - 1 <= 2 * DIFF_CONTEXT_LINES) cur.push(...lines.slice(last + 1, c + 1));
+    else { close(); cur = lines.slice(Math.max(0, c - DIFF_CONTEXT_LINES), c + 1); }
+    last = c;
+  });
+  close();
+  return hunks;
 }
 
 const count = (hunks: PermissionDiffHunk[], t: "add" | "del"): number =>
@@ -942,8 +1022,6 @@ const count = (hunks: PermissionDiffHunk[], t: "add" | "del"): number =>
 
 /** A Write over an existing file diffs against it only up to this size; bigger → the all-additions card. */
 export const OVERWRITE_DIFF_MAX_BYTES = 1 << 20;
-/** Context lines kept around an overwrite's change (an Edit's context is its own old_string). */
-const OVERWRITE_CONTEXT_LINES = 3;
 
 /** The text a Write is about to overwrite: the string, null (no such file — the Write creates it), or
  *  undefined (exists but is not read here → the all-additions card). `file_path` is agent input, so:
@@ -969,15 +1047,6 @@ function readOverwrittenText(path: string): string | null | undefined {
   }
 }
 
-/** A whole-file replacement hunk cut to the changed span plus a few context lines each side. */
-function trimContext(h: PermissionDiffHunk): PermissionDiffHunk {
-  const changed = h.lines.map((l) => l.t !== "ctx");
-  const first = changed.indexOf(true);
-  if (first < 0) return { lines: [] };
-  const last = changed.lastIndexOf(true);
-  return { lines: h.lines.slice(Math.max(0, first - OVERWRITE_CONTEXT_LINES), last + 1 + OVERWRITE_CONTEXT_LINES) };
-}
-
 /** The FULL diff for an edit-shaped tool, or undefined (any other tool, or an input without content —
  *  OpenCode's mapped `Edit` carries only file_path). Pure apart from Write's bounded read of the file it
  *  overwrites (readOverwrittenText). */
@@ -993,12 +1062,12 @@ export function buildPermissionDiff(toolName: string, toolInput: Record<string, 
     }
     case "Edit": {
       const o = str(toolInput.old_string), n = str(toolInput.new_string);
-      return path && o !== undefined && n !== undefined ? files([replacementHunk(o, n)]) : undefined;
+      return path && o !== undefined && n !== undefined ? files(diffHunks(o, n)) : undefined;
     }
     case "MultiEdit": {
       const edits = Array.isArray(toolInput.edits) ? toolInput.edits as { old_string?: unknown; new_string?: unknown }[] : [];
       const hunks = edits.flatMap((e) => typeof e?.old_string === "string" && typeof e.new_string === "string"
-        ? [replacementHunk(e.old_string, e.new_string)] : []);
+        ? diffHunks(e.old_string, e.new_string) : []);
       return path && hunks.length > 0 ? files(hunks) : undefined;
     }
     case "Write": {
@@ -1006,12 +1075,10 @@ export function buildPermissionDiff(toolName: string, toolInput: Record<string, 
       if (!path || content === undefined) return undefined;
       // An overwrite's old content is not in the input, so it is read from disk (same E2E blob as an
       // Edit's old_string). Unreadable/over-cap/binary → all lines read as added, removed unknown.
-      // ponytail: prefix/suffix match (linear), not an LCS — scattered changes count as one span;
-      // swap in Myers if real overwrites show inflated counts.
       const old = readOverwrittenText(path);
-      if (old === null) return files([replacementHunk("", content)], "added");
-      if (old === undefined) return files([replacementHunk("", content)], "modified", true);
-      return files([trimContext(replacementHunk(old, content))]);
+      if (old === null) return files(diffHunks("", content), "added");
+      if (old === undefined) return files(diffHunks("", content), "modified", true);
+      return files(diffHunks(old, content));
     }
     default: return undefined;
   }
@@ -1106,7 +1173,9 @@ export function fitPermissionDiff(
  *  applies exactly that at the seal site, keeping as much text as the wire can carry and reporting how
  *  much it had to drop. `MAX_DETAIL_CHARS` is only a sanity bound so a pathological tool_input can't make
  *  the fit's JSON work unbounded (its loss is counted too). Pure and never throws. */
-export function buildPermissionDetail(toolName: string, toolInput: Record<string, unknown>): string {
+export function buildPermissionDetail(
+  toolName: string, toolInput: Record<string, unknown>, precomputedDiff?: PermissionDiffFile[],
+): string {
   const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
   switch (toolName) {
     case "Bash": case "shell": case "local_shell": { const c = str(toolInput.command); return c ?? ""; }
@@ -1114,7 +1183,7 @@ export function buildPermissionDetail(toolName: string, toolInput: Record<string
     // diff) — old apps show it in the hero block, and a cut copy is pulled whole via permission-detail.
     case "apply_patch": return str(toolInput.command) ?? str(toolInput.description) ?? "";
     case "Edit": case "MultiEdit": case "Write": {
-      const diff = buildPermissionDiff(toolName, toolInput);
+      const diff = precomputedDiff ?? buildPermissionDiff(toolName, toolInput);
       return diff ? renderV4A(diff) : str(toolInput.file_path) ?? "";
     }
     case "Read": case "NotebookEdit": {
@@ -1975,13 +2044,15 @@ export async function runPermissionHook(
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
       permissionToolName: toolName,
     };
-    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
+    // Built once: a Write's diff reads the file it overwrites and runs the bounded line diff.
+    const diffFiles = buildPermissionDiff(toolName, toolInput);
+    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput, diffFiles);
     // NOM-166: the diff preview is fitted FIRST against the base plus the worst-case omitted count (so
     // the full-text pointer always fits beside it), then the detail takes what is left. Base keys are
     // never shed for it; a non-edit tool gets an empty tail and a byte-identical frame.
     const diffTail = fitPermissionDiff(
       { ...permissionBase, permissionDetailOmitted: Array.from(rawDetail).length },
-      buildPermissionDiff(toolName, toolInput),
+      diffFiles,
     );
     let fitted = fitPermissionDetail(
       permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput), diffTail,
