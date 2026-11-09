@@ -145,7 +145,8 @@ pairing secret (headers), the plugin version, whether remote approvals are on, a
 session id, the op (`start` / `update` / `done` / `end`), a priority, timestamps, and — for a Codex
 `request_user_input` question only — `attentionKind: "userInput"`. **Sealed**: everything else —
 title, machine name, folder, status, model, tool name, command, file path, plan text, questions,
-answers, and which agent produced the event.
+answers, and which agent produced the event. The diff on an edit approval (patch or edit content,
+line counts) is sealed the same way as a command, in the card and in a full-text pull.
 
 **Daily activity summary — counts only, sealed.** While paired, the watchdog reads your agents' local
 history read-only — Claude Code transcripts (`~/.claude/projects`), Codex rollouts and its

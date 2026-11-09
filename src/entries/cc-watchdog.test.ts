@@ -2880,6 +2880,19 @@ describe("live-decision-hold gate: no op:done corrective may land while an appro
       expect(count).toBe(1);
     });
 
+    // NOM-165: Codex SIGKILLs a holding hook when its network approval ends — no `finally`, no event.
+    // The dead holder's marker names its requestId, and the prune retires the worker's card with it.
+    test("a DEAD holder's card is resolved on the worker; a live holder's and an id-less marker's are not", async () => {
+      const resolved: string[] = [];
+      await pruneStaleDecisionHolds(["dead.hold", "live.hold", "old.hold"], {
+        readHold: async (id) => (id === "old" ? holdFor(902) : { ...holdFor(id === "live" ? 900 : 901), requestId: `req-${id}` }),
+        isAlive: (pid) => pid === 900,
+        removeHold: async () => {},
+        resolveCard: async (requestId) => { resolved.push(requestId); },
+      });
+      expect(resolved).toEqual(["req-dead"]);
+    });
+
     test("a marker past its TTL whose holder is ALIVE is kept (the readers already ignore it)", async () => {
       const removed: string[] = [];
       await pruneStaleDecisionHolds(["ancient.hold"], {

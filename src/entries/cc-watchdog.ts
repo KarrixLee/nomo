@@ -3585,6 +3585,8 @@ export interface PruneHoldsDeps {
   isAlive?: (pid: number) => boolean;
   removeHold?: (sessionId: string) => Promise<void>;
   trace?: (event: object) => void;
+  /** Retires the worker's card for a dead holder's `requestId` (NOM-165). Absent (unpaired) = skip. */
+  resolveCard?: (requestId: string) => Promise<void>;
 }
 
 /** Remove every `.hold` marker among `files` (one SESSIONS_DIR listing, which the sweep already has)
@@ -3613,6 +3615,13 @@ export async function pruneStaleDecisionHolds(files: string[], deps: PruneHoldsD
       let alive = true;
       try { alive = isAlive(hold.pid); } catch { alive = true; }
       if (alive) continue;
+    }
+    // NOM-165: the holder is gone (Codex SIGKILLs the hook when a network approval ends; a closed
+    // terminal SIGTERMs it), so nobody will ever read an answer — retire the phone's card now instead
+    // of leaving live Allow/Deny up until the worker's 30 s poll-liveness sweep. Fire-and-forget off
+    // the sweep path; a resolve on an already-answered record is a worker no-op.
+    if (typeof hold?.requestId === "string" && deps.resolveCard) {
+      void Promise.resolve(deps.resolveCard(hold.requestId)).catch(() => {});
     }
     try { await removeHold(sessionId); removed++; } catch { /* best-effort, like every write here */ }
   }
@@ -3651,7 +3660,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
   // Housekeeping FIRST, off the listing we already have: retire the `.hold` markers of hooks that were
   // killed before their `finally` could compare-and-clear. An orphan gates nothing (the correctives'
   // hold gate probes the holder pid), but the directory must not grow one per killed hook forever.
-  await pruneStaleDecisionHolds(files);
+  await pruneStaleDecisionHolds(files, config ? { resolveCard: (id) => resolveOnRelay(config, id) } : {});
   let remaining = 0;
   // Any 2xx POST this sweep proves the pairing is alive → the loop resets the gone-strike streak, so a
   // real success from EITHER the watchdog or the hook clears a stray transient strike.

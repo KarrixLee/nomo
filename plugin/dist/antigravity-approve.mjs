@@ -131,7 +131,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.4.0";
+var PLUGIN_VERSION = "2.4.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4936,7 +4936,7 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
 
 // src/core/permission.ts
 import { readFile as readFile6, realpath, unlink as unlink5 } from "node:fs/promises";
-import { appendFileSync as appendFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, existsSync as existsSync4, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
 import { hostname as hostname4 } from "node:os";
 import { basename as basename6, isAbsolute as isAbsolute4, relative, resolve as resolve3 } from "node:path";
 
@@ -5178,6 +5178,50 @@ function codexPassThroughReason(policy) {
     return;
   return "codex-context-unknown";
 }
+var CODEX_REQUIREMENTS_PATH = "/etc/codex/requirements.toml";
+async function codexPromptUserRuleMatches(command, path = CODEX_REQUIREMENTS_PATH) {
+  let text;
+  try {
+    text = await readFile6(path, "utf8");
+  } catch {
+    return false;
+  }
+  try {
+    const words = command.split(/[\s'"`;&|()]+/).filter((w) => w.length > 0);
+    for (const table of text.split(/^\s*\[/m)) {
+      if (!/^\[\s*rules\.prefix_rules\s*\]\]/.test(table))
+        continue;
+      if (!/^\s*decision\s*=\s*["']prompt-user["']/m.test(table))
+        continue;
+      const at = table.search(/^\s*pattern\s*=\s*\[/m);
+      if (at < 0)
+        continue;
+      const open = table.indexOf("[", table.indexOf("=", at));
+      let depth = 0, end = -1;
+      for (let i = open;i < table.length && end < 0; i++) {
+        if (table[i] === "[")
+          depth++;
+        else if (table[i] === "]" && --depth === 0)
+          end = i;
+      }
+      if (end < 0)
+        continue;
+      const tokens = (table.slice(open + 1, end).match(/\{[^}]*\}/g) ?? []).map((element) => {
+        const quoted = (s) => [...s.matchAll(/["']([^"']*)["']/g)].map((m) => m[1]);
+        const anyOf = /any_of\s*=\s*\[([^\]]*)\]/.exec(element);
+        return anyOf ? quoted(anyOf[1]) : quoted(/token\s*=\s*(["'][^"']*["'])/.exec(element)?.[1] ?? "");
+      });
+      if (tokens.length === 0 || tokens.some((alts) => alts.length === 0))
+        continue;
+      const hit = (word, alts) => alts.includes(word) || alts.includes(basename6(word));
+      for (let i = 0;i + tokens.length <= words.length; i++) {
+        if (tokens.every((alts, j) => hit(words[i + j], alts)))
+          return true;
+      }
+    }
+  } catch {}
+  return false;
+}
 function decisionLine(agent, hookSpecificOutput) {
   return JSON.stringify(agent === "codex" ? { continue: true, hookSpecificOutput } : { hookSpecificOutput });
 }
@@ -5403,9 +5447,18 @@ function buildPermissionSummary(toolName, toolInput) {
     }
     case "apply_patch": {
       const desc = str(toolInput.description);
-      return desc ? truncate(desc) : toolName;
+      if (desc)
+        return truncate(desc);
+      const files = parseV4APatch(str(toolInput.command) ?? "");
+      if (files.length > 1)
+        return `Edit ${files.length} files`;
+      if (files.length === 0)
+        return toolName;
+      const verb = files[0].kind === "added" ? "Add" : files[0].kind === "deleted" ? "Delete" : "Edit";
+      return truncate(`${verb} ${basename6(files[0].path)}`);
     }
     case "Edit":
+    case "MultiEdit":
     case "Write":
     case "Read":
     case "NotebookEdit": {
@@ -5439,13 +5492,195 @@ function buildPermissionSummary(toolName, toolInput) {
       return typeof q?.question === "string" ? truncate(q.question) : toolName;
     }
     default: {
-      if (/^mcp__/.test(toolName)) {
-        const seg = toolName.split("__").pop();
-        return seg && seg.length > 0 ? seg : toolName;
+      const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
+      if (mcp) {
+        const words = (s) => s.replace(/[_-]+/g, " ").trim();
+        const server = words(mcp[1].replace(/^claude_ai_/, ""));
+        const tool = words(mcp[2]);
+        return server && tool ? truncate(`${server} · ${tool}`) : toolName;
       }
       return toolName;
     }
   }
+}
+function parseV4APatch(text) {
+  const files = [];
+  let file;
+  let hunk;
+  for (const line of text.split(`
+`)) {
+    const head = /^\*\*\* (Update|Add|Delete) File: (.+)$/.exec(line);
+    if (head) {
+      const kind = head[1] === "Add" ? "added" : head[1] === "Delete" ? "deleted" : "modified";
+      file = { path: head[2].trim(), kind, added: 0, removed: kind === "deleted" ? null : 0, hunks: [] };
+      files.push(file);
+      hunk = undefined;
+      continue;
+    }
+    if (!file)
+      continue;
+    const move = /^\*\*\* Move to: (.+)$/.exec(line);
+    if (move) {
+      file.from = file.path;
+      file.path = move[1].trim();
+      file.kind = "renamed";
+      continue;
+    }
+    if (line.startsWith("***"))
+      continue;
+    if (line.startsWith("@@")) {
+      const header = line.slice(2).trim();
+      hunk = { ...header ? { header } : {}, lines: [] };
+      file.hunks.push(hunk);
+      continue;
+    }
+    const t = line[0] === "+" ? "add" : line[0] === "-" ? "del" : line[0] === " " ? "ctx" : undefined;
+    if (!t)
+      continue;
+    if (!hunk) {
+      hunk = { lines: [] };
+      file.hunks.push(hunk);
+    }
+    hunk.lines.push({ t, s: line.slice(1) });
+    if (t === "add")
+      file.added += 1;
+    else if (t === "del" && file.removed !== null)
+      file.removed += 1;
+  }
+  return files;
+}
+function replacementHunk(oldText, newText) {
+  const split = (s) => s.length === 0 ? [] : s.replace(/\n$/, "").split(`
+`);
+  const a = split(oldText);
+  const b = split(newText);
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre])
+    pre += 1;
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf])
+    suf += 1;
+  const ctx = (s) => ({ t: "ctx", s });
+  return {
+    lines: [
+      ...a.slice(0, pre).map(ctx),
+      ...a.slice(pre, a.length - suf).map((s) => ({ t: "del", s })),
+      ...b.slice(pre, b.length - suf).map((s) => ({ t: "add", s })),
+      ...a.slice(a.length - suf).map(ctx)
+    ]
+  };
+}
+var count = (hunks, t) => hunks.reduce((n, h) => n + h.lines.filter((l) => l.t === t).length, 0);
+function buildPermissionDiff(toolName, toolInput) {
+  const str = (v) => typeof v === "string" ? v : undefined;
+  const path = str(toolInput.file_path);
+  const files = (hunks, kind = "modified", removedUnknown = false) => [{ path, kind, added: count(hunks, "add"), removed: removedUnknown ? null : count(hunks, "del"), hunks }];
+  switch (toolName) {
+    case "apply_patch": {
+      const parsed = parseV4APatch(str(toolInput.command) ?? "");
+      return parsed.length > 0 ? parsed : undefined;
+    }
+    case "Edit": {
+      const o = str(toolInput.old_string), n = str(toolInput.new_string);
+      return path && o !== undefined && n !== undefined ? files([replacementHunk(o, n)]) : undefined;
+    }
+    case "MultiEdit": {
+      const edits = Array.isArray(toolInput.edits) ? toolInput.edits : [];
+      const hunks = edits.flatMap((e) => typeof e?.old_string === "string" && typeof e.new_string === "string" ? [replacementHunk(e.old_string, e.new_string)] : []);
+      return path && hunks.length > 0 ? files(hunks) : undefined;
+    }
+    case "Write": {
+      const content = str(toolInput.content);
+      if (!path || content === undefined)
+        return;
+      let exists = false;
+      try {
+        exists = existsSync4(path);
+      } catch {}
+      return files([replacementHunk("", content)], exists ? "modified" : "added", exists);
+    }
+    default:
+      return;
+  }
+}
+function renderV4A(files) {
+  const out = [];
+  for (const f of files) {
+    out.push(`*** ${f.kind === "added" ? "Add" : f.kind === "deleted" ? "Delete" : "Update"} File: ${f.path}`);
+    for (const h of f.hunks) {
+      if (f.kind !== "added")
+        out.push(h.header ? `@@ ${h.header}` : "@@");
+      for (const l of h.lines)
+        out.push(`${l.t === "add" ? "+" : l.t === "del" ? "-" : " "}${l.s}`);
+    }
+  }
+  return out.join(`
+`);
+}
+var DIFF_LINE_MAX = 240;
+var DIFF_PREVIEW_MAX_CHARS = 1400;
+function previewDiff(files, k) {
+  let left = k;
+  let truncated = false;
+  const out = [];
+  for (const f of files) {
+    const total = f.hunks.reduce((n, h) => n + h.lines.length, 0);
+    if (left <= 0 && (total > 0 || truncated)) {
+      truncated = true;
+      break;
+    }
+    const hunks = [];
+    for (const h of f.hunks) {
+      if (left <= 0) {
+        truncated = true;
+        break;
+      }
+      const lines = h.lines.slice(0, left).map((l) => {
+        const s = capPermissionWireText(l.s, DIFF_LINE_MAX);
+        if (s !== l.s)
+          truncated = true;
+        return { t: l.t, s };
+      });
+      if (lines.length < h.lines.length)
+        truncated = true;
+      left -= lines.length;
+      hunks.push({ ...h.header ? { header: h.header } : {}, lines });
+    }
+    out.push({ ...f, hunks });
+  }
+  return { files: out, ...truncated ? { truncated: true } : {} };
+}
+function fitPermissionDiff(frame, files, maxChars = BLOB_FIT_CHARS) {
+  if (!files || files.length === 0)
+    return {};
+  const encoder = new TextEncoder;
+  const fits = (tail) => sealedBlobChars(encoder.encode(JSON.stringify({ ...frame, ...tail })).length) <= maxChars;
+  const unknown = files.some((f) => f.removed === null);
+  const diffSummary = {
+    files: files.length,
+    added: files.reduce((n, f) => n + f.added, 0),
+    removed: files.reduce((n, f) => n + (f.removed ?? 0), 0),
+    ...unknown ? { removedUnknown: true } : {}
+  };
+  if (!fits({ diffSummary }))
+    return {};
+  const ok = (k) => {
+    const diff = previewDiff(files, k);
+    return JSON.stringify(diff).length <= DIFF_PREVIEW_MAX_CHARS && fits({ diffSummary, diff });
+  };
+  if (!ok(0))
+    return { diffSummary };
+  let lo = 0;
+  let hi = files.reduce((n, f) => n + f.hunks.reduce((m, h) => m + h.lines.length, 0), 0);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (ok(mid))
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  const diff = previewDiff(files, lo);
+  return diff.files.length > 0 ? { diffSummary, diff } : { diffSummary };
 }
 function buildPermissionDetail(toolName, toolInput) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
@@ -5456,12 +5691,14 @@ function buildPermissionDetail(toolName, toolInput) {
       const c = str(toolInput.command);
       return c ?? "";
     }
-    case "apply_patch": {
-      const d = str(toolInput.description);
-      return d ?? "";
-    }
+    case "apply_patch":
+      return str(toolInput.command) ?? str(toolInput.description) ?? "";
     case "Edit":
-    case "Write":
+    case "MultiEdit":
+    case "Write": {
+      const diff = buildPermissionDiff(toolName, toolInput);
+      return diff ? renderV4A(diff) : str(toolInput.file_path) ?? "";
+    }
     case "Read":
     case "NotebookEdit": {
       const fp = str(toolInput.file_path);
@@ -5548,12 +5785,12 @@ function buildPermissionQuestions(toolInput) {
   });
 }
 var MAX_DETAIL_CHARS = 20000;
-function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions = []) {
+function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions = [], diffTail = {}) {
   const all = Array.from(detail);
   const hardLoss = Math.max(0, all.length - MAX_DETAIL_CHARS);
   const chars = hardLoss > 0 ? all.slice(0, MAX_DETAIL_CHARS) : all;
   const encoder = new TextEncoder;
-  const measure = (d, omitted, qs) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs))).length);
+  const measure = (d, omitted, qs) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs, diffTail))).length);
   const worstCase = all.length;
   const noPreviews = questions.map(({ p: _previews, ...question }) => question);
   const bareQuestions = noPreviews.map(({ d: _descriptions, ...question }) => question);
@@ -5587,12 +5824,13 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions 
   }
   return { detail: shortest, omitted: all.length - lo, ...tail };
 }
-function permissionFrame(base, detail, omitted, questions = []) {
+function permissionFrame(base, detail, omitted, questions = [], tail = {}) {
   return {
     ...base,
     ...detail.length > 0 ? { permissionDetail: detail } : {},
     ...omitted > 0 ? { permissionDetailOmitted: omitted } : {},
-    ...questions.length > 0 ? { permissionQuestions: questions } : {}
+    ...questions.length > 0 ? { permissionQuestions: questions } : {},
+    ...tail
   };
 }
 function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
@@ -5894,6 +6132,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
     }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
+    if (agent === "codex" && typeof toolInput.command === "string" && await codexPromptUserRuleMatches(toolInput.command, deps.codexRequirementsPath)) {
+      trace({ event: "exit", reason: "codex-prompt-user" });
+      return;
+    }
     const suggestions = input.permission_suggestions;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
@@ -5912,7 +6154,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionToolName: toolName
     };
     const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
-    let fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    const diffTail = fitPermissionDiff({ ...permissionBase, permissionDetailOmitted: Array.from(rawDetail).length }, buildPermissionDiff(toolName, toolInput));
+    let fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput), diffTail);
     if (fitted.detail === "" && rawDetail !== "" && summary !== toolName && (toolName === "Bash" || toolName === "shell" || toolName === "local_shell")) {
       permissionBase.permissionSummary = toolName;
       fitted = fitPermissionDetail(permissionBase, rawDetail);
@@ -5922,7 +6165,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
     }
     const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
-    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
+    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -6065,9 +6308,9 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const holdPid = deps.holdPid ?? process.pid;
     let holdBlob = blob;
     try {
-      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined, formatDecisionHoldDebug({ requestId, pid: holdPid })));
+      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail), undefined, formatDecisionHoldDebug({ requestId, pid: holdPid })));
     } catch {}
-    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...deps.holdId ? { holdId: deps.holdId } : {} });
+    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...deps.holdId ? { holdId: deps.holdId } : {}, requestId });
     heldSessionId = sessionId;
     settleHeldRecord = async () => {
       const settledAt = (deps.now ?? Date.now)();

@@ -173,6 +173,26 @@ describe("CodexAppServerClient", () => {
     expect(await waiting).toEqual({ type: "active", activeFlags: ["waitingOnUserInput"] });
   });
 
+  // NOM-165: 0.167 shapes from `codex app-server generate-ts` — Thread grew many fields,
+  // ToolRequestUserInputParams added required `isBlocking` and deprecated `autoResolutionMs` (may be
+  // omitted). Unknown keys are ignored; an absent deadline reads as none.
+  test("0.167 shapes: extra thread fields and an isBlocking request with no autoResolutionMs", async () => {
+    const h = harness();
+    await initialize(h);
+    const transport = h.transports[0];
+    const read = h.client.readThreadStatus("thread-1");
+    await Promise.resolve();
+    transport.receive({ id: 2, result: { thread: {
+      id: "thread-1", sessionId: "s", forkedFromId: null, parentThreadId: null, preview: "", ephemeral: false,
+      section: null, projectId: null, status: { type: "idle" }, turns: [],
+    } } });
+    expect(await read).toEqual({ type: "idle" });
+    const { autoResolutionMs: _dropped, ...params } = requestParams();
+    transport.receive({ method: "item/tool/requestUserInput", id: 7, params: { ...params, isBlocking: true } });
+    expect(h.requests).toHaveLength(1);
+    expect(h.requests[0].autoResolutionMs).toBeNull();
+  });
+
   test("emits a typed request and answers the same server request id", async () => {
     const h = harness();
     await initialize(h);
