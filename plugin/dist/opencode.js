@@ -4059,7 +4059,7 @@ function buildPermissionDiff(toolName, toolInput) {
       if (old === null)
         return files(diffHunks("", content), "added");
       if (old === undefined)
-        return files(diffHunks("", content), "modified", true);
+        return;
       return files(diffHunks(old, content));
     }
     default:

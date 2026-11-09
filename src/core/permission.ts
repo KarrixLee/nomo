@@ -1026,7 +1026,7 @@ const count = (hunks: PermissionDiffHunk[], t: "add" | "del"): number =>
 export const OVERWRITE_DIFF_MAX_BYTES = 2 << 20;
 
 /** The text a Write is about to overwrite: the string, null (no such file — the Write creates it), or
- *  undefined (exists but is not read here → the all-additions card). `file_path` is agent input, so:
+ *  undefined (exists but is not read here → no diff, the plain card). `file_path` is agent input, so:
  *  stat first (follows a symlink but opens nothing), open only a regular file under the cap, O_NONBLOCK
  *  so a path swapped for a FIFO after the stat still cannot block the hook, and re-check the opened fd.
  *  Strict UTF-8 with no NUL, else undefined. Never throws. */
@@ -1076,10 +1076,11 @@ export function buildPermissionDiff(toolName: string, toolInput: Record<string, 
       const content = str(toolInput.content);
       if (!path || content === undefined) return undefined;
       // An overwrite's old content is not in the input, so it is read from disk (same E2E blob as an
-      // Edit's old_string). Unreadable/over-cap/binary → all lines read as added, removed unknown.
+      // Edit's old_string). Unreadable/over-cap/binary → NO diff (like GitHub's "too large to show"):
+      // all-green "+17500" would read as a brand-new file. The card falls back to the plain summary.
       const old = readOverwrittenText(path);
       if (old === null) return files(diffHunks("", content), "added");
-      if (old === undefined) return files(diffHunks("", content), "modified", true);
+      if (old === undefined) return undefined;
       return files(diffHunks(old, content));
     }
     default: return undefined;

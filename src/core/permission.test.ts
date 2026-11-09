@@ -3771,8 +3771,6 @@ describe("NOM-166 diff parsing", () => {
       return join(dir, name);
     };
     const NEW13 = Array.from({ length: 13 }, (_, i) => `new ${i}`).join("\n") + "\n";
-    /** Today's (pre-fix) answer when the old content can't be read: modified, all additions, removed unknown. */
-    const fallback = { kind: "modified", added: 13, removed: null };
 
     test("16 lines overwritten by 13 different lines → +13 −16, a modified file, red and green in the V4A", async () => {
       const fp = await at("retry.ts", Array.from({ length: 16 }, (_, i) => `old ${i}`).join("\n") + "\n");
@@ -3846,22 +3844,23 @@ describe("NOM-166 diff parsing", () => {
         .toMatchObject({ kind: "modified", added: 1, removed: 1 });
     });
 
-    test("symlink to /dev/zero, a FIFO, a directory → never read, today's all-additions fallback", async () => {
+    test("symlink to /dev/zero, a FIFO, a directory → never read, no diff (plain card)", async () => {
       await symlink("/dev/zero", join(dir, "zero"));
       expect(Bun.spawnSync(["mkfifo", join(dir, "fifo")]).exitCode).toBe(0);
       await mkdir(join(dir, "sub"));
       for (const name of ["zero", "fifo", "sub"]) {
-        expect(buildPermissionDiff("Write", { file_path: join(dir, name), content: NEW13 })![0]).toMatchObject(fallback);
+        expect(buildPermissionDiff("Write", { file_path: join(dir, name), content: NEW13 })).toBeUndefined();
       }
-      expect(buildPermissionDiff("Write", { file_path: "/dev/zero", content: NEW13 })![0]).toMatchObject(fallback);
+      expect(buildPermissionDiff("Write", { file_path: "/dev/zero", content: NEW13 })).toBeUndefined();
     }, 2000);
 
-    test("over the size cap, binary (NUL), or invalid UTF-8 → fallback, never throws", async () => {
+    test("over the size cap, binary (NUL), or invalid UTF-8 → no diff (never fake all-green counts), never throws", async () => {
       const big = await at("big.txt", "x\n".repeat(OVERWRITE_DIFF_MAX_BYTES / 2 + 1));
       const bin = await at("a.png", new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00, 0x0a]));
       const latin1 = await at("l.txt", new Uint8Array([0x63, 0x61, 0x66, 0xe9, 0x0a])); // "café" in Latin-1
       for (const fp of [big, bin, latin1]) {
-        expect(buildPermissionDiff("Write", { file_path: fp, content: NEW13 })![0]).toMatchObject(fallback);
+        expect(buildPermissionDiff("Write", { file_path: fp, content: NEW13 })).toBeUndefined();
+        expect(buildPermissionDetail("Write", { file_path: fp, content: NEW13 })).toBe(fp); // plain card: just the path
       }
     });
   });
