@@ -1070,15 +1070,58 @@ describe("discoverLiveSessions (generic adapter-driven step)", () => {
     expect(writes[0].rec).toMatchObject({ op: "done", lastEvent: "done", sentDone: true, provisional: true });
   });
 
-  test("a NON-delivered POST persists NOTHING (retried next sweep — pid stays unknown)", async () => {
+  test("a FAILED (timed-out) POST still persists the record — it may have landed (NOM-173)", async () => {
+    const writes: { id: string; rec: SessionRecord }[] = [];
+    const traces: object[] = [];
+    await discoverLiveSessions(cfg(), {
+      adapters: [fakeAdapter([disc()])],
+      post: async (_b, detail) => { if (detail) { detail.error = "timeout"; detail.ms = 2001; } return "failed" as PostOutcome; },
+      readRecords: async () => [],
+      writeRecord: async (id, rec) => { writes.push({ id, rec }); },
+      trace: (e) => { traces.push(e); },
+    });
+    expect(writes.map((w) => w.id)).toEqual(["codex-pid-5150"]);
+    expect(writes[0].rec).toMatchObject({ pid: 5150, provisional: true });
+    expect(traces).toEqual([{ event: "provisional-create", sessionId: "codex-pid-5150", op: "start", outcome: "failed", error: "timeout", ms: 2001 }]);
+  });
+
+  test("a REVOKED POST persists nothing (the pairing is gone; the loop tears down)", async () => {
     const writes: unknown[] = [];
     await discoverLiveSessions(cfg(), {
       adapters: [fakeAdapter([disc()])],
-      post: async () => "failed" as PostOutcome,
+      post: async () => "revoked" as PostOutcome,
       readRecords: async () => [],
       writeRecord: async (id, rec) => { writes.push({ id, rec }); },
+      trace: () => {},
     });
     expect(writes).toHaveLength(0);
+  });
+
+  // NOM-173 replay. On a slow link the provisional op:start is abandoned at the 2 s budget AFTER the
+  // worker stored it; the real hook then makes the pid known, so discovery never retries. Before the fix
+  // no provisional file existed, nothing ever sent the end, and the worker row stayed "running" for an hour.
+  test("replay: a start that times out but lands is still ended once the real session reports", async () => {
+    const worker = new Map<string, string>(); // sessionId → stored op
+    const fakePost = async (body: object): Promise<PostOutcome> => {
+      const env = body as { sessionId: string; op: string };
+      if (env.op === "end") { worker.delete(env.sessionId); return "delivered"; }
+      worker.set(env.sessionId, env.op);
+      return env.op === "start" ? "failed" : "delivered"; // stored, but the client gave up waiting
+    };
+    const disk = new Map<string, SessionRecord>();
+    await discoverLiveSessions(cfg(), {
+      adapters: [fakeAdapter([disc()])], post: fakePost, readRecords: async () => [...disk.values()],
+      writeRecord: async (id, r) => { disk.set(id, r); }, trace: () => {},
+    });
+    expect(worker.get("codex-pid-5150")).toBe("start"); // the ghost-to-be is on the worker
+    // The real hook fires for the same TUI pid (its own reconcile raced the in-flight discovery POST).
+    disk.set("real-codex", rec({ pid: 5150, agent: "codex" }));
+    await reconcileProvisionalsSweep(cfg(), {
+      post: fakePost, readEntries: async () => [...disk].map(([sessionId, r]) => ({ sessionId, rec: r })),
+      deleteRecord: async (id) => { disk.delete(id); }, trace: () => {},
+    });
+    expect(worker.has("codex-pid-5150")).toBe(false);
+    expect(disk.has("codex-pid-5150")).toBe(false);
   });
 
   test("an adapter WITHOUT discoverLive (claude) is skipped entirely — no POST", async () => {
@@ -1161,12 +1204,15 @@ describe("reconcileProvisionalsSweep (ends + deletes a covered provisional)", ()
 
   test("a failed end POST keeps the provisional for the next sweep (no delete)", async () => {
     const deletes: string[] = [];
+    const traces: object[] = [];
     await reconcileProvisionalsSweep(cfg(), {
       readEntries: async () => covered(),
-      post: async () => "failed" as PostOutcome,
+      post: async (_b, detail) => { if (detail) detail.status = 503; return "failed" as PostOutcome; },
       deleteRecord: async (id) => { deletes.push(id); },
+      trace: (e) => { traces.push(e); },
     });
     expect(deletes).toEqual([]);
+    expect(traces).toEqual([{ event: "provisional-end", sessionId: "codex-pid-100", by: "sweep", outcome: "failed", status: 503 }]);
   });
 });
 

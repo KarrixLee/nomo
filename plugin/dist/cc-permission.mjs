@@ -111,7 +111,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.4.2";
+var PLUGIN_VERSION = "2.4.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3739,9 +3739,14 @@ async function reconcileProvisional(config, hookPid) {
     if (provisionals.length === 0)
       return;
     const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
-    if (!sentinel)
+    if (!sentinel) {
+      traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
       return;
+    }
     let delivered = false;
+    const started = Date.now();
+    let status;
+    let error;
     try {
       const res = await fetch(`${config.url}/v1/cc/event`, {
         method: "POST",
@@ -3749,8 +3754,12 @@ async function reconcileProvisional(config, hookPid) {
         body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
         signal: AbortSignal.timeout(2000)
       });
+      status = res.status;
       delivered = res.ok;
-    } catch {}
+    } catch (e) {
+      error = e?.name === "TimeoutError" ? "timeout" : "network";
+    }
+    traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered)
       await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {}

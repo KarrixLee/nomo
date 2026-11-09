@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.4.2";
+var PLUGIN_VERSION = "2.4.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -4043,9 +4043,14 @@ async function reconcileProvisional(config, hookPid) {
     if (provisionals.length === 0)
       return;
     const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
-    if (!sentinel)
+    if (!sentinel) {
+      traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
       return;
+    }
     let delivered = false;
+    const started = Date.now();
+    let status;
+    let error;
     try {
       const res = await fetch(`${config.url}/v1/cc/event`, {
         method: "POST",
@@ -4053,8 +4058,12 @@ async function reconcileProvisional(config, hookPid) {
         body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
         signal: AbortSignal.timeout(2000)
       });
+      status = res.status;
       delivered = res.ok;
-    } catch {}
+    } catch (e) {
+      error = e?.name === "TimeoutError" ? "timeout" : "network";
+    }
+    traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered)
       await unlink3(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {}
@@ -10718,7 +10727,7 @@ function buildProvisionalRecord(d, machine, blob, blobAgentFields, now, pairingI
 }
 async function discoverLiveSessions(config, deps = {}) {
   const adapters = deps.adapters ?? allAdapters;
-  const post = deps.post ?? ((body) => postEvent(config, body));
+  const post = deps.post ?? ((body, detail) => postEvent(config, body, { detail }));
   const readRecords = deps.readRecords ?? readAllRecords;
   const writeRecord = deps.writeRecord ?? ((sessionId, rec) => atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify(rec), 384));
   const now = deps.now ?? Date.now;
@@ -10737,8 +10746,18 @@ async function discoverLiveSessions(config, deps = {}) {
       const ts = now();
       const idle = d.idle === true;
       const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey, Math.floor(ts / 1000));
-      const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle));
-      if (outcome !== "delivered")
+      const detail = {};
+      const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle), detail);
+      traceFocus(deps, {
+        event: "provisional-create",
+        sessionId: d.sessionId,
+        op: idle ? "done" : "start",
+        outcome,
+        status: detail.status,
+        error: detail.error,
+        ms: detail.ms
+      });
+      if (outcome === "revoked")
         continue;
       await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId, idle));
     }
@@ -10753,13 +10772,15 @@ function provisionalsCoveredByReal(entries, adapters = allAdapters) {
   return entries.filter((e) => e.rec.provisional === true && typeof e.rec.pid === "number" && realPids.has(e.rec.pid)).map((e) => e.sessionId);
 }
 async function reconcileProvisionalsSweep(config, deps = {}) {
-  const post = deps.post ?? ((body) => postEvent(config, body));
+  const post = deps.post ?? ((body, detail) => postEvent(config, body, { detail }));
   const readEntries = deps.readEntries ?? readAllRecordEntries;
   const deleteRecord = deps.deleteRecord ?? ((sessionId) => unlink6(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
   const now = deps.now ?? Date.now;
   const entries = await readEntries();
   for (const sessionId of provisionalsCoveredByReal(entries, deps.adapters ?? allAdapters)) {
-    const outcome = await post(buildEndEnvelope(sessionId, now()));
+    const detail = {};
+    const outcome = await post(buildEndEnvelope(sessionId, now()), detail);
+    traceFocus(deps, { event: "provisional-end", sessionId, by: "sweep", outcome, status: detail.status, error: detail.error, ms: detail.ms });
     if (outcome === "delivered")
       await deleteRecord(sessionId);
   }
@@ -11755,7 +11776,11 @@ async function sweep(config, deps = {}) {
       continue;
     }
     if (verdict === "end" && config && record) {
-      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record));
+      const detail = {};
+      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record), { detail });
+      if (record.provisional === true) {
+        traceFocus({}, { event: "provisional-end", sessionId, by: "reap", outcome, status: detail.status, error: detail.error, ms: detail.ms });
+      }
       if (outcome === "revoked")
         return { revoked: true };
       if (outcome !== "delivered") {

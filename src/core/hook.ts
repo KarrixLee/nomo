@@ -774,8 +774,16 @@ async function reconcileProvisional(config: Config, hookPid: number): Promise<vo
     }
     if (provisionals.length === 0) return;
     const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
-    if (!sentinel) return;
+    if (!sentinel) {
+      // A provisional exists but none matched this hook's pid chain — the trace that tells a ppid
+      // mismatch (hook run from a daemon, not the TUI) apart from a lost end.
+      traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
+      return;
+    }
     let delivered = false;
+    const started = Date.now();
+    let status: number | undefined;
+    let error: string | undefined;
     try {
       const res = await fetch(`${config.url}/v1/cc/event`, {
         method: "POST",
@@ -783,8 +791,13 @@ async function reconcileProvisional(config: Config, hookPid: number): Promise<vo
         body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
         signal: AbortSignal.timeout(2000),
       });
+      status = res.status;
       delivered = res.ok; // 2xx only — a 401/5xx did NOT retire the worker's row
-    } catch { /* network failure / timeout → keep the file so the retry paths above can re-send */ }
+    } catch (e) {
+      // network failure / timeout → keep the file so the retry paths above can re-send
+      error = (e as { name?: string } | null)?.name === "TimeoutError" ? "timeout" : "network";
+    }
+    traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered) await unlink(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {
     // best-effort — never surface into a session

@@ -1886,22 +1886,22 @@ export function buildProvisionalRecord(
 /** Injectable side-effect seams for the discovery step, so it's testable without real fs/network. */
 export interface DiscoverDeps {
   adapters?: AgentAdapter[];
-  post?: (body: object) => Promise<PostOutcome>;
+  post?: (body: object, detail?: PostDetail) => Promise<PostOutcome>;
   readRecords?: () => Promise<SessionRecord[]>;
   writeRecord?: (sessionId: string, rec: SessionRecord) => Promise<void>;
   now?: () => number;
+  trace?: (event: object) => void;
 }
 
 /** One discovery pass: for every adapter that implements discoverLive, surface the live TUIs the hooks
  *  can't see yet as PROVISIONAL sessions. Each new one is POSTed per its turn state — op:start
  *  ("working") for an in-flight turn, op:done ("done") for an idle REPL (see buildProvisionalEnvelope);
- *  only on a delivered POST do we persist the provisional record (so a failed POST simply retries next
- *  sweep — the pid is still not "known"). Best-effort throughout: a discoverLive throw or a POST failure
- *  never derails the sweep. No-ops entirely when no adapter implements discoverLive (Claude) or no TUI
+ *  the provisional record is persisted on every outcome except `revoked` (see the NOM-173 note at the
+ *  write). Best-effort throughout: a discoverLive throw or a POST failure never derails the sweep. No-ops entirely when no adapter implements discoverLive (Claude) or no TUI
  *  is found. */
 export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = {}): Promise<void> {
   const adapters = deps.adapters ?? allAdapters;
-  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const post = deps.post ?? ((body: object, detail?: PostDetail) => postEvent(config, body, { detail }));
   const readRecords = deps.readRecords ?? readAllRecords;
   const writeRecord = deps.writeRecord
     ?? ((sessionId: string, rec: SessionRecord) => atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify(rec), 0o600));
@@ -1920,8 +1920,22 @@ export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = 
       const ts = now();
       const idle = d.idle === true;
       const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey, Math.floor(ts / 1000));
-      const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle));
-      if (outcome !== "delivered") continue; // failed/revoked → retry next sweep, don't persist a ghost
+      const detail: PostDetail = {};
+      const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle), detail);
+      traceFocus(deps, {
+        event: "provisional-create", sessionId: d.sessionId, op: idle ? "done" : "start", outcome,
+        status: detail.status, error: detail.error, ms: detail.ms,
+      });
+      // NOM-173: a non-2xx is NOT proof the start missed the worker. On a slow link the POST is abandoned
+      // at the 2 s budget after the worker already stored the "working" row (measured from mainland China:
+      // 5 of 6 discovery starts timed out yet landed). This record is the ONLY handle the hook reconcile,
+      // the sweep backstop and the pid-death reap use to send that row its end. Skip it and the real hook
+      // makes the pid "known", discovery never retries, and the row stays up until the worker's 1 h sweep.
+      // So persist on every outcome but `revoked` (pairing gone). If the start truly never landed, the
+      // later end is a harmless 200 no-op, and a working record's heartbeat restates the start.
+      // ponytail: assumes an abandoned start is stored before its end (sent ≥ one POST later) reaches the
+      // worker; a worker-side tombstone would close that gap if a trace ever shows it.
+      if (outcome === "revoked") continue;
       await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId, idle));
     }
   }
@@ -1958,7 +1972,8 @@ export function provisionalsCoveredByReal(entries: RecordEntry[], adapters: Agen
 
 /** Injectable seams for the sweep-side provisional reconcile, so it's testable without fs/network. */
 export interface SweepReconcileDeps {
-  post?: (body: object) => Promise<PostOutcome>;
+  post?: (body: object, detail?: PostDetail) => Promise<PostOutcome>;
+  trace?: (event: object) => void;
   readEntries?: () => Promise<RecordEntry[]>;
   deleteRecord?: (sessionId: string) => Promise<void>;
   /** The adapter registry that decides which agents are discovery-capable (see provisionalsCoveredByReal). */
@@ -1971,13 +1986,15 @@ export interface SweepReconcileDeps {
  *  raced the discovery write). POSTs an op:end (worker reuses the last blob) and deletes the provisional
  *  only on a delivered POST — a failed POST leaves it for the next sweep. Best-effort. */
 export async function reconcileProvisionalsSweep(config: Config, deps: SweepReconcileDeps = {}): Promise<void> {
-  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const post = deps.post ?? ((body: object, detail?: PostDetail) => postEvent(config, body, { detail }));
   const readEntries = deps.readEntries ?? readAllRecordEntries;
   const deleteRecord = deps.deleteRecord ?? ((sessionId: string) => unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
   const now = deps.now ?? Date.now;
   const entries = await readEntries();
   for (const sessionId of provisionalsCoveredByReal(entries, deps.adapters ?? allAdapters)) {
-    const outcome = await post(buildEndEnvelope(sessionId, now()));
+    const detail: PostDetail = {};
+    const outcome = await post(buildEndEnvelope(sessionId, now()), detail);
+    traceFocus(deps, { event: "provisional-end", sessionId, by: "sweep", outcome, status: detail.status, error: detail.error, ms: detail.ms });
     if (outcome === "delivered") await deleteRecord(sessionId);
   }
 }
@@ -3850,7 +3867,11 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       // delivered gates deletion: a 401/500 (bad secret, Worker error) is NOT success, so we keep the
       // file and retry next sweep rather than silently dropping the session. A 404 means the pairing
       // itself is gone → bail and let the loop tear the config down.
-      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record));
+      const detail: PostDetail = {};
+      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record), { detail });
+      if (record.provisional === true) {
+        traceFocus({}, { event: "provisional-end", sessionId, by: "reap", outcome, status: detail.status, error: detail.error, ms: detail.ms });
+      }
       if (outcome === "revoked") return { revoked: true };
       if (outcome !== "delivered") {
         remaining++;
