@@ -14,7 +14,7 @@ import {
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
   CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid, resolveCodexTuiOwner,
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
-  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPendingUpdate, noteResend, resendAllowed, resendBackoffMs, resetResendBackoff, RESEND_BACKOFF_MAX_MS, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
+  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPendingUpdate, resealForPairing, shouldReseal, noteResend, resendAllowed, resendBackoffMs, resetResendBackoff, RESEND_BACKOFF_MAX_MS, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS, pruneStaleDecisionHolds,
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS, RETIRE_AFTER_MS,
@@ -4754,5 +4754,81 @@ describe("correctPendingUpdate (re-send a running session's state the relay neve
     const w = world(owed(), "revoked", { status: 404 });
     expect(await correctPendingUpdate(cfg(), "/tmp/s.json", "s", owed(), NOW, w.seams)).toBe("revoked");
     expect(resendAllowed(NOW)).toBe(true);
+  });
+});
+
+// NOM-174: after a re-pair every record's blob is sealed under the OLD pairing's key, so nothing could
+// re-announce the session. The reseal net rebuilds it under the CURRENT key and posts it to the CURRENT pairing.
+describe("resealForPairing (re-announce live sessions to a new pairing)", () => {
+  const NOW = 9_000_000;
+  const TS = NOW - 60_000;
+  const OLD_KEY = new Uint8Array(32).fill(3);
+  const stale = (over: Partial<SessionRecord> = {}): SessionRecord =>
+    rec({ lastEvent: "done", op: "done", prio: 0, blob: "OLD-BLOB", pairingId: "old", title: "launch video", ts: TS, ...over });
+  const world = (disk: SessionRecord | null, outcome: PostOutcome = "delivered") => {
+    const w = {
+      disk, posts: [] as Record<string, unknown>[],
+      seams: {
+        readRecord: async () => w.disk,
+        writeRecord: async (_p: string, r: SessionRecord) => { w.disk = JSON.parse(JSON.stringify(r)); },
+        post: async (b: object) => { w.posts.push(b as Record<string, unknown>); return outcome; },
+        trace: () => {},
+        readDecisionHoldFn: async () => null,
+        now: () => NOW,
+      },
+    };
+    return w;
+  };
+  beforeEach(() => resetResendBackoff());
+  afterEach(() => resetResendBackoff());
+
+  test("an idle done row is resealed under the NEW key, posted, and restamped; the old blob never leaves", async () => {
+    const w = world(stale({ updatePending: true }));
+    expect(await resealForPairing(cfg(), "/tmp/s.json", "s", stale({ updatePending: true }), NOW, w.seams)).toBe("corrected");
+    expect(w.posts).toHaveLength(1);
+    const env = w.posts[0];
+    expect(env).toMatchObject({ v: 2, sessionId: "s", op: "done", prio: 0, ts: NOW });
+    expect(env.blob).not.toBe("OLD-BLOB");
+    const plain = await decryptBlob(KEY, env.blob as string) as Record<string, unknown>;
+    expect(plain).toMatchObject({ status: "done", title: "launch video", machine: "mac", label: "proj", at: Math.floor(TS / 1000) });
+    await expect(decryptBlob(OLD_KEY, env.blob as string)).rejects.toThrow();
+    expect(w.disk).toMatchObject({ blob: env.blob, pairingId: "p", ts: TS });
+    expect(w.disk).not.toHaveProperty("updatePending");
+  });
+
+  test("a running row keeps its op/status", async () => {
+    const r = stale({ op: "update", lastEvent: "working" });
+    const w = world(r);
+    expect(await resealForPairing(cfg(), "/tmp/s.json", "s", r, NOW, w.seams)).toBe("corrected");
+    expect(w.posts[0]).toMatchObject({ op: "update" });
+    expect(await decryptBlob(KEY, w.posts[0].blob as string)).toMatchObject({ status: "working" });
+  });
+
+  test("current-pairing and legacy (no pairingId) records are left alone", async () => {
+    expect(shouldReseal(stale({ pairingId: "p" }), "p")).toBe(false);
+    expect(shouldReseal(stale({ pairingId: undefined }), "p")).toBe(false);
+    for (const r of [stale({ pairingId: "p" }), stale({ pairingId: undefined })]) {
+      const w = world(r);
+      expect(await resealForPairing(cfg(), "/tmp/s.json", "s", r, NOW, w.seams)).toBe("uncorrected");
+      expect(w.posts).toHaveLength(0);
+    }
+  });
+
+  test("a hook that moved the record first wins; a live approval hold defers", async () => {
+    const moved = world(stale({ ts: TS + 1, pairingId: "p" }));
+    expect(await resealForPairing(cfg(), "/tmp/s.json", "s", stale(), NOW, moved.seams)).toBe("uncorrected");
+    expect(moved.posts).toHaveLength(0);
+    const held = world(stale());
+    expect(await resealForPairing(cfg(), "/tmp/s.json", "s", stale(), NOW, {
+      ...held.seams, readDecisionHoldFn: async () => ({ blob: "CARD", pid: 77, at: NOW - 1_000 }), holdPidAliveFn: () => true,
+    })).toBe("uncorrected");
+    expect(held.posts).toHaveLength(0);
+  });
+
+  test("a failed post keeps the old stamp (retried) and arms the shared back-off", async () => {
+    const w = world(stale(), "failed");
+    expect(await resealForPairing(cfg(), "/tmp/s.json", "s", stale(), NOW, w.seams)).toBe("pending");
+    expect(w.disk!.pairingId).toBe("old");
+    expect(resendAllowed(NOW + 1)).toBe(false);
   });
 });

@@ -11464,6 +11464,53 @@ async function correctPendingUpdate(config, path, sessionId, record, now, deps =
     return "uncorrected";
   }
 }
+function shouldReseal(record, pairingId) {
+  return typeof record.pairingId === "string" && record.pairingId.length > 0 && record.pairingId !== pairingId && typeof record.ts === "number" && Number.isFinite(record.ts);
+}
+async function resealForPairing(config, path, sessionId, record, now, deps = {}) {
+  const post = deps.post ?? ((body, detail) => postEvent(config, body, { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail }));
+  const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const reread = deps.readRecord ?? readRecordAt;
+  try {
+    if (!shouldReseal(record, config.pairingId) || !resendAllowed(now))
+      return "uncorrected";
+    if (await decisionHoldIsLive(sessionId, now, deps))
+      return "uncorrected";
+    const fresh = await reread(path);
+    if (!fresh || recordMovedSince(record, fresh) || !shouldReseal(fresh, config.pairingId))
+      return "uncorrected";
+    const envelope = await buildTitleRepairEnvelope(sessionId, fresh, typeof fresh.title === "string" ? fresh.title : "", (deps.now ?? Date.now)(), config.e2eKey, recordAgent(fresh), Math.floor(fresh.ts / 1000));
+    const detail = {};
+    const outcome = await post(envelope, detail);
+    const delivered = outcome === "delivered";
+    const backoffMs = outcome === "revoked" ? undefined : noteResend(delivered, now);
+    traceFocus(deps, {
+      event: "reseal",
+      sessionId,
+      outcome,
+      delivered,
+      op: fresh.op,
+      lastEvent: fresh.lastEvent,
+      status: detail.status,
+      error: detail.error,
+      ms: detail.ms,
+      backoffMs
+    });
+    if (outcome === "revoked")
+      return "revoked";
+    if (!delivered)
+      return "pending";
+    const after = await reread(path);
+    if (after && !recordMovedSince(fresh, after) && shouldReseal(after, config.pairingId)) {
+      try {
+        await writeRecord(path, { ...after, blob: envelope.blob, pairingId: config.pairingId, updatePending: undefined });
+      } catch {}
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
 var RETIRE_AFTER_MS = PLAN_PICKER_PENDING_MAX_MS + 15 * 60000;
 function isRetireEligible(record, now) {
   if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt))
@@ -11879,6 +11926,14 @@ async function sweep(config, deps = {}) {
         const netOwned = idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle;
         let resent = false;
         if (!netOwned) {
+          const reseal = await resealForPairing(config, path, sessionId, record, now);
+          if (reseal === "revoked")
+            return { revoked: true };
+          if (reseal === "corrected")
+            delivered = true;
+          resent = reseal === "corrected" || reseal === "pending";
+        }
+        if (!netOwned && !resent) {
           const pendingUpdate = await correctPendingUpdate(config, path, sessionId, record, now);
           if (pendingUpdate === "revoked")
             return { revoked: true };
@@ -12405,6 +12460,7 @@ export {
   reconcileProvisionalsSweep,
   recordMovedSince,
   repairTitle,
+  resealForPairing,
   resendAllowed,
   resendBackoffMs,
   resetCommandState,
@@ -12422,6 +12478,7 @@ export {
   shouldPendingUpdateCheck,
   shouldPlanPickerVerificationCheck,
   shouldRepairTitle,
+  shouldReseal,
   shouldWaitingHeartbeat,
   tailShowsInterrupt,
   titleRepairedRecord,

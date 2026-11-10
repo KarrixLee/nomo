@@ -3110,6 +3110,64 @@ export async function correctPendingUpdate(
   }
 }
 
+// --- Re-pair reseal (NOM-174: a live session's blob is sealed under the PREVIOUS pairing) ----------
+//
+// A re-pair rotates pairingId + e2eKey and the new pairing's worker row list starts empty. Every record
+// on disk still holds a blob sealed under the OLD key, so buildHeartbeatEnvelope refuses it (correctly —
+// the phone can't open it) and the greet beat, heartbeat and pending-update nets all send nothing. A busy
+// session reappeared on its next hook; an idle one never did. This net rebuilds the record's CURRENT
+// state from its local fields (buildTitleRepairEnvelope — the same plaintext every corrective uses), seals
+// it under the CURRENT key, POSTs it to the CURRENT pairing, and restamps blob + pairingId on a 2xx.
+// The old key is never read and the old blob is never sent. Records with no pairingId are legacy
+// (pre-key-rotation-guard) and skipped. Shares the long timeout + back-off with the pending-update net.
+
+/** Gate: is this record's blob sealed under a pairing other than `pairingId`? Pure. */
+export function shouldReseal(record: SessionRecord, pairingId: string): boolean {
+  return typeof record.pairingId === "string" && record.pairingId.length > 0 && record.pairingId !== pairingId
+    && typeof record.ts === "number" && Number.isFinite(record.ts);
+}
+
+/** The reseal net for one tracked session. Same verdicts as correctPendingUpdate. */
+export async function resealForPairing(
+  config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: PendingDoneDeps = {},
+): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
+  const post = deps.post ?? ((body: object, detail: PostDetail) =>
+    postEvent(config, body, { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail }));
+  const writeRecord = deps.writeRecord
+    ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+  const reread = deps.readRecord ?? readRecordAt;
+  try {
+    if (!shouldReseal(record, config.pairingId) || !resendAllowed(now)) return "uncorrected";
+    if (await decisionHoldIsLive(sessionId, now, deps)) return "uncorrected";
+    const fresh = await reread(path);
+    if (!fresh || recordMovedSince(record, fresh) || !shouldReseal(fresh, config.pairingId)) return "uncorrected";
+    // `at` = the record's last real event (what its last hook stamped), so an idle done row ages honestly.
+    const envelope = await buildTitleRepairEnvelope(
+      sessionId, fresh, typeof fresh.title === "string" ? fresh.title : "", (deps.now ?? Date.now)(),
+      config.e2eKey, recordAgent(fresh), Math.floor(fresh.ts / 1000),
+    );
+    const detail: PostDetail = {};
+    const outcome = await post(envelope, detail);
+    const delivered = outcome === "delivered";
+    const backoffMs = outcome === "revoked" ? undefined : noteResend(delivered, now);
+    traceFocus(deps, {
+      event: "reseal", sessionId, outcome, delivered, op: fresh.op, lastEvent: fresh.lastEvent,
+      status: detail.status, error: detail.error, ms: detail.ms, backoffMs,
+    });
+    if (outcome === "revoked") return "revoked";
+    if (!delivered) return "pending";
+    const after = await reread(path);
+    if (after && !recordMovedSince(fresh, after) && shouldReseal(after, config.pairingId)) {
+      try { await writeRecord(path, { ...after, blob: envelope.blob, pairingId: config.pairingId, updatePending: undefined }); } catch {
+        // Restamp didn't land → one redundant reseal next sweep.
+      }
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
+
 // --- Idle-done retire (free the worker cap slot a long-idle done row still occupies) -----------
 //
 // v1.1.6 froze the reap's blob `at` so a resumed-but-idle session AGES OUT of the phone's
@@ -3826,7 +3884,14 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
         // Undelivered-update debt (see correctPendingUpdate): only for a session no net above took this
         // sweep. A resend IS this sweep's beat — it carries the same blob — so the heartbeat stands down.
         let resent = false;
+        // Re-pair reseal (see resealForPairing) — before the debt net, which can't send an old-key blob.
         if (!netOwned) {
+          const reseal = await resealForPairing(config, path, sessionId, record, now);
+          if (reseal === "revoked") return { revoked: true };
+          if (reseal === "corrected") delivered = true;
+          resent = reseal === "corrected" || reseal === "pending";
+        }
+        if (!netOwned && !resent) {
           const pendingUpdate = await correctPendingUpdate(config, path, sessionId, record, now);
           if (pendingUpdate === "revoked") return { revoked: true };
           if (pendingUpdate === "corrected") delivered = true;
