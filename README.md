@@ -529,9 +529,10 @@ process. Codex has no plugin update verb: with a `local` marketplace (`source_ty
   `marketplace add`, which would silently repoint a marketplace you aimed elsewhere (a fork, a local
   checkout). A Codex `local` marketplace prints nothing, since there is nothing to run.
 - **Commands** (`pair`, `status`, `reset`, `unpair`) run the INSTALLED plugin's own entry, not code from the npm
-  package: the copy hooks last ran (the hook shim's stamp in `~/.config/cc-status`), else `~/.nomo`,
-  else the hook shim's newest Claude Code / Codex cache copy — through that copy's `run.sh`, so the
-  runtime rules in [Runtime and launch](#runtime-and-launch) apply. Nothing installed → one line saying
+  package: the highest plugin version among every installed copy — the copy named in the hook shim's
+  stamp (`~/.config/cc-status`), `~/.nomo`, and each version in the Claude Code / Codex plugin caches
+  (the same copies the hook shim considers; superseded Codex copies are skipped) — through that copy's
+  `run.sh`, so the runtime rules in [Runtime and launch](#runtime-and-launch) apply. Nothing installed → one line saying
   to run `bunx nomo-ai` first. Output and exit status are the entry's own. An unknown word is refused,
   never treated as an install.
 - **Short command offer.** Only after Nomo is installed, only in a terminal (or with `--global`), default

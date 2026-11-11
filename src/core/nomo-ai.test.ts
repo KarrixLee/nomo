@@ -285,6 +285,41 @@ describe("commands: pair / status / reset / uninstall", () => {
     }
   });
 
+  test("stale stamp to an old Codex cache copy loses to a newer Claude Code cache copy", async () => {
+    const h = await home();
+    const old = join(h, ".codex", "plugins", "cache", "nomo", "nomo", "2.3.53");
+    await plugin(old, join(h, "old.log"), 0, "2.3.53");
+    await plugin(join(h, ".claude", "plugins", "cache", "nomo", "nomo-cc", "2.4.2"), join(h, "new.log"), 0, "2.4.2");
+    await plugin(join(h, ".claude", "plugins", "cache", "nomo", "nomo-cc", "2.3.6"), join(h, "older.log"), 0, "2.3.6");
+    await mkdir(join(h, ".config", "cc-status"), { recursive: true });
+    await writeFile(join(h, ".config", "cc-status", "hook-shim.stamp"), `5 ${old}\n`);
+    expect((await cli(h, ["reset"])).code).toBe(0);
+    expect(await readFile(join(h, "new.log"), "utf8")).toBe("reset \n");
+    for (const f of ["old.log", "older.log"]) await expect(readFile(join(h, f), "utf8")).rejects.toThrow();
+  });
+
+  test("a superseded (.orphaned_at) cache copy is never run, even when it is the highest version", async () => {
+    const h = await home();
+    const orphan = join(h, ".codex", "plugins", "cache", "nomo", "nomo", "2.9.0");
+    await plugin(orphan, join(h, "orphan.log"), 0, "2.9.0");
+    await writeFile(join(orphan, ".orphaned_at"), "1");
+    await plugin(join(h, ".codex", "plugins", "cache", "nomo", "nomo", "2.4.2"), join(h, "live.log"), 0, "2.4.2");
+    expect((await cli(h, ["status"])).code).toBe(0);
+    expect(await readFile(join(h, "live.log"), "utf8")).toBe("status-cmd \n");
+    await expect(readFile(join(h, "orphan.log"), "utf8")).rejects.toThrow();
+  });
+
+  test("~/.nomo runs when it is the newest copy; a copy missing the entry or run.sh does not count", async () => {
+    const h = await home();
+    await plugin(join(h, ".nomo", "plugin"), join(h, "nomo.log"), 0, "2.5.0");
+    await plugin(join(h, ".claude", "plugins", "cache", "nomo", "nomo-cc", "2.4.2"), join(h, "cache.log"), 0, "2.4.2");
+    const broken = join(h, ".claude", "plugins", "cache", "nomo", "nomo-cc", "2.9.0");
+    await plugin(broken, join(h, "broken.log"), 0, "2.9.0");
+    await rm(join(broken, "dist", "reset.mjs"));
+    expect((await cli(h, ["reset"])).code).toBe(0);
+    expect(await readFile(join(h, "nomo.log"), "utf8")).toBe("reset \n");
+  });
+
   test("a malformed stamp (one field, or a relative root) is ignored — never code from the current folder", async () => {
     for (const stamp of ["4", "4 relative/plugin"]) {
       const h = await home();

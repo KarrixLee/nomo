@@ -1194,33 +1194,48 @@ function versionNewer(a, b) {
   const p = (/** @type {string} */ v) => v.split(/[-+]/)[0].split(".").map((n) => (/^\d+$/.test(n) ? Number(n) : 0));
   const x = p(a), y = p(b);
   for (let i = 0; i < Math.max(x.length, y.length, 3); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) > (y[i] ?? 0);
-  return false;
+  return !a.includes("-") && b.includes("-"); // equal numbers: a release outranks its prerelease (as the shim)
 }
 
-/** How to run `entry` from the installed plugin, or undefined when there is none.
- *   1. the copy hooks last ran (the hook shim's stamp, "<rev> <root>" — used only with both fields and
- *      an ABSOLUTE root, so a malformed stamp can never run code relative to the current folder) and the
- *      ~/.nomo checkout (OpenCode, Cursor, Antigravity, Grok Bot): whichever is the higher plugin version,
- *      the stamp on a tie — an older copy may lack what the command is for (reset sending activity);
- *   2. the hook shim itself, which scans the Claude Code / Codex plugin caches for the newest copy —
- *      only when one of those caches really holds Nomo (the shim exits silently when it finds nothing).
- *  @param {string} entry @returns {[string, string[]] | undefined} */
-function installedEntry(entry) {
-  const usable = (/** @type {string} */ root) =>
-    existsSync(join(root, "scripts", "run.sh")) && existsSync(join(root, "dist", `${entry}.mjs`));
-  /** @type {string[]} */
+/** Every installed copy the hook shim would launch, plus ~/.nomo, in tie-break order: the stamp root
+ *  (both fields, ABSOLUTE root only — a malformed stamp can never mean the current folder), ~/.nomo
+ *  (OpenCode, Cursor, Antigravity, Grok Bot), then the shim's own cache scan (hook-shim.sh step b):
+ *  `~/.codex|.claude/plugins/cache/<marketplace>/<nomo|nomo-cc>/<version>/`, skipping a Codex
+ *  `.orphaned_at` (superseded) directory. Marketplace checkouts are never candidates (NOM-134).
+ *  @returns {string[]} */
+function installedRoots() {
   const roots = [];
   try {
     const m = /^\S+\s+(\/.*)$/.exec(readFileSync(join(ccDir(), "hook-shim.stamp"), "utf8").trim());
-    if (m && usable(m[1])) roots.push(m[1]);
+    if (m) roots.push(m[1]);
   } catch {}
-  if (usable(join(CHECKOUT, "plugin"))) roots.push(join(CHECKOUT, "plugin"));
-  const best = roots.reduce((x, y) => (versionNewer(pluginVersion(y), pluginVersion(x)) ? y : x), roots[0] ?? "");
-  if (best) return [join(best, "scripts", "run.sh"), [join(best, "dist", `${entry}.mjs`)]];
-  const shim = join(ccDir(), "hook-shim.sh");
-  const inCache = hostHasNomo(join(homedir(), ".claude", "plugins", "cache"), "nomo-cc") ||
-    hostHasNomo(join(homedir(), ".codex", "plugins", "cache"), "nomo");
-  return inCache && existsSync(shim) ? [shim, [entry]] : undefined;
+  roots.push(join(CHECKOUT, "plugin"));
+  for (const [host, plugin] of [[".codex", "nomo"], [".claude", "nomo-cc"]]) {
+    const cache = join(homedir(), host, "plugins", "cache");
+    for (const mp of readdirSafe(cache)) {
+      for (const v of readdirSafe(join(cache, mp, plugin))) {
+        const root = join(cache, mp, plugin, v);
+        if (!existsSync(join(root, ".orphaned_at"))) roots.push(root);
+      }
+    }
+  }
+  return roots;
+}
+/** @param {string} dir */
+const readdirSafe = (dir) => {
+  try { return readdirSync(dir); } catch { return []; }
+};
+
+/** How to run `entry`: the HIGHEST plugin version among installedRoots() that has `scripts/run.sh` and
+ *  `dist/<entry>.mjs` (the first such on a tie), through that copy's run.sh. An older copy may lack what
+ *  the command is for (a 2.3.x reset sends no activity). Undefined when nothing is installed.
+ *  @param {string} entry @returns {[string, string[]] | undefined} */
+function installedEntry(entry) {
+  const usable = installedRoots().filter((root) =>
+    existsSync(join(root, "scripts", "run.sh")) && existsSync(join(root, "dist", `${entry}.mjs`)));
+  const version = (/** @type {string} */ root) => pluginVersion(root) || root.slice(root.lastIndexOf("/") + 1);
+  const best = usable.reduce((x, y) => (versionNewer(version(y), version(x)) ? y : x), usable[0] ?? "");
+  return best ? [join(best, "scripts", "run.sh"), [join(best, "dist", `${entry}.mjs`)]] : undefined;
 }
 
 /** Run one command's entry with the terminal attached; its output and exit status are the command's.
