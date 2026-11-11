@@ -67,11 +67,23 @@ const VERSION = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
 ).version;
 
-const USAGE = `nomo-ai ${VERSION} — install (or update) the Nomo plugin for your coding agents.
+/** The name this was run as: `nomo` (the short bin, after `bun add -g nomo-ai`) or `nomo-ai`. Only the
+ *  help text uses it. Never suggest `bunx nomo`/`npx nomo`: the npm package `nomo` is someone else's. */
+const INVOKED = (process.argv[1] ?? "").split("/").pop() === "nomo" ? "nomo" : "nomo-ai";
+const CMD = INVOKED === "nomo" ? "nomo" : "bunx nomo-ai";
+/** One help row: the command, padded so the descriptions line up whichever name is shown. */
+const row = (/** @type {string} */ c, /** @type {string} */ what) => `  ${`${CMD}${c}`.padEnd(CMD.length + 12)} ${what}`;
 
-  bunx nomo-ai            detect agents, confirm, install
-  npx nomo-ai             same, without bun
-  bunx nomo-ai --uninstall --cursor   remove Nomo from an agent (name it; see below)
+const USAGE = `${INVOKED} ${VERSION} — install (or update) the Nomo plugin for your coding agents.
+
+${row("", "detect agents, confirm, install")}
+${INVOKED === "nomo" ? "" : `  ${"npx nomo-ai".padEnd(CMD.length + 12)} same, without bun\n`}
+Commands (from any folder; they run your installed Nomo, shared by every agent here):
+${row(" pair", "pair this computer with your phone (opens the QR page, then waits")}
+${row("", "for the scan); `pair code` prints the typeable code instead").replace(CMD, " ".repeat(CMD.length))}
+${row(" status", "is this computer paired, and is each agent set up")}
+${row(" reset", "clear stuck sessions and send your activity summary now")}
+${row(" uninstall", "remove Nomo from the agents you name (see below)")}
 
 An agent that already has Nomo shows an update instead of an install. OpenCode's is
 done for you — it has no marketplace, so its checkout is its version. Claude Code and
@@ -83,25 +95,28 @@ Agents (naming any one of these skips the prompt):
   --opencode              OpenCode
   --cursor                Cursor (desktop app + cursor-agent CLI)
   --antigravity           Google Antigravity (desktop app + agy CLI)
-  --all                   all of them (Cursor/Antigravity only if on this machine)
+  --grokbot               Grok Bot desktop app (macOS): an hourly job sends its days to
+                          the Activity widget
+  --all                   all of them (Cursor/Antigravity/Grok Bot only if on this machine)
 
 Options:
   -y, --yes               no prompt; install every agent detected on this machine
-      --uninstall         remove Nomo from the agents you name (an agent flag is required)
+      --uninstall         same as the \`uninstall\` command
   -n, --dry-run           print the commands that would run, run nothing
-      --ref <branch|tag>  OpenCode, Cursor and Antigravity only: install from this ref of the
-                          repo instead of its default branch. Claude Code and Codex
-                          install through their own marketplaces, which read the
+      --ref <branch|tag>  OpenCode, Cursor, Antigravity and Grok Bot only: install from
+                          this ref of the repo instead of its default branch. Claude Code
+                          and Codex install through their own marketplaces, which read the
                           default branch and take no ref — --ref cannot pin them.
   -h, --help              this
   -v, --version           print the version
 
-Nothing here pairs your phone — that stays a deliberate step you run from inside the
-agent afterwards (/nomo-cc:pair, $nomo-pair, /nomo-pair).
-
+Installing never pairs your phone — that stays a deliberate step: \`${CMD} pair\`,
+or from inside the agent (/nomo-cc:pair, $nomo-pair, /nomo-pair).
+${INVOKED === "nomo" ? "" : "\nShort form: after `bun add -g nomo-ai` (or `npm install -g nomo-ai`), `nomo pair`,\n`nomo status`, … work too. Never `bunx nomo` / `npx nomo`: that package is not ours.\n"}
 Uninstall (removes only what Nomo wrote; your phone stays paired for your other agents):
-  bunx nomo-ai --uninstall --cursor        Nomo's entries in ~/.cursor/hooks.json + /nomo-* skills
-  bunx nomo-ai --uninstall --antigravity   the "nomo" block in ~/.gemini/config/hooks.json + plugin
+  ${CMD} uninstall --cursor        Nomo's entries in ~/.cursor/hooks.json + /nomo-* skills
+  ${CMD} uninstall --antigravity   the "nomo" block in ~/.gemini/config/hooks.json + plugin
+  ${CMD} uninstall --grokbot       the hourly job ~/Library/LaunchAgents/gg.nomo.activity.plist
   (the same as: node ~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall)
 Not covered — each host removes its own install:
   Claude Code   claude plugin uninstall nomo-cc@nomo
@@ -222,6 +237,9 @@ const cursorDir = () => process.env.CURSOR_CONFIG_DIR || join(homedir(), ".curso
 /** Antigravity's installer, and its global customization dir (holds hooks.json). */
 const ANTIGRAVITY_SCRIPT = join(CHECKOUT, "plugin", "scripts", "antigravity-install.mjs");
 const antigravityDir = () => join(homedir(), ".gemini", "config");
+/** Grok Bot's installer (an hourly LaunchAgent; the app has no hooks), and the file it writes. */
+const GROKBOT_SCRIPT = join(CHECKOUT, "plugin", "scripts", "grokbot-install.mjs");
+const grokbotPlist = () => join(homedir(), "Library", "LaunchAgents", "gg.nomo.activity.plist");
 
 /** Is Nomo already installed for this host? Answered from the host's OWN plugin cache
  *  (`<cache>/<marketplace>/<plugin>/`): the MARKETPLACE directory name is whatever the user called it,
@@ -614,6 +632,49 @@ const AGENTS = [
         : null;
     },
   },
+  {
+    // Grok Bot has no hooks (its Bots run on a cloud computer), so nothing would ever start the watchdog
+    // that runs the activity scan. grokbot-install.mjs adds one per-user LaunchAgent that starts the
+    // existing watchdog at login and hourly — see that script's header. macOS only.
+    id: "grokbot",
+    label: "Grok Bot",
+    plan: () =>
+      STATUS.get("grokbot")?.installed
+        ? [`already installed — updates ${CHECKOUT}, then refreshes the hourly job`]
+        : [
+            `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
+            `node ${GROKBOT_SCRIPT}`,
+          ],
+    next: () =>
+      STATUS.get("grokbot")?.installed
+        ? ["nothing to restart — the next hourly run uses the update"]
+        : ["if this Mac is not paired yet, pair it (then scan the QR):", "  bunx nomo-ai pair", "check it works:", "  bunx nomo-ai status"],
+    uninstallScript: GROKBOT_SCRIPT,
+    detect: () =>
+      process.platform === "darwin" &&
+      (existsSync("/Applications/Grok Bot.app") || existsSync(join(homedir(), "Library", "Application Support", "Grok Bot"))),
+    skipUndetectedUnderAll: true,
+    installed: () => existsSync(grokbotPlist()),
+    install() {
+      if (process.platform !== "darwin") {
+        return { error: "Grok Bot setup is macOS only (it adds a per-user launchd job)", hint: "Nothing was changed." };
+      }
+      const checkout = ensureCheckout("Grok Bot", "grokbot-install.mjs");
+      if (checkout) return checkout;
+      if (!DRY && !existsSync(GROKBOT_SCRIPT)) {
+        return {
+          error: `${GROKBOT_SCRIPT} is missing from the checkout`,
+          hint: REF
+            ? `Does \`${REF}\` have Grok Bot support? Older refs do not ship that script.`
+            : `Delete ${CHECKOUT} and re-run.`,
+        };
+      }
+      const fail = run(process.execPath, [GROKBOT_SCRIPT]);
+      return fail
+        ? { error: fail, hint: `The script's own line above says what it refused and why. Fix that and re-run;\n    ${process.execPath} ${GROKBOT_SCRIPT}` }
+        : null;
+    },
+  },
 ];
 
 /** Fill STATUS, ONCE, before anything is rendered. Everything expensive lives here for one reason:
@@ -701,9 +762,9 @@ function parseArgs(argv) {
  *  "install this version" while two of three legs quietly ignore it is worse than no flag. */
 function refCaveat(selected) {
   /** The two that install from ~/.nomo. @param {{id: string}} a */
-  const pinned = (a) => a.id === "opencode" || a.id === "cursor" || a.id === "antigravity";
+  const pinned = (a) => a.id === "opencode" || a.id === "cursor" || a.id === "antigravity" || a.id === "grokbot";
   const ignoring = AGENTS.filter((a) => !pinned(a) && selected.has(a.id)).map((a) => a.label);
-  say(`${bold("Note:")} --ref ${REF} pins the ${CHECKOUT} checkout (OpenCode, Cursor, Antigravity) only.`);
+  say(`${bold("Note:")} --ref ${REF} pins the ${CHECKOUT} checkout (OpenCode, Cursor, Antigravity, Grok Bot) only.`);
   if (ignoring.length > 0) {
     say(dim(`  ${ignoring.join(" and ")} install through their own marketplace, which takes an`));
     say(dim(`  owner/repo and reads ${REPO}'s default branch. There is no ref to pass it, so`));
@@ -1023,7 +1084,7 @@ function banner() {
 function uninstall(selected) {
   if (selected.size === 0) {
     err("nomo-ai: --uninstall needs to know which agent — name it, e.g.:");
-    err("  bunx nomo-ai --uninstall --cursor   (or --antigravity)");
+    err("  bunx nomo-ai uninstall --cursor   (or --antigravity, --grokbot)");
     return 2;
   }
   if (DRY) say(dim("dry run — nothing will be removed\n"));
@@ -1053,6 +1114,75 @@ function uninstall(selected) {
   return failures.length > 0 ? 1 : 0;
 }
 
+// ── commands: pair / status / reset ──────────────────────────────────────────────────────────────
+//
+// The same plugin entries the agents' slash commands run (/nomo-cc:pair, $nomo-reset, /nomo-status…),
+// for a human in any folder — and the only way in for a Grok Bot-only Mac, which has no agent to type
+// them into. This package ships no plugin code, so each command finds the INSTALLED copy the way the
+// rest of the plugin does and runs its dist entry through that copy's run.sh (bun/node resolution and
+// bun's --config=/dev/null --env-file=/dev/null live there). Pairing, sessions and the watchdog are one
+// shared state folder per computer, so one reset or pairing here covers every agent.
+
+/** command → [dist entry, argv]. `pair` is the start + the wait in one go, as the slash commands do in
+ *  two steps; `pair code` is their typeable-code form. */
+/** @type {Record<string, (a: string[]) => [string, string[]]>} */
+const COMMANDS = {
+  pair: (a) => (a[0] === "code" ? ["pair", ["--show-code", ...a.slice(1)]] : ["pair", a]),
+  status: (a) => ["status-cmd", a],
+  reset: (a) => ["reset", a],
+};
+
+const ccDir = () => process.env.NOMO_CC_DIR || join(homedir(), ".config", "cc-status");
+
+/** How to run `entry` from the installed plugin, or undefined when there is none. In order:
+ *   1. the copy hooks last ran (the hook shim's stamp, "<rev> <root>") — the shim's own first choice;
+ *   2. the ~/.nomo checkout (OpenCode, Cursor, Antigravity, Grok Bot);
+ *   3. the hook shim itself, which scans the Claude Code / Codex plugin caches for the newest copy —
+ *      only when one of those caches really holds Nomo (the shim exits silently when it finds nothing).
+ *  @param {string} entry @returns {[string, string[]] | undefined} */
+function installedEntry(entry) {
+  const at = (/** @type {string} */ root) =>
+    existsSync(join(root, "scripts", "run.sh")) && existsSync(join(root, "dist", `${entry}.mjs`))
+      ? /** @type {[string, string[]]} */ ([join(root, "scripts", "run.sh"), [join(root, "dist", `${entry}.mjs`)]])
+      : undefined;
+  let stamped = "";
+  try {
+    stamped = readFileSync(join(ccDir(), "hook-shim.stamp"), "utf8").trim().replace(/^\S+\s+/, "");
+  } catch {}
+  const found = (stamped && at(stamped)) || at(join(CHECKOUT, "plugin"));
+  if (found) return found;
+  const shim = join(ccDir(), "hook-shim.sh");
+  const inCache = hostHasNomo(join(homedir(), ".claude", "plugins", "cache"), "nomo-cc") ||
+    hostHasNomo(join(homedir(), ".codex", "plugins", "cache"), "nomo");
+  return inCache && existsSync(shim) ? [shim, [entry]] : undefined;
+}
+
+/** Run one command's entry with the terminal attached; its output and exit status are the command's.
+ *  @param {string} name @param {string[]} rest */
+function runCommand(name, rest) {
+  if (rest.includes("-h") || rest.includes("--help")) {
+    say(USAGE);
+    return 0;
+  }
+  const [entry, args] = COMMANDS[name](rest);
+  const how = installedEntry(entry);
+  if (!how) {
+    err("nomo-ai: Nomo is not installed on this computer yet — run `bunx nomo-ai` first.");
+    return 1;
+  }
+  const exec = (/** @type {string[]} */ a) => {
+    const r = spawnSync(how[0], [...how[1], ...a], { stdio: "inherit" });
+    if (r.error) err(`nomo-ai: could not run ${how[0]}: ${r.error.message}`);
+    return r.status ?? 1;
+  };
+  const code = exec(args);
+  // `pair` = start, then wait for the scan, unless the caller already chose a step.
+  if (name === "pair" && code === 0 && !args.some((a) => a === "wait" || a === "wire-notify" || a === "--check")) {
+    return exec(["wait"]);
+  }
+  return code;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────────────────────────
 //
 // Wrapped in a function purely so every exit is `process.exitCode` + `return`, never `process.exit()`.
@@ -1061,7 +1191,19 @@ function uninstall(selected) {
 // i.e. exactly the output a `bunx nomo-ai | tee install.log` would lose.
 
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
+  let argv = process.argv.slice(2);
+  // A first word that is not a flag is a command. An unknown one fails here — never an install.
+  if (argv[0] !== undefined && !argv[0].startsWith("-")) {
+    const [name, ...rest] = argv;
+    if (name === "uninstall") argv = ["--uninstall", ...rest];
+    else if (Object.hasOwn(COMMANDS, name)) return runCommand(name, rest);
+    else {
+      err(`nomo-ai: unknown command: ${name}\n`);
+      err(USAGE);
+      return 2;
+    }
+  }
+  const args = parseArgs(argv);
   if (args.needsValue !== undefined) {
     err(`nomo-ai: ${args.needsValue} needs a branch or tag name\n`);
     err(USAGE);
@@ -1101,9 +1243,9 @@ async function main() {
   const selected = explicit ? args.picked : new Set(args.yes ? found : []);
 
   if (!explicit && found.length === 0) {
-    err("\nnomo-ai: found no Claude Code, Codex, OpenCode, Cursor or Antigravity install on this machine.");
-    err("  Looked for `claude`, `codex`, `opencode`, `cursor-agent`, `agy` on PATH and ~/.claude, ~/.codex, ~/.config/opencode, ~/.cursor, ~/.gemini/config.");
-    err("  Name one anyway with --claude / --codex / --opencode / --cursor / --antigravity, or --all.");
+    err("\nnomo-ai: found no Claude Code, Codex, OpenCode, Cursor, Antigravity or Grok Bot install on this machine.");
+    err("  Looked for `claude`, `codex`, `opencode`, `cursor-agent`, `agy` on PATH and ~/.claude, ~/.codex, ~/.config/opencode, ~/.cursor, ~/.gemini/config, /Applications/Grok Bot.app.");
+    err("  Name one anyway with --claude / --codex / --opencode / --cursor / --antigravity / --grokbot, or --all.");
     return 1;
   }
 
@@ -1123,7 +1265,7 @@ async function main() {
   if (!explicit && !args.yes) {
     if (!interactive()) {
       err("\nnomo-ai: not a terminal, so there is nobody to ask.");
-      err("  Pass --yes to install everything detected, or name agents: --claude --codex --opencode --cursor --antigravity / --all.");
+      err("  Pass --yes to install everything detected, or name agents: --claude --codex --opencode --cursor --antigravity --grokbot / --all.");
       return 2;
     }
     const answer = await choose(selected);
@@ -1175,7 +1317,8 @@ async function main() {
     say(bold("Next:"));
     for (const a of done) {
       say(`  ${a.label}`);
-      for (const step of a.next()) say(`    - ${step}`);
+      // A two-space prefix marks a line to TYPE (as in showUpdate): no bullet, so it copies clean.
+      for (const step of a.next()) say(step.startsWith("  ") ? `      ${bold(step.trim())}` : `    - ${step}`);
     }
     say();
     say(dim("Pairing is one QR scan from the Nomo app's Sessions tab. One pairing covers every agent."));

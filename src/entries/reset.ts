@@ -6,7 +6,11 @@
 //      PROVISIONAL (a discovery sentinel), or that is corrupt, gets an op:end POSTed under the
 //      CURRENT pairing (an end carries no blob, so it clears the phone row regardless of which key
 //      sealed the record's stale blob) and its file deleted. Records with LIVE pids are left alone.
-//   3. Pairing, keys, and config.json are NOT touched — that is `unpair`'s job.
+//   3. When paired, scans the agents' history and sends the daily activity summary NOW (heatmap +
+//      streak), skipping the watchdog's 6 h upload gate for this one call. Runs after step 1, so no
+//      watchdog is writing activity-days.json meanwhile; the respawned watchdog reads the fresh
+//      lastUpload/hash from that file and does not re-send the same rows.
+//   4. Pairing, keys, and config.json are NOT touched — that is `unpair`'s job.
 //
 // Interactive command (same output contract as unpair): sequential stdout lines, ALWAYS exit 0 —
 // "nothing to reset" is a normal, successful outcome. The watchdog restarts automatically on the
@@ -17,6 +21,7 @@
 import { execFileSync } from "node:child_process";
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { basename } from "node:path";
+import { ActivityOutcome, CycleDeps, runActivityCycle } from "../core/activity";
 import { Config, isWatchdogCommand, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
 
 export type ResetVerdict = "clear" | "keep";
@@ -48,6 +53,8 @@ export interface ResetDeps {
   /** `ps -o command= -p <pid>` — the safety check before killing the pidfile's pid. */
   commandOf?: (pid: number) => string | undefined;
   killPid?: (pid: number) => void;
+  /** The activity cycle (scan + forced upload); tests inject a stub so the real history is never read. */
+  activityCycle?: (deps: CycleDeps) => Promise<ActivityOutcome>;
 }
 
 /** The `ps -o command= -p <pid>` line for a pid, or undefined when the pid is gone / ps fails. */
@@ -80,6 +87,10 @@ async function stopWatchdog(deps: ResetDeps): Promise<"killed" | "stale-pidfile"
     const cmd = commandOf(pid);
     if (cmd !== undefined && isWatchdogCommand(cmd)) {
       try { killPid(pid); killed = true; } catch { /* raced its own exit — fine */ }
+      // Let it finish exiting (its SIGTERM path takes ~250 ms) so a scan it had in flight cannot write
+      // activity-days.json under the activity step below. Bounded at ~1 s.
+      const isAlive = deps.isAlive ?? pidAlive;
+      for (let i = 0; killed && i < 20 && isAlive(pid); i++) await new Promise((r) => setTimeout(r, 50));
     }
   }
   await unlink(pidPath).catch(() => {});
@@ -145,6 +156,19 @@ export async function reset(deps: ResetDeps = {}): Promise<number> {
     print("No stale sessions to clear.");
   }
   if (kept > 0) print(`Left ${kept} live session${kept === 1 ? "" : "s"} untouched.`);
+
+  // 3. Activity summary, sent now. The watchdog was stopped above (step 1).
+  if (config) {
+    let outcome: ActivityOutcome | "error";
+    try {
+      outcome = await (deps.activityCycle ?? runActivityCycle)({ config, fetchFn, force: true });
+    } catch {
+      outcome = "error";
+    }
+    if (outcome === "sent") print("Sent your activity summary (heatmap and streak) to your phone.");
+    else if (outcome === "empty") print("No activity to send yet.");
+    else print("Could not send your activity summary right now — it will be sent again automatically later.");
+  }
   print("Pairing and keys were not touched — use the unpair command if you want that.");
   return 0;
 }
@@ -153,7 +177,7 @@ export async function reset(deps: ResetDeps = {}): Promise<number> {
 // for older nodes.
 if (import.meta.main) {
   if (process.argv.includes("--check")) {
-    console.log("usage: reset  — stop the watchdog and clear dead/phantom session rows (keeps the pairing; watchdog restarts on the next session)");
+    console.log("usage: reset  — stop the watchdog, clear dead/phantom session rows and send the activity summary now (keeps the pairing; watchdog restarts on the next session)");
     process.exit(0);
   }
   process.exit(await reset());

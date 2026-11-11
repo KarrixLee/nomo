@@ -145,8 +145,8 @@ describe("bunx nomo-ai --uninstall", () => {
 
   test("--help lists the uninstall lines", async () => {
     const help = await nomoAi(["--help"]);
-    expect(help.out).toContain("bunx nomo-ai --uninstall --cursor");
-    expect(help.out).toContain("bunx nomo-ai --uninstall --antigravity");
+    expect(help.out).toContain("bunx nomo-ai uninstall --cursor");
+    expect(help.out).toContain("bunx nomo-ai uninstall --antigravity");
     expect(help.out).toContain("claude plugin uninstall nomo-cc@nomo");
   });
 
@@ -185,3 +185,110 @@ describe("bunx nomo-ai --uninstall", () => {
     expect(r.out).not.toContain("$ claude");
   });
 });
+
+describe("commands: pair / status / reset / uninstall", () => {
+  async function cli(home: string, args: string[], bin = NOMO_AI): Promise<{ code: number; out: string }> {
+    const proc = spawnTestProcess({
+      cmd: [Bun.which("node")!, bin, ...args],
+      cwd: home,
+      env: isolatedTestEnv(home, { NO_COLOR: "1", PATH: "/usr/bin:/bin" }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    return { code: await proc.exited, out: `${out}${err}` };
+  }
+  const home = async () => {
+    const h = await mkdtemp(join(tmpdir(), "nomo-ai-cmd-"));
+    homes.push(h);
+    return h;
+  };
+  /** A fake installed plugin at `root`: run.sh logs "<entry> <args>" and exits with $EXIT (default 0). */
+  const plugin = async (root: string, log: string, exit = 0) => {
+    await mkdir(join(root, "scripts"), { recursive: true });
+    await mkdir(join(root, "dist"), { recursive: true });
+    for (const e of ["pair", "reset", "status-cmd"]) await writeFile(join(root, "dist", `${e}.mjs`), "");
+    await writeFile(join(root, "scripts", "run.sh"), `#!/bin/sh\ne=$(basename "$1" .mjs); shift\necho "$e $*" >> '${log}'\necho "from-${"$"}e"\nexit ${exit}\n`, { mode: 0o755 });
+  };
+
+  test("nothing installed: one plain line naming `bunx nomo-ai`, non-zero exit", async () => {
+    for (const c of ["pair", "status", "reset"]) {
+      const r = await cli(await home(), [c]);
+      expect(r.code).toBe(1);
+      expect(r.out.trim()).toBe("nomo-ai: Nomo is not installed on this computer yet — run `bunx nomo-ai` first.");
+    }
+  });
+
+  test("runs the ~/.nomo copy's entry; stdout, args and exit code pass through", async () => {
+    const h = await home();
+    const log = join(h, "calls.log");
+    await plugin(join(h, ".nomo", "plugin"), log, 3);
+    const r = await cli(h, ["status", "--plain", "claude"]);
+    expect(r.code).toBe(3);
+    expect(r.out).toBe("from-status-cmd\n");
+    expect(await readFile(log, "utf8")).toBe("status-cmd --plain claude\n");
+  });
+
+  test("pair = start then wait; `pair code` is the typeable-code form; a failed start does not wait", async () => {
+    const h = await home();
+    const log = join(h, "calls.log");
+    await plugin(join(h, ".nomo", "plugin"), log);
+    expect((await cli(h, ["pair"])).code).toBe(0);
+    expect((await cli(h, ["pair", "code"])).code).toBe(0);
+    expect(await readFile(log, "utf8")).toBe("pair \npair wait\npair --show-code\npair wait\n");
+    const h2 = await home();
+    const log2 = join(h2, "calls.log");
+    await plugin(join(h2, ".nomo", "plugin"), log2, 1);
+    expect((await cli(h2, ["pair"])).code).toBe(1);
+    expect(await readFile(log2, "utf8")).toBe("pair \n");
+  });
+
+  test("the copy hooks last ran (the shim stamp) wins over ~/.nomo", async () => {
+    const h = await home();
+    const log = join(h, "calls.log");
+    await plugin(join(h, ".nomo", "plugin"), join(h, "nomo.log"));
+    const stamped = join(h, "cache copy", "2.4.2");
+    await plugin(stamped, log);
+    await mkdir(join(h, ".config", "cc-status"), { recursive: true });
+    await writeFile(join(h, ".config", "cc-status", "hook-shim.stamp"), `4 ${stamped}\n`);
+    expect((await cli(h, ["reset"])).code).toBe(0);
+    expect(await readFile(log, "utf8")).toBe("reset \n");
+  });
+
+  test("an unknown word fails clearly and installs nothing; `<cmd> --help` prints help, runs nothing", async () => {
+    const h = await home();
+    const r = await cli(h, ["instal", "--claude"]);
+    expect(r.code).toBe(2);
+    expect(r.out).toContain("unknown command: instal");
+    expect(r.out).not.toContain("$ claude");
+    expect(r.out).not.toContain("Nomo plugin installer"); // the install banner never printed
+    const log = join(h, "calls.log");
+    await plugin(join(h, ".nomo", "plugin"), log);
+    const help = await cli(h, ["pair", "--help"]);
+    expect(help.code).toBe(0);
+    expect(help.out).toContain("Commands");
+    await expect(readFile(log, "utf8")).rejects.toThrow();
+  });
+
+  test("`uninstall` is the --uninstall flag: same agent-required rule, same removal", async () => {
+    const h = await home();
+    expect((await cli(h, ["uninstall"])).code).toBe(2);
+    const r = await cli(h, ["uninstall", "--claude"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("claude plugin uninstall nomo-cc@nomo");
+  });
+
+  test("help names the command after how it was run: `nomo` (global short bin) or `bunx nomo-ai`", async () => {
+    const h = await home();
+    const { symlink } = await import("node:fs/promises");
+    await symlink(NOMO_AI, join(h, "nomo"));
+    const short = await cli(h, ["--help"], join(h, "nomo"));
+    expect(short.out).toContain("  nomo pair");
+    expect(short.out).not.toContain("bunx nomo-ai pair");
+    const long = await cli(h, ["--help"]);
+    expect(long.out).toContain("  bunx nomo-ai pair");
+    // never point anyone at the `nomo` npm package (not ours)
+    for (const o of [short.out, long.out]) expect(o).not.toMatch(/(bunx|npx) nomo (pair|status|reset|uninstall)/);
+  });
+});
+

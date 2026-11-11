@@ -15,7 +15,7 @@ import {
   CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid, resolveCodexTuiOwner,
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
   codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPendingUpdate, resealForPairing, shouldReseal, noteResend, resendAllowed, resendBackoffMs, resetResendBackoff, RESEND_BACKOFF_MAX_MS, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
-  enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
+  enforceWatchdogOwnership, hasInterruptMarker, incumbentKeepsBeat, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS, pruneStaleDecisionHolds,
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS, RETIRE_AFTER_MS,
   buildWorkingEnvelope, postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
@@ -43,6 +43,27 @@ const rec = (over: Partial<SessionRecord> = {}): SessionRecord => ({
 // record write can't unbound it — see effectiveDoneAttempts). That state is per-process, exactly as it is
 // in the real daemon, so each test starts from a fresh daemon's view of the world.
 beforeEach(() => { resetDoneAttemptMemory(); });
+
+describe("incumbentKeepsBeat (who owns the daemon when a second watchdog starts)", () => {
+  const holder = (version?: string, build?: string) => ({ pid: 4242, ...(version ? { version } : {}), ...(build ? { build } : {}) });
+  test("same version and bundle: every start is a no-op", () => {
+    expect(incumbentKeepsBeat(holder("2.4.2", "b1"), "2.4.2", "b1", false)).toBe(true);
+    expect(incumbentKeepsBeat(holder("2.4.2", "b1"), "2.4.2", "b1", true)).toBe(true);
+  });
+  test("a hook-spawned start takes over any other build (unchanged behaviour)", () => {
+    expect(incumbentKeepsBeat(holder("2.4.2", "b1"), "2.4.2", "b2", false)).toBe(false);
+    expect(incumbentKeepsBeat(holder("2.4.5", "b1"), "2.4.2", "b2", false)).toBe(false);
+  });
+  test("a scheduled (launchd) start defers to a same-version other checkout and to a newer version", () => {
+    expect(incumbentKeepsBeat(holder("2.4.2", "b1"), "2.4.2", "b2", true)).toBe(true);
+    expect(incumbentKeepsBeat(holder("2.4.5", "b1"), "2.4.2", "b2", true)).toBe(true);
+    expect(incumbentKeepsBeat(holder("garbage"), "2.4.2", "b2", true)).toBe(true);
+  });
+  test("a scheduled start still replaces an older version (as ensureWatchdog would)", () => {
+    expect(incumbentKeepsBeat(holder("2.4.1", "b1"), "2.4.2", "b2", true)).toBe(false);
+    expect(incumbentKeepsBeat(holder(), "2.4.2", "b2", true)).toBe(false);
+  });
+});
 
 describe("per-sweep watchdog pidfile ownership", () => {
   test("a non-owner self-exits at the sweep gate and cleans up its bridge/proxy children", () => {

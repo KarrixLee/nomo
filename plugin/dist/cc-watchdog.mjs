@@ -9284,7 +9284,7 @@ async function loadMachineId(path) {
   await atomicWrite(path, mid, 384);
   return mid;
 }
-var emptyState = () => ({ lastUpload: 0, lastHash: "", lastPairing: "", rows: new Map });
+var emptyState = () => ({ lastUpload: 0, lastHash: "", lastPairing: "", lastVersion: "", rows: new Map });
 var h12 = (s) => createHash3("sha1").update(s).digest("base64").slice(0, 12);
 var pad = (n) => String(n).padStart(2, "0");
 function localDate(ts) {
@@ -9359,7 +9359,7 @@ function serializeState(state) {
     u: r.u,
     ...r.k ? { k: [...r.k], ss: [...r.ss], ko: r.ko ?? {} } : {}
   }));
-  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, days });
+  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, lastVersion: state.lastVersion, days });
 }
 function parseState(text) {
   const st = emptyState();
@@ -9368,6 +9368,7 @@ function parseState(text) {
     st.lastUpload = Number(o.lastUpload) || 0;
     st.lastHash = typeof o.lastHash === "string" ? o.lastHash : "";
     st.lastPairing = typeof o.lastPairing === "string" ? o.lastPairing : "";
+    st.lastVersion = typeof o.lastVersion === "string" ? o.lastVersion : "";
     for (const r of o.days ?? []) {
       const bits = new Uint8Array(36);
       bits.set(Buffer.from(String(r.b ?? ""), "base64").subarray(0, 36));
@@ -9768,13 +9769,14 @@ async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
 function payloadHash(payload) {
   return createHash3("sha1").update(JSON.stringify(payload.days)).digest("hex");
 }
-async function maybeUpload(state, config, now, fetchFn = fetch, mid) {
-  const newPairing = config.pairingId !== state.lastPairing;
-  if (state.rows.size === 0 || !newPairing && now - state.lastUpload < UPLOAD_EVERY_MS)
+async function maybeUpload(state, config, now, fetchFn = fetch, mid, force = false) {
+  const due = force || config.pairingId !== state.lastPairing;
+  const timeDue = due || state.lastVersion !== PLUGIN_VERSION || now - state.lastUpload >= UPLOAD_EVERY_MS;
+  if (state.rows.size === 0 || !timeDue)
     return false;
   const payload = buildPayload(state, now, mid);
   const hash = payloadHash(payload);
-  if (!newPairing && hash === state.lastHash && now - state.lastUpload < REFRESH_EVERY_MS)
+  if (!due && hash === state.lastHash && now - state.lastUpload < REFRESH_EVERY_MS)
     return false;
   try {
     const blob = await encryptBlob(config.e2eKey, payload);
@@ -9794,6 +9796,7 @@ async function maybeUpload(state, config, now, fetchFn = fetch, mid) {
     state.lastUpload = now;
     state.lastHash = hash;
     state.lastPairing = config.pairingId;
+    state.lastVersion = PLUGIN_VERSION;
     return true;
   } catch {
     return false;
@@ -9802,7 +9805,7 @@ async function maybeUpload(state, config, now, fetchFn = fetch, mid) {
 async function runActivityCycle(deps = {}) {
   const config = deps.config !== undefined ? deps.config : await loadConfig();
   if (!config)
-    return;
+    return "unpaired";
   const daysPath = deps.daysPath ?? ACTIVITY_DAYS_PATH;
   const cursorPath = deps.cursorPath ?? ACTIVITY_CURSOR_PATH;
   const now = deps.now ?? Date.now;
@@ -9823,9 +9826,10 @@ async function runActivityCycle(deps = {}) {
   const mid = await loadMachineId(deps.midPath ?? `${dirname2(daysPath)}/machine-id`).catch(() => {
     return;
   });
-  const sent = await maybeUpload(state, config, now(), deps.fetchFn, mid);
+  const sent = await maybeUpload(state, config, now(), deps.fetchFn, mid, deps.force);
   if (scan || sent)
     await save();
+  return sent ? "sent" : state.rows.size === 0 ? "empty" : "not-sent";
 }
 function startActivityLoop(load = loadConfig, cycle = runActivityCycle) {
   let busy = false;
@@ -12222,11 +12226,16 @@ function createBridgeSupervisor(deps = {}) {
     }
   };
 }
+function incumbentKeepsBeat(holder, version, build, scheduled) {
+  if (holder.version === version && !watchdogBuildDiffers(holder.build, build))
+    return true;
+  return scheduled && !watchdogVersionOutranks(version, holder.version);
+}
 async function claimSingleInstance() {
   const build = watchdogBuildStamp();
   try {
     const holder = parseWatchdogPidfile(readFileSync3(WATCHDOG_PID_PATH, "utf8"));
-    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && holder.version === PLUGIN_VERSION && !watchdogBuildDiffers(holder.build, build)) {
+    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && incumbentKeepsBeat(holder, PLUGIN_VERSION, build, process.argv.includes("--scheduled"))) {
       return false;
     }
   } catch {}
@@ -12478,6 +12487,7 @@ export {
   goneStrikeShouldTeardown,
   hasInterruptMarker,
   heartbeatKind,
+  incumbentKeepsBeat,
   isClaudeIdleReapEligible,
   isRetireEligible,
   isRightfulWatchdogOwner,

@@ -57,8 +57,9 @@ import {
   GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, sidField, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
-  watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, writeInterruptFlagAt,
+  watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, watchdogVersionOutranks, writeInterruptFlagAt,
 } from "../core/shared";
+import type { WatchdogPidfile } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
 import { startActivityLoop } from "../core/activity";
 
@@ -4350,6 +4351,23 @@ export function createBridgeSupervisor(deps: BridgeSupervisorDeps = {}) {
  *     leave the old code running (and would re-loop: the next hook SIGTERMs + spawns again), so a
  *     version-mismatched incumbent is taken over. Its own release is ownership-checked, so it can never
  *     stomp our claim on the way out. */
+/** Does a live incumbent keep the beat against a starter on `version`/`build`? Pure (the caller has
+ *  already proven the holder live and not us).
+ *    - same version AND same bundle → always: a second start is a no-op.
+ *    - otherwise a HOOK-spawned start takes over (ensureWatchdog only spawns when it wants its build
+ *      running — see claimSingleInstance).
+ *    - a SCHEDULED start (`--scheduled`: the Grok Bot leg's hourly launchd job, grokbot-install.mjs)
+ *      only fills a gap. Nothing chose its build, so it defers to any incumbent it does not strictly
+ *      outrank by version — the same rule ensureWatchdog applies to peers. Without this, the hourly job
+ *      from ~/.nomo would evict a newer or same-version-other-checkout daemon (Claude Code's, Codex's)
+ *      every hour, and that agent's next hook would evict it straight back. */
+export function incumbentKeepsBeat(
+  holder: WatchdogPidfile, version: string, build: string | undefined, scheduled: boolean,
+): boolean {
+  if (holder.version === version && !watchdogBuildDiffers(holder.build, build)) return true;
+  return scheduled && !watchdogVersionOutranks(version, holder.version);
+}
+
 async function claimSingleInstance(): Promise<boolean> {
   // OUR bundle's identity, read once. It is stamped into the pidfile so a later hook can tell that a
   // rebuild happened under an unchanged version (see watchdogBuildStamp) — and it is the same test
@@ -4360,7 +4378,7 @@ async function claimSingleInstance(): Promise<boolean> {
   try {
     const holder = parseWatchdogPidfile(readFileSync(WATCHDOG_PID_PATH, "utf8"));
     if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid)
-        && holder.version === PLUGIN_VERSION && !watchdogBuildDiffers(holder.build, build)) {
+        && incumbentKeepsBeat(holder, PLUGIN_VERSION, build, process.argv.includes("--scheduled"))) {
       return false;
     }
   } catch {

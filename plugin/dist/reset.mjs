@@ -3,16 +3,15 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/reset.ts
 import { execFileSync as execFileSync2 } from "node:child_process";
-import { readdir, readFile as readFile2, unlink as unlink2 } from "node:fs/promises";
-import { basename as basename2 } from "node:path";
+import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
+import { basename as basename3 } from "node:path";
 
-// src/core/shared.ts
-import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
-import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
-import { execFileSync, spawn } from "node:child_process";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
+// src/core/activity.ts
+import { createHash as createHash2, randomUUID } from "node:crypto";
+import { createReadStream, existsSync as existsSync2 } from "node:fs";
+import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { basename as basename2, dirname as dirname2 } from "node:path";
+import * as zlib from "node:zlib";
 
 // src/core/crypto.ts
 var textEncoder = new TextEncoder;
@@ -99,6 +98,12 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
+import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 var PLUGIN_VERSION = "2.4.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
@@ -1082,6 +1087,603 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
   return null;
 }
 
+// src/core/activity.ts
+var HOT_DAYS = 40;
+var MAX_DAYS = 400;
+var HOUR_MS = 3600000;
+var UPLOAD_EVERY_MS = 6 * HOUR_MS;
+var REFRESH_EVERY_MS = 7 * 24 * HOUR_MS;
+var CHUNK = 2 * 1024 * 1024;
+var SAVE_EVERY_BYTES = 256 * 1024 * 1024;
+var MAX_PAYLOAD_CHARS = 900000;
+var ACTIVITY_DAYS_PATH = `${CC_DIR}/activity-days.json`;
+var ACTIVITY_CURSOR_PATH = `${CC_DIR}/activity-cursor.json`;
+var UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+async function loadMachineId(path) {
+  const have = (await readFile2(path, "utf8").catch(() => "")).trim();
+  if (UUID_SHAPE.test(have))
+    return have;
+  const mid = randomUUID();
+  await atomicWrite(path, mid, 384);
+  return mid;
+}
+var emptyState = () => ({ lastUpload: 0, lastHash: "", lastPairing: "", lastVersion: "", rows: new Map });
+var h12 = (s) => createHash2("sha1").update(s).digest("base64").slice(0, 12);
+var pad = (n) => String(n).padStart(2, "0");
+function localDate(ts) {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function addEvent(state, ev) {
+  if (!Number.isFinite(ev.ts))
+    return false;
+  const d = localDate(ev.ts);
+  const key = `${d}|${ev.agent}`;
+  let row = state.rows.get(key);
+  if (!row) {
+    row = { d, a: ev.agent, s: 0, t: 0, bits: new Uint8Array(36), u: {}, k: new Set, ss: new Set, ko: {} };
+    state.rows.set(key, row);
+  }
+  if (!row.k || !row.ss)
+    return false;
+  const id = h12(ev.id);
+  const model = ev.model || "unknown";
+  if (row.k.has(id)) {
+    const prev = row.ko?.[id];
+    if (prev === undefined || !ev.tokens || ev.tokens.o <= prev)
+      return false;
+    (row.u[model] ??= { i: 0, o: 0, cw: 0, cr: 0 }).o += ev.tokens.o - prev;
+    row.ko[id] = ev.tokens.o;
+    return true;
+  }
+  row.k.add(id);
+  if (ev.agent === "claude" && ev.tokens)
+    (row.ko ??= {})[id] = ev.tokens.o;
+  if (ev.sessionId) {
+    row.ss.add(h12(ev.sessionId));
+    row.s = row.ss.size;
+  }
+  if (ev.kind === "turn")
+    row.t++;
+  if (ev.tokens) {
+    const m = row.u[model] ??= { i: 0, o: 0, cw: 0, cr: 0 };
+    m.i += ev.tokens.i;
+    m.o += ev.tokens.o;
+    m.cw += ev.tokens.cw;
+    m.cr += ev.tokens.cr;
+    if (ev.tokens.r)
+      m.r = (m.r ?? 0) + ev.tokens.r;
+  }
+  const t = new Date(ev.ts);
+  const slot = t.getHours() * 12 + Math.floor(t.getMinutes() / 5);
+  row.bits[slot >> 3] |= 128 >> (slot & 7);
+  return true;
+}
+function freeze(state, now) {
+  const hot = localDate(now - HOT_DAYS * 86400000);
+  const keep = localDate(now - MAX_DAYS * 86400000);
+  for (const [key, row] of state.rows) {
+    if (row.d < keep)
+      state.rows.delete(key);
+    else if (row.d < hot) {
+      delete row.k;
+      delete row.ss;
+      delete row.ko;
+    }
+  }
+}
+function serializeState(state) {
+  const days = [...state.rows.values()].map((r) => ({
+    d: r.d,
+    a: r.a,
+    s: r.s,
+    t: r.t,
+    b: Buffer.from(r.bits).toString("base64"),
+    u: r.u,
+    ...r.k ? { k: [...r.k], ss: [...r.ss], ko: r.ko ?? {} } : {}
+  }));
+  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, lastVersion: state.lastVersion, days });
+}
+function parseState(text) {
+  const st = emptyState();
+  try {
+    const o = JSON.parse(text);
+    st.lastUpload = Number(o.lastUpload) || 0;
+    st.lastHash = typeof o.lastHash === "string" ? o.lastHash : "";
+    st.lastPairing = typeof o.lastPairing === "string" ? o.lastPairing : "";
+    st.lastVersion = typeof o.lastVersion === "string" ? o.lastVersion : "";
+    for (const r of o.days ?? []) {
+      const bits = new Uint8Array(36);
+      bits.set(Buffer.from(String(r.b ?? ""), "base64").subarray(0, 36));
+      st.rows.set(`${r.d}|${r.a}`, {
+        d: r.d,
+        a: r.a,
+        s: r.s | 0,
+        t: r.t | 0,
+        bits,
+        u: r.u ?? {},
+        ...Array.isArray(r.k) ? { k: new Set(r.k), ss: new Set(r.ss ?? []), ko: r.ko && typeof r.ko === "object" ? r.ko : {} } : {}
+      });
+    }
+  } catch {
+    return emptyState();
+  }
+  return st;
+}
+function buildPayload(state, now, mid) {
+  const days = [...state.rows.values()].sort((x, y) => x.d === y.d ? x.a.localeCompare(y.a) : x.d.localeCompare(y.d)).map((r) => ({
+    d: r.d,
+    a: r.a,
+    s: r.s,
+    t: r.t,
+    b: Buffer.from(r.bits).toString("base64"),
+    u: Object.entries(r.u).map(([m, k]) => ({ m, i: k.i, o: k.o, cw: k.cw, cr: k.cr, ...k.r ? { r: k.r } : {} }))
+  }));
+  while (days.length > 1 && JSON.stringify(days).length > MAX_PAYLOAD_CHARS)
+    days.shift();
+  return { v: 1, gen: now, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, days, ...mid ? { mid } : {} };
+}
+var num = (x) => typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0;
+var NON_PROMPT = ["<task-notification>", "<bash-stdout>", "<bash-stderr>", "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>"];
+function parseClaudeLine(line) {
+  const isA = line.includes('"type":"assistant"');
+  if (!isA && !(line.includes('"type":"user"') && line.includes('"userType":"external"')))
+    return null;
+  let o;
+  try {
+    o = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  const ts = Date.parse(o?.timestamp);
+  const sid = typeof o?.sessionId === "string" ? o.sessionId : "";
+  if (!Number.isFinite(ts))
+    return null;
+  if (o.type === "assistant") {
+    const u = o.message?.usage;
+    const model = o.message?.model;
+    if (!u || typeof u !== "object" || model === "<synthetic>")
+      return null;
+    const r = num(u.output_tokens_details?.thinking_tokens);
+    return {
+      ts,
+      agent: "claude",
+      sessionId: sid,
+      kind: "assistant",
+      id: o.message?.id && o.requestId ? `cc:${o.message.id}:${o.requestId}` : `cc:${sid}:${o.timestamp}`,
+      model: typeof model === "string" ? model : undefined,
+      tokens: {
+        i: num(u.input_tokens),
+        o: Math.max(0, num(u.output_tokens) - r),
+        cw: num(u.cache_creation_input_tokens),
+        cr: num(u.cache_read_input_tokens),
+        ...r ? { r } : {}
+      }
+    };
+  }
+  if (o.type !== "user" || o.userType !== "external" || o.isMeta || o.isSidechain || o.isCompactSummary)
+    return null;
+  const c = o.message?.content;
+  let text;
+  if (typeof c === "string")
+    text = c;
+  else if (Array.isArray(c) && !c.some((x) => x?.type === "tool_result"))
+    text = c.find((x) => x?.type === "text")?.text;
+  if (typeof text !== "string" || NON_PROMPT.some((p) => text.startsWith(p)))
+    return null;
+  return { ts, agent: "claude", sessionId: sid, kind: "turn", id: `cc:u:${o.uuid ?? `${sid}:${o.timestamp}`}` };
+}
+function parseCodexLine(line, st) {
+  if (!line.includes('"session_meta"') && !line.includes('"turn_context"') && !line.includes('"task_started"') && !line.includes('"token_count"'))
+    return null;
+  let o;
+  try {
+    o = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  const p = o?.payload;
+  if (!p || typeof p !== "object")
+    return null;
+  if (o.type === "session_meta") {
+    const src = p.source;
+    if (src && typeof src === "object" && src.subagent) {
+      st.sub = 1;
+      const parent = src.subagent?.thread_spawn?.parent_thread_id;
+      if (typeof parent === "string")
+        st.parent = parent;
+    }
+    return null;
+  }
+  if (o.type === "turn_context") {
+    if (typeof p.model === "string")
+      st.m = p.model;
+    return null;
+  }
+  if (o.type !== "event_msg")
+    return null;
+  const ts = Date.parse(o.timestamp);
+  if (!Number.isFinite(ts))
+    return null;
+  const sessionId = st.sub ? st.parent ?? "" : st.sid;
+  if (p.type === "task_started" && !st.sub) {
+    return { ts, agent: "codex", sessionId, kind: "turn", id: `cx:t:${p.turn_id ?? `${st.sid}:${o.timestamp}`}` };
+  }
+  if (p.type === "token_count") {
+    const last = p.info?.last_token_usage;
+    const total = p.info?.total_token_usage?.total_tokens;
+    if (!last || typeof total !== "number")
+      return null;
+    const cached = num(last.cached_input_tokens);
+    const r = num(last.reasoning_output_tokens);
+    return {
+      ts,
+      agent: "codex",
+      sessionId,
+      kind: "assistant",
+      id: `cx:u:${st.sid}:${total}`,
+      model: st.m,
+      tokens: {
+        i: Math.max(0, num(last.input_tokens) - cached),
+        o: Math.max(0, num(last.output_tokens) - r),
+        cw: num(last.cache_write_input_tokens),
+        cr: cached,
+        ...r ? { r } : {}
+      }
+    };
+  }
+  return null;
+}
+var breathe = () => new Promise((r) => setTimeout(r, 5));
+var hasZstd = typeof zlib.zstdDecompressSync === "function";
+async function scanFile(path, cursor, onLine) {
+  const st = await stat2(path);
+  const prev = cursor[path];
+  const same = prev && prev.ino === st.ino && st.size >= prev.offset;
+  const entry = same ? prev : { ino: st.ino, offset: 0, ...prev?.cx ? { cx: { sid: prev.cx.sid } } : {} };
+  if (path.endsWith(".zst")) {
+    if (same && prev.offset === st.size)
+      return 0;
+    const text = zlib.zstdDecompressSync(await readFile2(path)).toString("utf8");
+    entry.offset = 0;
+    for (const line of text.split(`
+`))
+      if (line)
+        onLine(line, entry);
+    entry.offset = st.size;
+    cursor[path] = entry;
+    return st.size;
+  }
+  if (entry.offset >= st.size) {
+    cursor[path] = entry;
+    return 0;
+  }
+  let carry = Buffer.alloc(0);
+  let consumed = entry.offset;
+  const stream = createReadStream(path, { start: entry.offset, end: st.size - 1, highWaterMark: CHUNK });
+  for await (const chunk of stream) {
+    const buf = carry.length ? Buffer.concat([carry, chunk]) : chunk;
+    const nl = buf.lastIndexOf(10);
+    if (nl < 0) {
+      carry = buf;
+      continue;
+    }
+    for (const line of buf.subarray(0, nl).toString("utf8").split(`
+`))
+      if (line)
+        onLine(line, entry);
+    consumed += nl + 1;
+    carry = buf.subarray(nl + 1);
+    await breathe();
+  }
+  entry.offset = consumed;
+  cursor[path] = entry;
+  return st.size - (prev && same ? prev.offset : 0);
+}
+async function listFiles(dir, match) {
+  try {
+    const names = await readdir(dir, { recursive: true });
+    return names.filter(match).map((n) => `${dir}/${n}`);
+  } catch {
+    return [];
+  }
+}
+async function openReadOnly(path) {
+  if (!existsSync2(path))
+    return null;
+  const isBun = typeof globalThis.Bun !== "undefined";
+  const spec = isBun ? "bun:sqlite" : "node:sqlite";
+  let mod;
+  try {
+    mod = await import(spec);
+  } catch {
+    return null;
+  }
+  for (const opt of ["mode=ro", "immutable=1"]) {
+    try {
+      const db = isBun ? new mod.Database(`file:${path}?${opt}`, { readonly: true }) : new mod.DatabaseSync(new URL(`file://${path}?${opt}`), { readOnly: true });
+      db.prepare("select 1").all();
+      return { all: (sql, ...params) => db.prepare(sql).all(...params), close: () => db.close() };
+    } catch {}
+  }
+  return null;
+}
+var defaultRoots = () => ({
+  claude: `${process.env.HOME}/.claude/projects`,
+  codex: codexHome(),
+  opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`,
+  grokBot: `${process.platform === "darwin" ? `${process.env.HOME}/Library/Application Support` : process.platform === "win32" ? process.env.APPDATA : process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/Grok Bot/sand-client-persistence`
+});
+async function readClaude(root, cursor, sink, progress, seen) {
+  for (const f of await listFiles(root, (n) => n.endsWith(".jsonl"))) {
+    seen.add(f);
+    try {
+      await progress(await scanFile(f, cursor, (line) => {
+        const ev = parseClaudeLine(line);
+        if (ev)
+          sink(ev);
+      }));
+    } catch {}
+  }
+}
+var UUID_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl(\.zst)?$/;
+async function readCodex(home, cursor, sink, progress, seen, sinceMs, days) {
+  const readable = (n) => /rollout-.*\.jsonl$/.test(n) || hasZstd && /rollout-.*\.jsonl\.zst$/.test(n);
+  const files = [...await listFiles(`${home}/sessions`, readable), ...await listFiles(`${home}/archived_sessions`, readable)];
+  for (const f of files) {
+    seen.add(f);
+    const sid = f.match(UUID_RE)?.[1] ?? f;
+    try {
+      await progress(await scanFile(f, cursor, (line, e) => {
+        e.cx ??= { sid };
+        const ev = parseCodexLine(line, e.cx);
+        if (ev)
+          sink(ev);
+      }));
+    } catch {}
+  }
+  const counted = (t) => {
+    const u = h12(`cx:u:${t.id}:${t.tokens_used}`);
+    for (const r of days.rows.values())
+      if (r.a === "codex" && r.k?.has(u))
+        return true;
+    return false;
+  };
+  const state = await openReadOnly(`${home}/state_5.sqlite`);
+  if (!state)
+    return;
+  try {
+    const orphans = new Map;
+    for (const t of state.all("select id, rollout_path, created_at, tokens_used, model, source from threads where created_at >= ?", Math.floor(sinceMs / 1000))) {
+      const p = String(t.rollout_path ?? "");
+      const base = p.replace(/\.zst$/, "");
+      if (existsSync2(base) || hasZstd && existsSync2(`${base}.zst`))
+        continue;
+      orphans.set(t.id, t);
+      if (counted(t))
+        continue;
+      const sub = String(t.source ?? "").includes("subagent");
+      sink({
+        ts: Number(t.created_at) * 1000,
+        agent: "codex",
+        sessionId: sub ? "" : t.id,
+        kind: "assistant",
+        id: `cx:th:${t.id}`,
+        model: t.model ?? undefined,
+        tokens: { i: num(t.tokens_used), o: 0, cw: 0, cr: 0 }
+      });
+    }
+    if (orphans.size === 0)
+      return;
+    const hist = await openReadOnly(`${home}/thread_history_1.sqlite`);
+    if (!hist)
+      return;
+    try {
+      for (const r of hist.all("select thread_id, turn_id, started_at from thread_turns where started_at >= ?", Math.floor(sinceMs / 1000))) {
+        const t = orphans.get(r.thread_id);
+        if (!t || String(t.source ?? "").includes("subagent"))
+          continue;
+        sink({ ts: Number(r.started_at) * 1000, agent: "codex", sessionId: t.id, kind: "turn", id: `cx:t:${r.turn_id}` });
+      }
+    } finally {
+      hist.close();
+    }
+  } finally {
+    state.close();
+  }
+}
+async function readOpenCode(dbPath, sink, sinceMs) {
+  const db = await openReadOnly(dbPath);
+  if (!db)
+    return;
+  try {
+    const rows = db.all("select m.id, m.session_id, m.time_created, m.data, s.parent_id from message m left join session s on s.id = m.session_id where m.time_created >= ?", sinceMs);
+    for (const r of rows) {
+      let o;
+      try {
+        o = JSON.parse(r.data);
+      } catch {
+        continue;
+      }
+      const sessionId = r.parent_id ?? r.session_id;
+      const ts = Number(r.time_created);
+      if (o?.role === "user" && !r.parent_id)
+        sink({ ts, agent: "opencode", sessionId, kind: "turn", id: `oc:${r.id}` });
+      else if (o?.role === "assistant" && o.time?.completed && o.tokens) {
+        const k = o.tokens;
+        sink({
+          ts,
+          agent: "opencode",
+          sessionId,
+          kind: "assistant",
+          id: `oc:${r.id}`,
+          model: typeof o.modelID === "string" ? o.modelID : undefined,
+          tokens: { i: num(k.input), o: num(k.output), cw: num(k.cache?.write), cr: num(k.cache?.read), ...num(k.reasoning) ? { r: num(k.reasoning) } : {} }
+        });
+      }
+    }
+  } finally {
+    db.close();
+  }
+}
+function base32(s) {
+  const out = [];
+  let v = 0, bits = 0;
+  for (const ch of s) {
+    const i = "abcdefghijklmnopqrstuvwxyz234567".indexOf(ch);
+    if (i < 0)
+      return null;
+    v = (v << 5 | i) & 65535;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push(v >> bits & 255);
+    }
+  }
+  return Buffer.from(out).toString("utf8");
+}
+var GB_KEY = /\.transcript\.replicas\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+async function readGrokBot(dir, sink) {
+  for (const f of await listFiles(dir, (n) => n.endsWith(".blob"))) {
+    const bot = base32(basename2(f, ".blob"))?.match(GB_KEY)?.[1];
+    if (!bot)
+      continue;
+    try {
+      const keep = (k, v) => typeof v === "string" && k !== "kind" && k !== "role" && k !== "id" ? undefined : v;
+      for (const e of JSON.parse(await readFile2(f, "utf8"), keep).value.entries) {
+        const kind = e?.kind === "message" && e.role === "user" ? "turn" : e?.kind === "send-message" ? "assistant" : null;
+        if (!kind || e.isStreaming || !Number.isFinite(e.timestampMs) || typeof e.id !== "string")
+          continue;
+        sink({ ts: e.timestampMs, agent: "grokbot", sessionId: bot, kind, id: `gb:${bot}:${e.id}` });
+      }
+    } catch {}
+  }
+}
+async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
+  const sink = (ev) => {
+    addEvent(state, ev);
+  };
+  let sinceSave = 0;
+  const progress = async (n) => {
+    sinceSave += n;
+    if (sinceSave >= SAVE_EVERY_BYTES) {
+      sinceSave = 0;
+      await checkpoint();
+    }
+  };
+  const since = (a) => [...state.rows.values()].some((r) => r.a === a) ? now - HOT_DAYS * 86400000 : 0;
+  const seen = new Set;
+  try {
+    await readClaude(roots.claude, cursor, sink, progress, seen);
+  } catch {}
+  try {
+    await readCodex(roots.codex, cursor, sink, progress, seen, since("codex"), state);
+  } catch {}
+  try {
+    await readOpenCode(roots.opencode, sink, since("opencode"));
+  } catch {}
+  try {
+    await readGrokBot(roots.grokBot, sink);
+  } catch {}
+  for (const p of Object.keys(cursor))
+    if (!seen.has(p))
+      delete cursor[p];
+}
+function payloadHash(payload) {
+  return createHash2("sha1").update(JSON.stringify(payload.days)).digest("hex");
+}
+async function maybeUpload(state, config, now, fetchFn = fetch, mid, force = false) {
+  const due = force || config.pairingId !== state.lastPairing;
+  const timeDue = due || state.lastVersion !== PLUGIN_VERSION || now - state.lastUpload >= UPLOAD_EVERY_MS;
+  if (state.rows.size === 0 || !timeDue)
+    return false;
+  const payload = buildPayload(state, now, mid);
+  const hash = payloadHash(payload);
+  if (!due && hash === state.lastHash && now - state.lastUpload < REFRESH_EVERY_MS)
+    return false;
+  try {
+    const blob = await encryptBlob(config.e2eKey, payload);
+    const res = await fetchFn(`${config.url}/v1/cc/full`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION
+      },
+      body: JSON.stringify({ v: 2, sessionId: "activity", what: "activity", blob }),
+      signal: AbortSignal.timeout(15000)
+    });
+    if (!res.ok)
+      return false;
+    state.lastUpload = now;
+    state.lastHash = hash;
+    state.lastPairing = config.pairingId;
+    state.lastVersion = PLUGIN_VERSION;
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function runActivityCycle(deps = {}) {
+  const config = deps.config !== undefined ? deps.config : await loadConfig();
+  if (!config)
+    return "unpaired";
+  const daysPath = deps.daysPath ?? ACTIVITY_DAYS_PATH;
+  const cursorPath = deps.cursorPath ?? ACTIVITY_CURSOR_PATH;
+  const now = deps.now ?? Date.now;
+  const state = parseState(await readFile2(daysPath, "utf8").catch(() => ""));
+  let cursor = {};
+  try {
+    cursor = JSON.parse(await readFile2(cursorPath, "utf8")) ?? {};
+  } catch {}
+  const save = async () => {
+    await atomicWrite(daysPath, serializeState(state), 384);
+    await atomicWrite(cursorPath, JSON.stringify(cursor), 384);
+  };
+  const scan = deps.scan !== false;
+  if (scan) {
+    await scanAll(state, cursor, deps.roots ?? defaultRoots(), now(), save);
+    freeze(state, now());
+  }
+  const mid = await loadMachineId(deps.midPath ?? `${dirname2(daysPath)}/machine-id`).catch(() => {
+    return;
+  });
+  const sent = await maybeUpload(state, config, now(), deps.fetchFn, mid, deps.force);
+  if (scan || sent)
+    await save();
+  return sent ? "sent" : state.rows.size === 0 ? "empty" : "not-sent";
+}
+function startActivityLoop(load = loadConfig, cycle = runActivityCycle) {
+  let busy = false;
+  let seen;
+  const run = (deps) => {
+    if (busy)
+      return;
+    busy = true;
+    cycle(deps).catch(() => {}).finally(() => {
+      seen = deps.config?.pairingId ?? "";
+      busy = false;
+    });
+  };
+  const kick = async () => {
+    if (!busy)
+      run({ config: await load() });
+  };
+  const tick = async () => {
+    if (busy || seen === undefined)
+      return;
+    const config = await load();
+    if (config && config.pairingId !== seen)
+      run({ config, scan: seen === "" });
+  };
+  const timers = [setInterval(() => void kick(), HOUR_MS), setInterval(() => void tick(), 60000)];
+  for (const t of timers)
+    t.unref?.();
+  kick();
+  return () => timers.forEach(clearInterval);
+}
+
 // src/entries/reset.ts
 function classifyResetSession(record, isAlive) {
   if (!record || typeof record.pid !== "number" || !Number.isFinite(record.pid))
@@ -1105,7 +1707,7 @@ async function stopWatchdog(deps) {
   const killPid = deps.killPid ?? ((pid) => process.kill(pid));
   let raw;
   try {
-    raw = await readFile2(pidPath, "utf8");
+    raw = await readFile3(pidPath, "utf8");
   } catch {
     return "none";
   }
@@ -1118,6 +1720,9 @@ async function stopWatchdog(deps) {
         killPid(pid);
         killed = true;
       } catch {}
+      const isAlive = deps.isAlive ?? pidAlive;
+      for (let i = 0;killed && i < 20 && isAlive(pid); i++)
+        await new Promise((r) => setTimeout(r, 50));
     }
   }
   await unlink2(pidPath).catch(() => {});
@@ -1151,7 +1756,7 @@ async function reset(deps = {}) {
   const config = await (deps.loadConfigFn ?? loadConfig)();
   let files = [];
   try {
-    files = (await readdir(sessionsDir)).filter((f) => f.endsWith(".json"));
+    files = (await readdir2(sessionsDir)).filter((f) => f.endsWith(".json"));
   } catch {
     files = [];
   }
@@ -1162,7 +1767,7 @@ async function reset(deps = {}) {
     const path = `${sessionsDir}/${f}`;
     let record = null;
     try {
-      record = JSON.parse(await readFile2(path, "utf8"));
+      record = JSON.parse(await readFile3(path, "utf8"));
     } catch {
       record = null;
     }
@@ -1170,7 +1775,7 @@ async function reset(deps = {}) {
       kept++;
       continue;
     }
-    if (config && await postEnd(config, basename2(f, ".json"), fetchFn))
+    if (config && await postEnd(config, basename3(f, ".json"), fetchFn))
       ended++;
     await unlink2(path).catch(() => {});
     cleared++;
@@ -1182,12 +1787,26 @@ async function reset(deps = {}) {
   }
   if (kept > 0)
     print(`Left ${kept} live session${kept === 1 ? "" : "s"} untouched.`);
+  if (config) {
+    let outcome;
+    try {
+      outcome = await (deps.activityCycle ?? runActivityCycle)({ config, fetchFn, force: true });
+    } catch {
+      outcome = "error";
+    }
+    if (outcome === "sent")
+      print("Sent your activity summary (heatmap and streak) to your phone.");
+    else if (outcome === "empty")
+      print("No activity to send yet.");
+    else
+      print("Could not send your activity summary right now — it will be sent again automatically later.");
+  }
   print("Pairing and keys were not touched — use the unpair command if you want that.");
   return 0;
 }
 if (__require.main == __require.module) {
   if (process.argv.includes("--check")) {
-    console.log("usage: reset  — stop the watchdog and clear dead/phantom session rows (keeps the pairing; watchdog restarts on the next session)");
+    console.log("usage: reset  — stop the watchdog, clear dead/phantom session rows and send the activity summary now (keeps the pairing; watchdog restarts on the next session)");
     process.exit(0);
   }
   process.exit(await reset());

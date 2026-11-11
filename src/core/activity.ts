@@ -3,7 +3,8 @@
 // folds it into per-(local day, agent) rows of COUNTS ONLY, and uploads the rows E2E-sealed through the
 // blind /v1/cc/full slot. Driven by the watchdog (startActivityLoop): once at start, then hourly; an
 // upload needs changed rows AND ≥6 h since the last one — except the first upload to a NEW pairing
-// (re-pair), which goes out within a minute.
+// (re-pair), which goes out within a minute, and the first changed rows after a plugin update (the last
+// upload's version is kept), which skip the 6 h wait once. `reset` forces one upload on demand.
 //
 // PRIVACY: an event carries a timestamp, a session id, a kind, a model id and token counts — never
 // prompt or reply text (a user line's text is looked at only to tell a real prompt from a tool echo).
@@ -79,10 +80,11 @@ interface Row {
   k?: Set<string>; ss?: Set<string>; // present ⇔ hot
   ko?: Record<string, number>; // hot only: output counted per CC assistant id hash (see addEvent)
 }
-/** lastPairing = the pairingId the last upload went to; the relay keeps the blob PER PAIRING. */
-export interface State { lastUpload: number; lastHash: string; lastPairing: string; rows: Map<string, Row> }
+/** lastPairing = the pairingId the last upload went to; the relay keeps the blob PER PAIRING.
+ *  lastVersion = the PLUGIN_VERSION that made it ("" in older files = treated as a different version). */
+export interface State { lastUpload: number; lastHash: string; lastPairing: string; lastVersion: string; rows: Map<string, Row> }
 
-export const emptyState = (): State => ({ lastUpload: 0, lastHash: "", lastPairing: "", rows: new Map() });
+export const emptyState = (): State => ({ lastUpload: 0, lastHash: "", lastPairing: "", lastVersion: "", rows: new Map() });
 
 const h12 = (s: string) => createHash("sha1").update(s).digest("base64").slice(0, 12);
 const pad = (n: number) => String(n).padStart(2, "0");
@@ -146,7 +148,7 @@ export function serializeState(state: State): string {
     d: r.d, a: r.a, s: r.s, t: r.t, b: Buffer.from(r.bits).toString("base64"), u: r.u,
     ...(r.k ? { k: [...r.k], ss: [...r.ss!], ko: r.ko ?? {} } : {}),
   }));
-  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, days });
+  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, lastVersion: state.lastVersion, days });
 }
 
 export function parseState(text: string): State {
@@ -156,6 +158,7 @@ export function parseState(text: string): State {
     st.lastUpload = Number(o.lastUpload) || 0;
     st.lastHash = typeof o.lastHash === "string" ? o.lastHash : "";
     st.lastPairing = typeof o.lastPairing === "string" ? o.lastPairing : ""; // absent in older files
+    st.lastVersion = typeof o.lastVersion === "string" ? o.lastVersion : ""; // absent before 2.4.2's grokbot setup
     for (const r of o.days ?? []) {
       const bits = new Uint8Array(36);
       bits.set(Buffer.from(String(r.b ?? ""), "base64").subarray(0, 36));
@@ -506,14 +509,18 @@ export function payloadHash(payload: ReturnType<typeof buildPayload>): string {
 }
 
 /** Seal + POST the payload when rows changed and the last upload is ≥6 h old — or right away when the
- *  last upload went to a different pairing (a re-pair: the new pairing has no blob yet). Unchanged rows
- *  are still re-sent every REFRESH_EVERY_MS so the relay copy never expires. Never throws. */
-export async function maybeUpload(state: State, config: Config, now: number, fetchFn: typeof fetch = fetch, mid?: string): Promise<boolean> {
-  const newPairing = config.pairingId !== state.lastPairing;
-  if (state.rows.size === 0 || (!newPairing && now - state.lastUpload < UPLOAD_EVERY_MS)) return false;
+ *  last upload went to a different pairing (a re-pair: the new pairing has no blob yet). After a plugin
+ *  update (last upload by another version) the 6 h wait is skipped once, so rows the new version just
+ *  started counting go up now; unchanged rows still skip. Unchanged rows are re-sent every
+ *  REFRESH_EVERY_MS so the relay copy never expires. `force` (reset only) skips both gates for this one
+ *  call; no rows still sends nothing. Never throws. */
+export async function maybeUpload(state: State, config: Config, now: number, fetchFn: typeof fetch = fetch, mid?: string, force = false): Promise<boolean> {
+  const due = force || config.pairingId !== state.lastPairing;
+  const timeDue = due || state.lastVersion !== PLUGIN_VERSION || now - state.lastUpload >= UPLOAD_EVERY_MS;
+  if (state.rows.size === 0 || !timeDue) return false;
   const payload = buildPayload(state, now, mid);
   const hash = payloadHash(payload);
-  if (!newPairing && hash === state.lastHash && now - state.lastUpload < REFRESH_EVERY_MS) return false;
+  if (!due && hash === state.lastHash && now - state.lastUpload < REFRESH_EVERY_MS) return false;
   try {
     const blob = await encryptBlob(config.e2eKey, payload);
     const res = await fetchFn(`${config.url}/v1/cc/full`, {
@@ -529,6 +536,7 @@ export async function maybeUpload(state: State, config: Config, now: number, fet
     state.lastUpload = now;
     state.lastHash = hash;
     state.lastPairing = config.pairingId;
+    state.lastVersion = PLUGIN_VERSION;
     return true;
   } catch { return false; }
 }
@@ -539,11 +547,16 @@ export interface CycleDeps {
   scan?: boolean;
   /** Defaults to `machine-id` next to daysPath. */
   midPath?: string;
+  /** Upload even inside the 6 h gate / with unchanged rows (`reset`). The watchdog never sets it. */
+  force?: boolean;
 }
 
-export async function runActivityCycle(deps: CycleDeps = {}): Promise<void> {
+/** What one cycle did: sent, nothing to send (no rows), not sent (gated, or the POST failed), unpaired. */
+export type ActivityOutcome = "sent" | "empty" | "not-sent" | "unpaired";
+
+export async function runActivityCycle(deps: CycleDeps = {}): Promise<ActivityOutcome> {
   const config = deps.config !== undefined ? deps.config : await loadConfig();
-  if (!config) return; // only when paired
+  if (!config) return "unpaired"; // only when paired
   const daysPath = deps.daysPath ?? ACTIVITY_DAYS_PATH;
   const cursorPath = deps.cursorPath ?? ACTIVITY_CURSOR_PATH;
   const now = deps.now ?? Date.now;
@@ -561,15 +574,16 @@ export async function runActivityCycle(deps: CycleDeps = {}): Promise<void> {
     freeze(state, now());
   }
   const mid = await loadMachineId(deps.midPath ?? `${dirname(daysPath)}/machine-id`).catch(() => undefined);
-  const sent = await maybeUpload(state, config, now(), deps.fetchFn, mid);
+  const sent = await maybeUpload(state, config, now(), deps.fetchFn, mid, deps.force);
   if (scan || sent) await save();
+  return sent ? "sent" : state.rows.size === 0 ? "empty" : "not-sent";
 }
 
 /** Watchdog hook: run now, then hourly; overlapping runs are skipped. A once-a-minute tick reads only
  *  config.json and, when the pairing changed since the last run (a re-pair under a live watchdog —
  *  `pair` does not restart a same-build daemon), uploads the rows already on disk without rescanning.
  *  Returns the stopper. */
-export function startActivityLoop(load = loadConfig, cycle = runActivityCycle): () => void {
+export function startActivityLoop(load = loadConfig, cycle: (deps: CycleDeps) => Promise<unknown> = runActivityCycle): () => void {
   let busy = false;
   let seen: string | undefined; // pairingId the last run saw ("" = unpaired); undefined until the first run
   const run = (deps: CycleDeps) => {
