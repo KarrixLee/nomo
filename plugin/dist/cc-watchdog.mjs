@@ -5,7 +5,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 import { readdir as readdir8, readFile as readFile10, unlink as unlink6 } from "node:fs/promises";
 import { readFileSync as readFileSync3, statSync as statSync4, unlinkSync } from "node:fs";
 import { hostname as hostname6 } from "node:os";
-import { basename as basename8 } from "node:path";
+import { basename as basename9 } from "node:path";
 
 // src/core/crypto.ts
 var textEncoder = new TextEncoder;
@@ -9263,7 +9263,7 @@ class CodexRemoteInputBridge {
 import { createHash as createHash3, randomUUID } from "node:crypto";
 import { createReadStream, existsSync as existsSync5 } from "node:fs";
 import { readdir as readdir7, readFile as readFile9, stat as stat6 } from "node:fs/promises";
-import { dirname as dirname2 } from "node:path";
+import { basename as basename8, dirname as dirname2 } from "node:path";
 import * as zlib from "node:zlib";
 var HOT_DAYS = 40;
 var MAX_DAYS = 400;
@@ -9587,7 +9587,8 @@ async function openReadOnly(path) {
 var defaultRoots = () => ({
   claude: `${process.env.HOME}/.claude/projects`,
   codex: codexHome(),
-  opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`
+  opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`,
+  grokBot: `${process.platform === "darwin" ? `${process.env.HOME}/Library/Application Support` : process.platform === "win32" ? process.env.APPDATA : process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/Grok Bot/sand-client-persistence`
 });
 async function readClaude(root, cursor, sink, progress, seen) {
   for (const f of await listFiles(root, (n) => n.endsWith(".jsonl"))) {
@@ -9701,6 +9702,39 @@ async function readOpenCode(dbPath, sink, sinceMs) {
     db.close();
   }
 }
+function base32(s) {
+  const out = [];
+  let v = 0, bits = 0;
+  for (const ch of s) {
+    const i = "abcdefghijklmnopqrstuvwxyz234567".indexOf(ch);
+    if (i < 0)
+      return null;
+    v = (v << 5 | i) & 65535;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push(v >> bits & 255);
+    }
+  }
+  return Buffer.from(out).toString("utf8");
+}
+var GB_KEY = /\.transcript\.replicas\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+async function readGrokBot(dir, sink) {
+  for (const f of await listFiles(dir, (n) => n.endsWith(".blob"))) {
+    const bot = base32(basename8(f, ".blob"))?.match(GB_KEY)?.[1];
+    if (!bot)
+      continue;
+    try {
+      const keep = (k, v) => typeof v === "string" && k !== "kind" && k !== "role" && k !== "id" ? undefined : v;
+      for (const e of JSON.parse(await readFile9(f, "utf8"), keep).value.entries) {
+        const kind = e?.kind === "message" && e.role === "user" ? "turn" : e?.kind === "send-message" ? "assistant" : null;
+        if (!kind || e.isStreaming || !Number.isFinite(e.timestampMs) || typeof e.id !== "string")
+          continue;
+        sink({ ts: e.timestampMs, agent: "grokbot", sessionId: bot, kind, id: `gb:${bot}:${e.id}` });
+      }
+    } catch {}
+  }
+}
 async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
   const sink = (ev) => {
     addEvent(state, ev);
@@ -9723,6 +9757,9 @@ async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
   } catch {}
   try {
     await readOpenCode(roots.opencode, sink, since("opencode"));
+  } catch {}
+  try {
+    await readGrokBot(roots.grokBot, sink);
   } catch {}
   for (const p of Object.keys(cursor))
     if (!seen.has(p))
@@ -10105,7 +10142,7 @@ function resolveCodexTuiOwner(record, candidates, alive = pidAlive) {
   const command = record.origin?.ppid_command;
   if (typeof command === "string") {
     const tokens = command.trim().split(/\s+/);
-    if (basename8(tokens[0] ?? "") === "codex" && tokens[1] !== "app-server" && !tokens.slice(1).includes("exec") && typeof record.pid === "number" && alive(record.pid)) {
+    if (basename9(tokens[0] ?? "") === "codex" && tokens[1] !== "app-server" && !tokens.slice(1).includes("exec") && typeof record.pid === "number" && alive(record.pid)) {
       return record.pid;
     }
   }
@@ -10797,7 +10834,7 @@ async function readAllRecordEntries() {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename8(f, ".json"), rec: JSON.parse(await readFile10(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename9(f, ".json"), rec: JSON.parse(await readFile10(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -11174,7 +11211,7 @@ async function antigravitySettleTick(config, deps = {}) {
     if (record.lastEvent !== "working" && record.lastEvent !== "sessionStart")
       continue;
     active++;
-    await (deps.reap ?? correctIdleClaude)(config, path, basename8(file, ".json"), record, (deps.now ?? Date.now)()).catch(() => "uncorrected");
+    await (deps.reap ?? correctIdleClaude)(config, path, basename9(file, ".json"), record, (deps.now ?? Date.now)()).catch(() => "uncorrected");
   }
   return active;
 }
@@ -11763,7 +11800,7 @@ async function pruneStaleDecisionHolds(files, deps = {}) {
   for (const file of files) {
     if (!file.endsWith(DECISION_HOLD_SUFFIX))
       continue;
-    const sessionId = basename8(file, DECISION_HOLD_SUFFIX);
+    const sessionId = basename9(file, DECISION_HOLD_SUFFIX);
     if (sessionId.length === 0)
       continue;
     let hold = null;
@@ -11812,7 +11849,7 @@ async function sweep(config, deps = {}) {
     if (!file.endsWith(".json"))
       continue;
     const path = `${SESSIONS_DIR}/${file}`;
-    const sessionId = basename8(file, ".json");
+    const sessionId = basename9(file, ".json");
     let record = null;
     try {
       record = JSON.parse(await readFile10(path, "utf8"));
