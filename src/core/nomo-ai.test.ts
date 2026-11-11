@@ -146,6 +146,7 @@ describe("bunx nomo-ai --uninstall", () => {
   test("--help lists the uninstall lines", async () => {
     const help = await nomoAi(["--help"]);
     expect(help.out).toContain("bunx nomo-ai uninstall --cursor");
+    expect(help.out).toContain("bunx nomo-ai unpair");
     expect(help.out).toContain("bunx nomo-ai uninstall --antigravity");
     expect(help.out).toContain("claude plugin uninstall nomo-cc@nomo");
   });
@@ -207,12 +208,12 @@ describe("commands: pair / status / reset / uninstall", () => {
   const plugin = async (root: string, log: string, exit = 0) => {
     await mkdir(join(root, "scripts"), { recursive: true });
     await mkdir(join(root, "dist"), { recursive: true });
-    for (const e of ["pair", "reset", "status-cmd"]) await writeFile(join(root, "dist", `${e}.mjs`), "");
+    for (const e of ["pair", "reset", "status-cmd", "unpair"]) await writeFile(join(root, "dist", `${e}.mjs`), "");
     await writeFile(join(root, "scripts", "run.sh"), `#!/bin/sh\ne=$(basename "$1" .mjs); shift\necho "$e $*" >> '${log}'\necho "from-${"$"}e"\nexit ${exit}\n`, { mode: 0o755 });
   };
 
   test("nothing installed: one plain line naming `bunx nomo-ai`, non-zero exit", async () => {
-    for (const c of ["pair", "status", "reset"]) {
+    for (const c of ["pair", "status", "reset", "unpair"]) {
       const r = await cli(await home(), [c]);
       expect(r.code).toBe(1);
       expect(r.out.trim()).toBe("nomo-ai: Nomo is not installed on this computer yet — run `bunx nomo-ai` first.");
@@ -227,6 +228,16 @@ describe("commands: pair / status / reset / uninstall", () => {
     expect(r.code).toBe(3);
     expect(r.out).toBe("from-status-cmd\n");
     expect(await readFile(log, "utf8")).toBe("status-cmd --plain claude\n");
+  });
+
+  test("unpair runs the installed unpair entry; args and exit code pass through", async () => {
+    const h = await home();
+    const log = join(h, "calls.log");
+    await plugin(join(h, ".nomo", "plugin"), log, 4);
+    const r = await cli(h, ["unpair", "--check"]);
+    expect(r.code).toBe(4);
+    expect(r.out).toBe("from-unpair\n");
+    expect(await readFile(log, "utf8")).toBe("unpair --check\n");
   });
 
   test("pair = start then wait; `pair code` is the typeable-code form; a failed start does not wait", async () => {

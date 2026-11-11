@@ -116,6 +116,7 @@ describe("grokbot-install.mjs", () => {
     const r = await run(b, ["--uninstall"]);
     expect(r.code).toBe(0);
     expect(r.out).toContain("unloaded and removed");
+    expect(r.out).toContain("run `bunx nomo-ai unpair` (before or after this)");
     expect(existsSync(b.plist)).toBe(false);
     expect(existsSync(neighbour)).toBe(true);
     expect(await calls(b)).toContain(`bootout gui/${process.getuid!()}/gg.nomo.activity`);

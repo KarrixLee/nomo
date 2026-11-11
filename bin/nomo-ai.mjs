@@ -83,6 +83,7 @@ ${row(" pair", "pair this computer with your phone (opens the QR page, then wait
 ${row("", "for the scan); `pair code` prints the typeable code instead").replace(CMD, " ".repeat(CMD.length))}
 ${row(" status", "is this computer paired, and is each agent set up")}
 ${row(" reset", "clear stuck sessions and send your activity summary now")}
+${row(" unpair", "disconnect this computer from your phone (every agent here)")}
 ${row(" uninstall", "remove Nomo from the agents you name (see below)")}
 
 An agent that already has Nomo shows an update instead of an install. OpenCode's is
@@ -1120,7 +1121,7 @@ function uninstall(selected) {
   return failures.length > 0 ? 1 : 0;
 }
 
-// ── commands: pair / status / reset ──────────────────────────────────────────────────────────────
+// ── commands: pair / status / reset / unpair ──────────────────────────────────────────────────────────────
 //
 // The same plugin entries the agents' slash commands run (/nomo-cc:pair, $nomo-reset, /nomo-status…),
 // for a human in any folder — and the only way in for a Grok Bot-only Mac, which has no agent to type
@@ -1136,6 +1137,7 @@ const COMMANDS = {
   pair: (a) => (a[0] === "code" ? ["pair", ["--show-code", ...a.slice(1)]] : ["pair", a]),
   status: (a) => ["status-cmd", a],
   reset: (a) => ["reset", a],
+  unpair: (a) => ["unpair", a],
 };
 
 const ccDir = () => process.env.NOMO_CC_DIR || join(homedir(), ".config", "cc-status");

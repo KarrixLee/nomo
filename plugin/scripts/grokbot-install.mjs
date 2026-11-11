@@ -103,7 +103,8 @@ try {
     const hadFile = existsSync(PLIST);
     rmSync(PLIST, { force: true });
     say(`job      -> ${wasLoaded || hadFile ? `unloaded and removed ${PLIST}` : "not installed — nothing to remove"}`);
-    say("pairing is untouched (it is shared with your other agents) — unpair from the Nomo app or the unpair command.");
+    // Order does not matter: unpair needs only config.json and the plugin files, both left in place here.
+    say("pairing is untouched (it is shared with your other agents) — to disconnect this Mac from your phone, run `bunx nomo-ai unpair` (before or after this).");
   } else {
     if (!existsSync(WATCHDOG)) fail(`${WATCHDOG} is missing — run 'bun build.ts' from the repo root first`);
     if (!existsSync(RUN)) fail(`${RUN} is missing — this does not look like a nomo plugin directory`);

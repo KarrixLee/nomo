@@ -73,6 +73,7 @@ Code, Codex and OpenCode, uninstall only prints the host's own removal command.
 bunx nomo-ai pair       # pair with your phone (QR page, then waits for the scan); `pair code` for the typeable code
 bunx nomo-ai status     # is this computer paired, and is each agent set up
 bunx nomo-ai reset      # clear stuck sessions and send your activity summary now
+bunx nomo-ai unpair     # disconnect this computer from your phone (every agent on it)
 bunx nomo-ai uninstall --cursor   # remove Nomo from an agent you name
 ```
 
@@ -381,7 +382,8 @@ real installs never set it, and anything that can set your agent's environment c
 - **Network.** With no agent sessions, its only request is the existing sealed activity upload to
   `/v1/cc/full` (at most every 6 hours, only when something changed), plus finishing a pairing you
   started.
-- **Pair, check, send now:** `bunx nomo-ai pair`, `bunx nomo-ai status`, `bunx nomo-ai reset`.
+- **Pair, check, send now, disconnect:** `bunx nomo-ai pair`, `bunx nomo-ai status`, `bunx nomo-ai reset`,
+  `bunx nomo-ai unpair` (unpair works before or after removing the job).
 - **Remove it** with `bunx nomo-ai uninstall --grokbot` (or
   `node ~/.nomo/plugin/scripts/grokbot-install.mjs --uninstall`). It unloads the job and deletes the
   plist, nothing else; your pairing stays.
@@ -523,7 +525,7 @@ process. Codex has no plugin update verb: with a `local` marketplace (`source_ty
   version). Claude Code and Codex rows only **print** the host command, because install begins with
   `marketplace add`, which would silently repoint a marketplace you aimed elsewhere (a fork, a local
   checkout). A Codex `local` marketplace prints nothing, since there is nothing to run.
-- **Commands** (`pair`, `status`, `reset`) run the INSTALLED plugin's own entry, not code from the npm
+- **Commands** (`pair`, `status`, `reset`, `unpair`) run the INSTALLED plugin's own entry, not code from the npm
   package: the copy hooks last ran (the hook shim's stamp in `~/.config/cc-status`), else `~/.nomo`,
   else the hook shim's newest Claude Code / Codex cache copy — through that copy's `run.sh`, so the
   runtime rules in [Runtime and launch](#runtime-and-launch) apply. Nothing installed → one line saying
