@@ -71,6 +71,7 @@ const USAGE = `nomo-ai ${VERSION} — install (or update) the Nomo plugin for yo
 
   bunx nomo-ai            detect agents, confirm, install
   npx nomo-ai             same, without bun
+  bunx nomo-ai --uninstall --cursor   remove Nomo from an agent (name it; see below)
 
 An agent that already has Nomo shows an update instead of an install. OpenCode's is
 done for you — it has no marketplace, so its checkout is its version. Claude Code and
@@ -86,6 +87,7 @@ Agents (naming any one of these skips the prompt):
 
 Options:
   -y, --yes               no prompt; install every agent detected on this machine
+      --uninstall         remove Nomo from the agents you name (an agent flag is required)
   -n, --dry-run           print the commands that would run, run nothing
       --ref <branch|tag>  OpenCode, Cursor and Antigravity only: install from this ref of the
                           repo instead of its default branch. Claude Code and Codex
@@ -97,11 +99,14 @@ Options:
 Nothing here pairs your phone — that stays a deliberate step you run from inside the
 agent afterwards (/nomo-cc:pair, $nomo-pair, /nomo-pair).
 
-Cursor is the one agent whose config file this writes into directly (hooks.json, merged —
-other tools' entries are left alone). Undo it with:
-  node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall
-Antigravity likewise owns one "nomo" block in ~/.gemini/config/hooks.json. Undo it with:
-  node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall`;
+Uninstall (removes only what Nomo wrote; your phone stays paired for your other agents):
+  bunx nomo-ai --uninstall --cursor        Nomo's entries in ~/.cursor/hooks.json + /nomo-* skills
+  bunx nomo-ai --uninstall --antigravity   the "nomo" block in ~/.gemini/config/hooks.json + plugin
+  (the same as: node ~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall)
+Not covered — each host removes its own install:
+  Claude Code   claude plugin uninstall nomo-cc@nomo
+  Codex         codex plugin remove nomo@nomo
+  OpenCode      delete ~/.config/opencode/plugins/nomo.js and ~/.config/opencode/commands/nomo-*.md`;
 
 // ── plumbing ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -401,6 +406,7 @@ const AGENTS = [
       STATUS.get("claude")?.installed
         ? [`run \`${CLAUDE_UPDATE}\`, then restart Claude Code`]
         : ["restart Claude Code so the hooks load", "run /nomo-cc:pair"],
+    manualUninstall: "claude plugin uninstall nomo-cc@nomo",
     detect: () => onPath("claude") || existsSync(join(homedir(), ".claude")),
     installed: () => hostHasNomo(join(homedir(), ".claude", "plugins", "cache"), "nomo-cc"),
     install() {
@@ -439,6 +445,7 @@ const AGENTS = [
           ? ["run the command above, then restart Codex"]
           : ["nothing to run here — this row printed no command on purpose"]
         : ["run /hooks in Codex and trust the seven Nomo entries", "run $nomo-pair"],
+    manualUninstall: "codex plugin remove nomo@nomo",
     detect: () => onPath("codex") || existsSync(join(homedir(), ".codex")),
     installed: () => hostHasNomo(join(homedir(), ".codex", "plugins", "cache"), "nomo"),
     install() {
@@ -470,6 +477,7 @@ const AGENTS = [
       STATUS.get("opencode")?.installed
         ? ["restart OpenCode (plugins load once at server start; no hot reload)"]
         : ["restart OpenCode (plugins load once at server start; no hot reload)", "run /nomo-pair"],
+    manualUninstall: "delete ~/.config/opencode/plugins/nomo.js and ~/.config/opencode/commands/nomo-*.md",
     detect: () =>
       onPath("opencode") ||
       existsSync(join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode")),
@@ -525,6 +533,7 @@ const AGENTS = [
       STATUS.get("cursor")?.installed
         ? ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json"]
         : ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json", "run /nomo-pair"],
+    uninstallScript: CURSOR_SCRIPT,
     detect: () => onPath("cursor-agent") || onPath("cursor") || existsSync(cursorDir()),
     // The one agent whose installer NEEDS the host's own directory to exist (it merges into a file
     // there). Claude and Codex go through their CLI and say so when it is missing; OpenCode's script
@@ -578,6 +587,7 @@ const AGENTS = [
       STATUS.get("antigravity")?.installed
         ? ["restart Antigravity (and any open agy)", "type /nomo-status to check"]
         : ["restart Antigravity (and any open agy)", "type /nomo-pair"],
+    uninstallScript: ANTIGRAVITY_SCRIPT,
     detect: () => onPath("agy") || existsSync(antigravityDir()),
     skipUndetectedUnderAll: true,
     installed: () => {
@@ -663,12 +673,14 @@ function parseArgs(argv) {
   const named = new Set();
   let all = false;
   let yes = false;
+  let uninstall = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") return { help: true };
     else if (a === "-v" || a === "--version") return { showVersion: true };
     else if (a === "-y" || a === "--yes") yes = true;
     else if (a === "-n" || a === "--dry-run") DRY = true;
+    else if (a === "--uninstall") uninstall = true;
     else if (a === "--all") {
       all = true;
       for (const ag of AGENTS) picked.add(ag.id);
@@ -682,7 +694,7 @@ function parseArgs(argv) {
       named.add(a.slice(2));
     } else return { bad: a };
   }
-  return { picked, yes, all, named };
+  return { picked, yes, all, named, uninstall };
 }
 
 /** --ref reaches exactly one leg. Saying so out loud is the whole point: a flag that reads as
@@ -1000,6 +1012,47 @@ function banner() {
   say(`  ${dim(TAGLINE)}`);
 }
 
+// ── uninstall ────────────────────────────────────────────────────────────────────────────────────
+//
+// An agent flag is REQUIRED: no picker, no "everything detected". Removing is the one action here a
+// stray Enter should never be able to do. Each agent's own installer does the removal (it already
+// knows exactly what it wrote); an agent whose install belongs to its host gets that host's command
+// printed instead — nothing here drives a host's uninstall.
+
+/** @param {Set<string>} selected */
+function uninstall(selected) {
+  if (selected.size === 0) {
+    err("nomo-ai: --uninstall needs to know which agent — name it, e.g.:");
+    err("  bunx nomo-ai --uninstall --cursor   (or --antigravity)");
+    return 2;
+  }
+  if (DRY) say(dim("dry run — nothing will be removed\n"));
+  const failures = [];
+  for (const agent of AGENTS.filter((a) => selected.has(a.id))) {
+    say(bold(agent.label));
+    if (!agent.uninstallScript) {
+      say(`  ${dim("not covered by nomo-ai — remove it with:")}`);
+      say(`    ${bold(agent.manualUninstall)}`);
+      say();
+      continue;
+    }
+    if (!DRY && !existsSync(agent.uninstallScript)) {
+      failures.push(agent);
+      err(`  ${agent.uninstallScript} is missing — Nomo was not installed from ${CHECKOUT}.`);
+      err(`  Installed from another checkout? Run: node <checkout>/plugin/scripts/${agent.id}-install.mjs --uninstall`);
+      say();
+      continue;
+    }
+    const fail = run(process.execPath, [agent.uninstallScript, "--uninstall"]);
+    if (fail) {
+      failures.push(agent);
+      err(`  ${bold("FAILED")}: ${fail}`);
+    }
+    say();
+  }
+  return failures.length > 0 ? 1 : 0;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────────────────────────
 //
 // Wrapped in a function purely so every exit is `process.exitCode` + `return`, never `process.exit()`.
@@ -1029,6 +1082,8 @@ async function main() {
   }
 
   banner();
+
+  if (args.uninstall) return uninstall(args.picked);
 
   const floor = hookRuntimeFloor();
   if (floor) {

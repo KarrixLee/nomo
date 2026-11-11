@@ -11,7 +11,7 @@
 // with no exports (it runs main() on import) — the same reason hook-shim.test.ts drives the real shell
 // scripts rather than reimplementing them. `--dry-run` guarantees nothing is installed or written.
 
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -121,5 +121,67 @@ describe("runtime floor (CVE-2026-111497): a warning, never a block", () => {
 
   test("bun 1.4.4: no warning", async () => {
     expect(await withBun("1.4.4")).not.toContain("CVE-2026-111497");
+  });
+});
+
+describe("bunx nomo-ai --uninstall", () => {
+  async function nomoAi(flags: string[], setup: (home: string) => Promise<void> = async () => {}): Promise<{ code: number; out: string }> {
+    const home = await mkdtemp(join(tmpdir(), "nomo-ai-uninstall-"));
+    homes.push(home);
+    const bin = join(home, "bin");
+    await mkdir(bin, { recursive: true });
+    for (const name of ["claude", "codex"]) await writeFile(join(bin, name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await setup(home);
+    const proc = spawnTestProcess({
+      cmd: [Bun.which("node")!, NOMO_AI, ...flags],
+      cwd: home,
+      env: isolatedTestEnv(home, { NO_COLOR: "1", PATH: `${bin}:/usr/bin:/bin` }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    return { code: await proc.exited, out: `${out}${err}` };
+  }
+
+  test("--help lists the uninstall lines", async () => {
+    const help = await nomoAi(["--help"]);
+    expect(help.out).toContain("bunx nomo-ai --uninstall --cursor");
+    expect(help.out).toContain("bunx nomo-ai --uninstall --antigravity");
+    expect(help.out).toContain("claude plugin uninstall nomo-cc@nomo");
+  });
+
+  test("--uninstall needs an agent flag: no picker, nothing run", async () => {
+    const r = await nomoAi(["--uninstall"]);
+    expect(r.code).toBe(2);
+    expect(r.out).toContain("--uninstall needs to know which agent");
+    expect((await nomoAi(["--uninstall", "-y"])).code).toBe(2);
+  });
+
+  test("--uninstall --antigravity runs ~/.nomo's antigravity-install.mjs --uninstall; -y is accepted", async () => {
+    let log = "";
+    const r = await nomoAi(["--uninstall", "--antigravity", "-y"], async (home) => {
+      const scripts = join(home, ".nomo", "plugin", "scripts");
+      await mkdir(scripts, { recursive: true });
+      log = join(home, "argv.log");
+      await writeFile(join(scripts, "antigravity-install.mjs"), `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" "));\n`);
+    });
+    expect(r.code).toBe(0);
+    expect(await readFile(log, "utf8")).toBe("--uninstall");
+    expect(r.out).not.toContain("claude plugin");
+  });
+
+  test("--uninstall with no ~/.nomo checkout fails loudly and names the long form", async () => {
+    const r = await nomoAi(["--uninstall", "--cursor"]);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("cursor-install.mjs --uninstall");
+  });
+
+  test("--uninstall for a host-owned install prints the host's command and runs nothing", async () => {
+    const r = await nomoAi(["--uninstall", "--claude", "--codex", "--opencode"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("claude plugin uninstall nomo-cc@nomo");
+    expect(r.out).toContain("codex plugin remove nomo@nomo");
+    expect(r.out).toContain("~/.config/opencode/plugins/nomo.js");
+    expect(r.out).not.toContain("$ claude");
   });
 });

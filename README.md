@@ -61,9 +61,10 @@ bunx nomo-ai     # or: npx nomo-ai
 It detects which agents are on this computer and installs Nomo for each through that agent's own
 install path (`--claude` `--codex` `--opencode` `--cursor` `--antigravity` pick agents; `-n` prints
 the plan and runs nothing). It never pairs your phone and has no `postinstall` hook. The two agent
-config files it merges into directly are undone with
-`node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall` (Cursor) and
-`node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall` (Antigravity).
+config files it merges into directly are undone with `bunx nomo-ai --uninstall --cursor` and
+`bunx nomo-ai --uninstall --antigravity` (the same as
+`node ~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall`). An agent flag is required. For Claude
+Code, Codex and OpenCode, `--uninstall` only prints the host's own removal command.
 
 The full guides live at [docs.nomo.gg](https://docs.nomo.gg):
 
