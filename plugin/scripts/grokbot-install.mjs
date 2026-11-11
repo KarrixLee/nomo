@@ -12,10 +12,11 @@
 //   /bin/sh <root>/scripts/run.sh <root>/dist/cc-watchdog.mjs --scheduled
 //
 // run.sh resolves bun/node at run time (so a version manager moving node breaks nothing) and gives bun
-// `--config=/dev/null --env-file=/dev/null`. The watchdog scans once at start, is single-instance
-// (`--scheduled` makes it defer to any live watchdog it does not outrank — see incumbentKeepsBeat), exits
-// at once when unpaired, and exits by itself after 30 idle minutes when paired. So: no new daemon, no
-// new bundle. User-level launchd only (~/Library/LaunchAgents, `gui/<uid>`): no sudo, no LaunchDaemon.
+// `--config=/dev/null --env-file=/dev/null`. `--scheduled` makes the watchdog an ACTIVITY ONE-SHOT (see
+// scheduledActivityRun): if any watchdog is already running it does nothing, otherwise it runs one
+// activity scan/upload (normal gates; nothing when unpaired) and exits. It never claims the watchdog
+// pidfile, serves sessions, opens the LAN listener or lingers. So: no new daemon, no new bundle.
+// User-level launchd only (~/Library/LaunchAgents, `gui/<uid>`): no sudo, no LaunchDaemon.
 //
 // The plist addresses THIS checkout by absolute path — safe for the same reason as cursor-install.mjs:
 // it runs from ~/.nomo (`bunx nomo-ai --grokbot`), a checkout that is `git pull`ed, never moved.
@@ -99,10 +100,16 @@ if (process.platform !== "darwin") {
 try {
   if (UNINSTALL) {
     const wasLoaded = loaded();
-    if (wasLoaded) launchctl("bootout", `${domain}/${LABEL}`);
+    const out = wasLoaded ? launchctl("bootout", `${domain}/${LABEL}`) : { ok: true, out: "" };
     const hadFile = existsSync(PLIST);
     rmSync(PLIST, { force: true });
-    say(`job      -> ${wasLoaded || hadFile ? `unloaded and removed ${PLIST}` : "not installed — nothing to remove"}`);
+    if (!out.ok) {
+      console.error(`grokbot-install: launchctl bootout ${domain}/${LABEL} failed: ${out.out}`);
+      console.error(`grokbot-install: ${hadFile ? `removed ${PLIST}; ` : ""}to stop it now: launchctl bootout ${domain}/${LABEL}`);
+      process.exitCode = 1;
+    } else {
+      say(`job      -> ${wasLoaded ? `unloaded and removed ${PLIST}` : hadFile ? `removed ${PLIST}` : "not installed — nothing to remove"}`);
+    }
     // Order does not matter: unpair needs only config.json and the plugin files, both left in place here.
     say("pairing is untouched (it is shared with your other agents) — to disconnect this Mac from your phone, run `bunx nomo-ai unpair` (before or after this).");
   } else {
@@ -118,8 +125,13 @@ try {
       writeFileSync(tmp, want, { mode: 0o644 });
       renameSync(tmp, PLIST);
       // Reload so launchd reads the new file. bootout of a job that is not loaded just fails — ignored.
+      // launchd can refuse a bootstrap for a moment while the old job is still exiting, so retry briefly.
       launchctl("bootout", `${domain}/${LABEL}`);
-      const r = launchctl("bootstrap", domain, PLIST);
+      let r = launchctl("bootstrap", domain, PLIST);
+      for (let i = 0; !r.ok && i < 5; i++) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+        r = launchctl("bootstrap", domain, PLIST);
+      }
       if (!r.ok) {
         fail(`launchctl bootstrap ${domain} ${PLIST} failed: ${r.out}\n` +
           `grokbot-install: the file is in place; load it by hand with that command, or log out and back in`);

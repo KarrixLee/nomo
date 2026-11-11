@@ -92,7 +92,8 @@ package named `nomo` is someone else's.
 **Grok Bot only (macOS).** The Grok Bot app has no hooks, so `--grokbot` adds an hourly background job
 instead (see [Grok Bot background job](#grok-bot-background-job)); then pair with `bunx nomo-ai pair`.
 `bunx nomo-ai uninstall --grokbot` removes the job. With another agent installed you do not need it:
-that agent already runs the same scan.
+that agent already runs the same scan, so `-y` and `--all` add it only when Grok Bot is the only agent
+found (name `--grokbot` to add it anyway).
 
 The full guides live at [docs.nomo.gg](https://docs.nomo.gg):
 
@@ -163,9 +164,10 @@ valid. The page is deleted when pairing completes.
 
 | Destination | When | What |
 |---|---|---|
-| Relay Worker (`https://api.nomo.gg`, or `NOMO_WORKER_URL` at pair time) | every session event; approval holds; pairing; unpair | `/v1/cc/event`, `/v1/cc/decision*`, `/v1/cc/full`, `/v1/cc/pair/*` |
+| Relay Worker (`https://api.nomo.gg`, or `NOMO_WORKER_URL` at pair time) | every session event; approval holds; pairing; unpair; the activity summary | `/v1/cc/event`, `/v1/cc/decision*`, `/v1/cc/full`, `/v1/cc/pair/*` |
 | Your iPhone, on the same network (only if LAN is turned on in the app) | commands and answers | `POST /v1/lan`, sealed under `K_lan` |
-| `github.com/KarrixLee/nomo` via `git` | `bunx nomo-ai` (OpenCode, Cursor, Antigravity legs) and `/nomo-update` | clone / fetch / pull of this repo |
+| `github.com/KarrixLee/nomo` via `git` | `bunx nomo-ai` (OpenCode, Cursor, Antigravity, Grok Bot legs) and `/nomo-update` | clone / fetch / pull of this repo |
+| The npm registry, via your package manager | only if you answer yes to the short `nomo` command, or pass `--global` | `bun add -g nomo-ai` or `npm install -g nomo-ai` |
 
 Nothing else: no analytics, no crash reporting, no reads of agent credentials.
 
@@ -187,7 +189,8 @@ chats (`~/Library/Application Support/Grok Bot/sand-client-persistence`) — and
 agent: session count, prompt count, which 5-minute slots had activity, and token totals per model. It
 **never** puts prompt or reply text, project names or paths into the summary. From Grok Bot it uses only
 each message's time, id and whether you or the bot sent it, plus the bot's id — never the text, the bot's
-name or your account id; the text is discarded while the file is read. The ids stay on your computer (as
+name or your account id; every other text value (message text, names, attachments) is dropped as the
+file is parsed, so it is never held in memory. The ids stay on your computer (as
 short hashes, only to avoid counting a message twice). What is sent for Grok Bot is, per day, how many
 Bots you used, how many messages you sent and when you were active, with no token counts; a day counts
 only when you sent Grok Bot a message that day. Rows are kept in
@@ -373,21 +376,20 @@ real installs never set it, and anything that can set your agent's environment c
   `~/Library/LaunchAgents/gg.nomo.activity.plist`. No `sudo`, no system-wide daemon, no hooks. It is
   only for a Mac whose one agent is the Grok Bot app.
 - **What it runs.** `/bin/sh ~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/cc-watchdog.mjs
-  --scheduled` — the same watchdog the other agents start — at login and then once an hour, at low
-  (background) priority. `run.sh` picks bun or node each time (see [Runtime and launch](#runtime-and-launch)).
-- **What it does.** Unpaired, the watchdog exits at once. Paired, it reads the activity history
-  described in [What leaves your computer](#what-leaves-your-computer), then stops by itself after
-  30 idle minutes. If a watchdog is already running, the new one exits (with `--scheduled` it also
-  leaves a newer or other-copy watchdog alone). While it runs it is the ordinary watchdog, including the
-  [LAN listener](#runtime-and-launch) if LAN is on in the app.
-- **Network.** With no agent sessions, its only request is the existing sealed activity upload to
-  `/v1/cc/full` (at most every 6 hours, only when something changed), plus finishing a pairing you
-  started.
+  --scheduled` at login and then once an hour, at low (background) priority. `run.sh` picks bun or node
+  each time (see [Runtime and launch](#runtime-and-launch)).
+- **What it does.** `--scheduled` is a one-shot activity run, not the session watchdog. If a watchdog is
+  already running (started by any agent), it exits at once — that one sends the activity. Otherwise it
+  scans the activity history described in [What leaves your computer](#what-leaves-your-computer) once,
+  uploads it if due (same rules: at most every 6 hours, only when changed; nothing when unpaired), and
+  exits. It does not claim the watchdog, serve sessions, open the LAN listener or keep running.
+- **Network.** Its only request is that sealed activity upload to `/v1/cc/full`. Pairing is done by
+  `bunx nomo-ai pair`, which starts the normal watchdog to finish the pairing and send the first upload.
 - **Pair, check, send now, disconnect:** `bunx nomo-ai pair`, `bunx nomo-ai status`, `bunx nomo-ai reset`,
   `bunx nomo-ai unpair` (unpair works before or after removing the job).
-- **Remove it** with `bunx nomo-ai uninstall --grokbot` (or
-  `node ~/.nomo/plugin/scripts/grokbot-install.mjs --uninstall`). It unloads the job and deletes the
-  plist, nothing else; your pairing stays.
+- **Remove it** with `bunx nomo-ai uninstall --grokbot` (works even if `~/.nomo` is gone). It unloads
+  the job and deletes the plist, nothing else; your pairing stays. By hand:
+  `launchctl bootout gui/$(id -u)/gg.nomo.activity` then `rm ~/Library/LaunchAgents/gg.nomo.activity.plist`.
 
 ### Runtime and launch
 

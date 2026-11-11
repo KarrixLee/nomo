@@ -205,8 +205,12 @@ describe("commands: pair / status / reset / uninstall", () => {
     return h;
   };
   /** A fake installed plugin at `root`: run.sh logs "<entry> <args>" and exits with $EXIT (default 0). */
-  const plugin = async (root: string, log: string, exit = 0) => {
+  const plugin = async (root: string, log: string, exit = 0, version?: string) => {
     await mkdir(join(root, "scripts"), { recursive: true });
+    if (version) {
+      await mkdir(join(root, ".claude-plugin"), { recursive: true });
+      await writeFile(join(root, ".claude-plugin", "plugin.json"), JSON.stringify({ name: "nomo-cc", version }));
+    }
     await mkdir(join(root, "dist"), { recursive: true });
     for (const e of ["pair", "reset", "status-cmd", "unpair"]) await writeFile(join(root, "dist", `${e}.mjs`), "");
     await writeFile(join(root, "scripts", "run.sh"), `#!/bin/sh\ne=$(basename "$1" .mjs); shift\necho "$e $*" >> '${log}'\necho "from-${"$"}e"\nexit ${exit}\n`, { mode: 0o755 });
@@ -264,6 +268,36 @@ describe("commands: pair / status / reset / uninstall", () => {
     await writeFile(join(h, ".config", "cc-status", "hook-shim.stamp"), `4 ${stamped}\n`);
     expect((await cli(h, ["reset"])).code).toBe(0);
     expect(await readFile(log, "utf8")).toBe("reset \n");
+  });
+
+  test("stamp copy vs ~/.nomo: the higher plugin version runs, whichever it is", async () => {
+    for (const [stampV, nomoV, winner] of [["2.3.53", "2.4.2", "nomo"], ["2.5.0", "2.4.2", "stamp"], ["2.10.0", "2.9.9", "stamp"]] as const) {
+      const h = await home();
+      const log = join(h, "calls.log");
+      await plugin(join(h, ".nomo", "plugin"), join(h, "nomo.log"), 0, nomoV);
+      const stamped = join(h, "cache", stampV);
+      await plugin(stamped, join(h, "stamp.log"), 0, stampV);
+      await mkdir(join(h, ".config", "cc-status"), { recursive: true });
+      await writeFile(join(h, ".config", "cc-status", "hook-shim.stamp"), `5 ${stamped}\n`);
+      expect((await cli(h, ["reset"])).code).toBe(0);
+      expect(await readFile(join(h, `${winner}.log`), "utf8")).toBe("reset \n");
+      void log;
+    }
+  });
+
+  test("a malformed stamp (one field, or a relative root) is ignored — never code from the current folder", async () => {
+    for (const stamp of ["4", "4 relative/plugin"]) {
+      const h = await home();
+      // A plugin-shaped folder right where a relative root would resolve from the cwd (the home here).
+      await plugin(join(h, "4"), join(h, "evil.log"));
+      await plugin(join(h, "relative", "plugin"), join(h, "evil.log"));
+      await mkdir(join(h, ".config", "cc-status"), { recursive: true });
+      await writeFile(join(h, ".config", "cc-status", "hook-shim.stamp"), `${stamp}\n`);
+      const r = await cli(h, ["reset"]);
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("Nomo is not installed on this computer yet");
+      await expect(readFile(join(h, "evil.log"), "utf8")).rejects.toThrow();
+    }
   });
 
   test("an unknown word fails clearly and installs nothing; `<cmd> --help` prints help, runs nothing", async () => {
@@ -404,6 +438,17 @@ describe("the optional short `nomo` command", () => {
     expect(r.out).not.toContain(Q);
     expect(await npmCalls(b.log)).toBe("");
     expect(r.out).toContain("`nomo pair` from any folder");
+  });
+
+  test("-n: never asked (even in a terminal); a foreign `nomo` is not mentioned in a non-TTY run", async () => {
+    const b = await box("ok");
+    const r = await cli(b, ["--claude", "-n"], true, "y\n");
+    expect(r.out).not.toContain(Q);
+    expect(r.out).not.toContain("would run: npm");
+    expect(await npmCalls(b.log)).toBe("");
+    const f = await box("ok", { foreign: true });
+    const quiet = await cli(f, ["--claude"], false);
+    expect(quiet.out).not.toContain("Another program called `nomo`");
   });
 
   test("--global installs without asking; with -n it only shows the plan", async () => {

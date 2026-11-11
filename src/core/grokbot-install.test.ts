@@ -43,8 +43,13 @@ echo "$*" >> '${log}'
 f='${join(tmp, "loaded")}'
 case "$1" in
   print) [ -f "$f" ] && exit 0; exit 113 ;;
-  bootstrap) [ -f "$2" ] || [ -f "$3" ] && : > "$f"; exit 0 ;;
-  bootout) [ -f "$f" ] || exit 3; rm -f "$f"; exit 0 ;;
+  bootstrap)
+    n='${join(tmp, "bootstrap-fails")}'
+    if [ -s "$n" ]; then c=$(cat "$n"); if [ "$c" -gt 0 ]; then echo $((c - 1)) > "$n"; echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi; fi
+    [ -f "$2" ] || [ -f "$3" ] && : > "$f"; exit 0 ;;
+  bootout)
+    [ -f '${join(tmp, "bootout-fails")}' ] && { echo "Boot-out failed: 5: Input/output error" >&2; exit 5; }
+    [ -f "$f" ] || exit 3; rm -f "$f"; exit 0 ;;
 esac
 exit 0
 `, { mode: 0o755 });
@@ -98,6 +103,17 @@ describe("grokbot-install.mjs", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("already up to date");
     expect((await calls(b)).slice(before).every((c) => c.startsWith("print"))).toBe(true);
+  });
+
+  test("a reinstall retries a bootstrap launchd refuses while the old job is exiting", async () => {
+    const b = await box();
+    expect((await run(b)).code).toBe(0);
+    await writeFile(join(b.plist), "stale"); // force a rewrite + reload
+    await writeFile(join(b.tmp, "bootstrap-fails"), "2");
+    const r = await run(b);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("(loaded)");
+    expect((await calls(b)).filter((c) => c.startsWith("bootstrap")).length).toBe(4); // 1 first install + 3 here
   });
 
   test("a path with XML-special characters is escaped, not broken", async () => {
@@ -174,6 +190,22 @@ describe("bunx nomo-ai --grokbot", () => {
     expect(r.out).toContain("ok (dry run)");
   });
 
+  test("-y / --all leave Grok Bot out when another agent is here; --grokbot still adds it", async () => {
+    const h = await home();
+    await mkdir(join(h, "Library", "Application Support", "Grok Bot"), { recursive: true });
+    await mkdir(join(h, ".claude"), { recursive: true }); // Claude Code detected too
+    for (const flags of [["-y", "-n"], ["--all", "-n"]]) {
+      const r = await nomoAi(h, flags);
+      expect(r.out).not.toContain("[*] Grok Bot");
+      expect(r.out).not.toContain("grokbot-install.mjs");
+      expect(r.out).toContain("Grok Bot left out — another agent here already sends its activity.");
+    }
+    const named = await nomoAi(h, ["-y", "--grokbot", "-n"]);
+    expect(named.out).toContain("[*] Grok Bot");
+    const both = await nomoAi(h, ["--all", "--grokbot", "-n"]);
+    expect(both.out).toContain("[*] Grok Bot");
+  });
+
   test("not macOS: the leg refuses with one clear line, nothing run", async () => {
     const h = await home();
     const r = await nomoAi(h, ["--grokbot", "-n"], ["--import", LINUX]);
@@ -182,15 +214,47 @@ describe("bunx nomo-ai --grokbot", () => {
     expect(r.out).not.toContain("would run");
   });
 
-  test("--uninstall --grokbot runs ~/.nomo's grokbot-install.mjs --uninstall", async () => {
-    const h = await home();
-    const scripts = join(h, ".nomo", "plugin", "scripts");
-    await mkdir(scripts, { recursive: true });
-    const log = join(h, "argv.log");
-    await writeFile(join(scripts, "grokbot-install.mjs"), `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" "));\n`);
-    const r = await nomoAi(h, ["--uninstall", "--grokbot"]);
+  /** The installer's own uninstall, with no ~/.nomo at all and the box's fake launchctl. */
+  async function uninstallVia(b: Box): Promise<{ code: number; out: string }> {
+    const proc = spawnTestProcess({
+      cmd: [Bun.which("node")!, NOMO_AI, "uninstall", "--grokbot"],
+      cwd: b.tmp,
+      env: isolatedTestEnv(b.home, { NO_COLOR: "1", PATH: `${b.bin}:/usr/bin:/bin` }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    return { code: await proc.exited, out: `${out}${err}` };
+  }
+
+  test("uninstall --grokbot works with ~/.nomo gone: unloads our label, deletes the plist, idempotent", async () => {
+    const b = await box();
+    expect((await run(b)).code).toBe(0); // installed + loaded
+    const r = await uninstallVia(b);
     expect(r.code).toBe(0);
-    expect(await readFile(log, "utf8")).toBe("--uninstall");
+    expect(r.out).toContain(`unloaded and removed ${b.plist}`);
+    expect(r.out).toContain("run `bunx nomo-ai unpair` (before or after this)");
+    expect(existsSync(b.plist)).toBe(false);
+    expect(await calls(b)).toContain(`bootout gui/${process.getuid!()}/gg.nomo.activity`);
+    const again = await uninstallVia(b);
+    expect(again.code).toBe(0);
+    expect(again.out).toContain("not installed — nothing to remove");
+  });
+
+  test("a failed bootout is reported, never called \"unloaded\"; the plist still goes and the hand command is printed", async () => {
+    const b = await box();
+    expect((await run(b)).code).toBe(0);
+    await writeFile(join(b.tmp, "bootout-fails"), "");
+    const r = await uninstallVia(b);
+    expect(r.code).toBe(1);
+    expect(r.out).not.toContain("unloaded");
+    expect(r.out).toContain("launchctl bootout gui/");
+    expect(r.out).toContain("Boot-out failed: 5");
+    expect(r.out).toContain(`To stop it now: launchctl bootout gui/${process.getuid!()}/gg.nomo.activity`);
+    expect(existsSync(b.plist)).toBe(false);
+    const viaScript = await (async () => { await run(b); return run(b, ["--uninstall"]); })();
+    expect(viaScript.code).toBe(1);
+    expect(viaScript.out).not.toContain("unloaded");
   });
 
   test("--help names the leg and its uninstall", async () => {

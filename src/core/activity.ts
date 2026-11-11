@@ -29,8 +29,8 @@
 // skips that line/agent, never the watchdog. PORTABLE: runs under node or bun (no Bun.* globals).
 
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { constants as fsConstants, createReadStream, existsSync } from "node:fs";
+import { open, readdir, readFile, stat } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import * as zlib from "node:zlib";
 import { encryptBlob } from "./crypto";
@@ -101,7 +101,9 @@ export function localDate(ts: number): string {
  *  only GROWS on the later lines (the rest is identical). So a repeated CC id with more output adds the
  *  difference, tracked in `ko` — idempotent across re-reads and lines split across scans. */
 export function addEvent(state: State, ev: ActivityEvent): boolean {
-  if (!Number.isFinite(ev.ts)) return false;
+  // A finite ts can still be past Date's range (±8.64e15): localDate would then be "NaN-NaN-NaN" and the
+  // row would be uploaded forever. Refused here for every agent.
+  if (!Number.isFinite(ev.ts) || Number.isNaN(new Date(ev.ts).getTime())) return false;
   const d = localDate(ev.ts);
   const key = `${d}|${ev.agent}`;
   let row = state.rows.get(key);
@@ -345,10 +347,9 @@ export const defaultRoots = (): Roots => ({
   claude: `${process.env.HOME}/.claude/projects`,
   codex: codexHome(),
   opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`,
-  // Electron userData. Only the macOS path was verified; Windows/Linux follow the Electron convention.
-  grokBot: `${process.platform === "darwin" ? `${process.env.HOME}/Library/Application Support`
-    : process.platform === "win32" ? process.env.APPDATA
-    : process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/Grok Bot/sand-client-persistence`,
+  // The app's Electron userData. macOS only for now (the one verified, documented path); "" elsewhere
+  // makes readGrokBot a no-op instead of guessing a folder.
+  grokBot: process.platform === "darwin" ? `${process.env.HOME}/Library/Application Support/Grok Bot/sand-client-persistence` : "",
 });
 
 type Sink = (ev: ActivityEvent) => void;
@@ -462,6 +463,7 @@ function base32(s: string): string | null {
   return Buffer.from(out).toString("utf8");
 }
 
+const GB_MAX_BYTES = 4 * 1024 * 1024; // ~200 entries per bot are a few hundred KB at most
 const GB_KEY = /\.transcript\.replicas\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 
 /** Grok Bot keeps the latest ~200 entries per bot in `<base32(key)>.blob`; files are tiny, so every cycle
@@ -473,18 +475,34 @@ const GB_KEY = /\.transcript\.replicas\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
  *  own. Dropped output is not sunk (nor hashed): a prompt later that day makes the next scan count it.
  *  Ceiling: once a prompt has left the app's ~200-entry window, its surviving replies count only if an
  *  earlier scan already counted them. */
-async function readGrokBot(dir: string, sink: Sink): Promise<void> {
+async function readGrokBot(dir: string, sink: Sink, now: number): Promise<void> {
+  if (!dir) return; // not macOS
   const events: ActivityEvent[] = [];
-  for (const f of await listFiles(dir, (n) => n.endsWith(".blob"))) {
-    const bot = base32(basename(f, ".blob"))?.match(GB_KEY)?.[1];
+  // NOT recursive, regular files only: a FIFO named like a blob would block the read forever (and with it
+  // every later cycle and `reset`), a symlink could point anywhere. The dirent type filters the listing;
+  // the open itself is O_NONBLOCK|O_NOFOLLOW and re-checked with fstat, so a swap after the listing
+  // cannot block or follow either. Files over GB_MAX_BYTES are skipped unread.
+  const names = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  for (const ent of names) {
+    if (!ent.isFile() || !ent.name.endsWith(".blob")) continue;
+    const bot = base32(basename(ent.name, ".blob"))?.match(GB_KEY)?.[1];
     if (!bot) continue; // roster, usage cache, ui state, …
     try {
+      const fh = await open(`${dir}/${ent.name}`, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
+      let text: string;
+      try {
+        const st = await fh.stat();
+        if (!st.isFile() || st.size > GB_MAX_BYTES) continue;
+        text = await fh.readFile("utf8");
+      } finally { await fh.close(); }
       // The reviver drops every string except kind/role/id AS the file is parsed, so message text, names
       // and attachments never exist in the parsed data this code (or a later edit) can reach.
       const keep = (k: string, v: unknown) => (typeof v === "string" && k !== "kind" && k !== "role" && k !== "id" ? undefined : v);
-      for (const e of JSON.parse(await readFile(f, "utf8"), keep).value.entries) {
+      for (const e of JSON.parse(text, keep).value.entries) {
         const kind = e?.kind === "message" && e.role === "user" ? "turn" : e?.kind === "send-message" ? "assistant" : null;
-        if (!kind || e.isStreaming || !Number.isFinite(e.timestampMs) || typeof e.id !== "string") continue;
+        if (!kind || e.isStreaming || typeof e.id !== "string") continue;
+        // A real time only: after the epoch and at most a day ahead of this computer's clock.
+        if (!Number.isFinite(e.timestampMs) || e.timestampMs <= 0 || e.timestampMs > now + 86_400_000) continue;
         events.push({ ts: e.timestampMs, agent: "grokbot", sessionId: bot, kind, id: `gb:${bot}:${e.id}` });
       }
     } catch { /* corrupt file or unknown schema: skip it */ }
@@ -508,7 +526,7 @@ export async function scanAll(state: State, cursor: Cursor, roots: Roots, now: n
   try { await readClaude(roots.claude, cursor, sink, progress, seen); } catch { /* skip agent */ }
   try { await readCodex(roots.codex, cursor, sink, progress, seen, since("codex"), state); } catch { /* skip agent */ }
   try { await readOpenCode(roots.opencode, sink, since("opencode")); } catch { /* skip agent */ }
-  try { await readGrokBot(roots.grokBot, sink); } catch { /* skip agent */ }
+  try { await readGrokBot(roots.grokBot, sink, now); } catch { /* skip agent */ }
   for (const p of Object.keys(cursor)) if (!seen.has(p)) delete cursor[p];
 }
 

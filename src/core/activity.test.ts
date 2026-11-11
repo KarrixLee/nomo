@@ -3,11 +3,12 @@ process.env.TZ = "Asia/Tokyo"; // before any Date use: day bucketing is local-ti
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { PLUGIN_VERSION } from "./shared";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  addEvent, buildPayload, Cursor, emptyState, freeze, loadMachineId, localDate, maybeUpload, parseClaudeLine, parseCodexLine,
+  addEvent, buildPayload, Cursor, defaultRoots, emptyState, freeze, loadMachineId, localDate, maybeUpload, parseClaudeLine, parseCodexLine,
   parseState, runActivityCycle, scanAll, serializeState, startActivityLoop, State,
 } from "./activity";
 
@@ -241,31 +242,70 @@ describe("grok bot", () => {
 
   test("a day counts only if the person sent a message that day; output from any Bot counts on such a day", async () => {
     transcript(BOT_A, [
-      reply("t1s0", "2026-11-05T01:00:00Z"), // 10:00 JST 11-05: a routine, nobody prompted that day
-      prompt("t2u", "2026-11-06T01:00:00Z"), // 10:00 JST 11-06
+      reply("t1s0", "2026-10-29T01:00:00Z"), // 10:00 JST 10-29: a routine, nobody prompted that day
+      prompt("t2u", "2026-10-30T01:00:00Z"), // 10:00 JST 10-30
     ]);
-    transcript(BOT_B, [reply("t7s0", "2026-11-06T03:00:00Z")]); // 12:00 JST 11-06, no prompt to B
+    transcript(BOT_B, [reply("t7s0", "2026-10-30T03:00:00Z")]); // 12:00 JST 10-30, no prompt to B
     const st = emptyState();
     await scanAll(st, {}, roots, NOW);
-    expect(row(st, "2026-11-05", "grokbot")).toBeUndefined();
-    const r6 = row(st, "2026-11-06", "grokbot")!;
+    expect(row(st, "2026-10-29", "grokbot")).toBeUndefined();
+    const r6 = row(st, "2026-10-30", "grokbot")!;
     expect(r6).toMatchObject({ s: 2, t: 1 });
     expect(slots(r6)).toEqual([120, 144]);
   });
 
   test("output dropped earlier counts once a prompt arrives later that day; re-scans stay idempotent", async () => {
-    transcript(BOT_A, [reply("t1s0", "2026-11-07T01:00:00Z")]); // 10:00 JST
+    transcript(BOT_A, [reply("t1s0", "2026-10-31T01:00:00Z")]); // 10:00 JST
     const st = emptyState();
     await scanAll(st, {}, roots, NOW);
-    expect(row(st, "2026-11-07", "grokbot")).toBeUndefined();
-    transcript(BOT_A, [reply("t1s0", "2026-11-07T01:00:00Z"), prompt("t2u", "2026-11-07T11:00:00Z")]); // 20:00 JST
+    expect(row(st, "2026-10-31", "grokbot")).toBeUndefined();
+    transcript(BOT_A, [reply("t1s0", "2026-10-31T01:00:00Z"), prompt("t2u", "2026-10-31T11:00:00Z")]); // 20:00 JST
     await scanAll(st, {}, roots, NOW);
-    const r7 = row(st, "2026-11-07", "grokbot")!;
+    const r7 = row(st, "2026-10-31", "grokbot")!;
     expect(r7).toMatchObject({ s: 1, t: 1 });
     expect(slots(r7)).toEqual([120, 240]);
     const st2 = parseState(serializeState(st));
     await scanAll(st2, {}, roots, NOW);
     expect(buildPayload(st2, NOW).days).toEqual(buildPayload(st, NOW).days);
+  });
+
+  test("only regular *.blob files directly in the folder are read: FIFO, symlink, oversize and *.blob directories are skipped", async () => {
+    const key = (bot: string) => `${b32(`sand.client.slice.account.grok%7Cuser_TEST.transcript.replicas.${bot}`)}.blob`;
+    const body = (entries: unknown[], pad = 0) =>
+      JSON.stringify({ schemaVersion: 1, value: { entries, epochHint: 1, acceptedSequenceHint: 1, persistedAt: 0 } }) + " ".repeat(pad);
+    transcript(BOT_A, [prompt("t1u", "2026-11-03T01:00:00Z")]); // the one real file
+    const C = "00000000-0000-4000-8000-00000000000c", D = "00000000-0000-4000-8000-00000000000d";
+    const E = "00000000-0000-4000-8000-00000000000e", F = "00000000-0000-4000-8000-00000000000f";
+    expect(spawnSync("mkfifo", [join(roots.grokBot, key(C))]).status).toBe(0); // would block a plain read forever
+    const outside = join(roots.grokBot, "..", "elsewhere.json");
+    writeFileSync(outside, body([prompt("t1u", "2026-11-02T01:00:00Z")]));
+    symlinkSync(outside, join(roots.grokBot, key(D)));
+    writeFileSync(join(roots.grokBot, key(E)), body([prompt("t1u", "2026-11-01T01:00:00Z")], 4 * 1024 * 1024));
+    mkdirSync(join(roots.grokBot, key(F)));
+    writeFileSync(join(roots.grokBot, key(F), key(F)), body([prompt("t1u", "2026-10-31T01:00:00Z")]));
+    const st = emptyState();
+    await scanAll(st, {}, roots, NOW);
+    expect([...st.rows.values()].filter((r) => r.a === "grokbot").map((r) => r.d)).toEqual(["2026-11-03"]);
+  }, 10_000);
+
+  test("out-of-range timestamps are dropped (never a NaN day), and addEvent refuses them for every agent", async () => {
+    transcript(BOT_A, [
+      prompt("t1u", "2026-11-03T01:00:00Z"),
+      prompt("t2u", "x", { timestampMs: 1e20 }), prompt("t3u", "x", { timestampMs: -5 }), prompt("t4u", "x", { timestampMs: 0 }),
+      prompt("t5u", "x", { timestampMs: NOW + 2 * 86_400_000 }),
+    ]);
+    const st = emptyState();
+    await scanAll(st, {}, roots, NOW);
+    expect([...st.rows.keys()]).toEqual(["2026-11-03|grokbot"]);
+    const st2 = emptyState();
+    expect(addEvent(st2, { ts: 1e20, agent: "claude", sessionId: "s", kind: "turn", id: "x" })).toBe(false);
+    expect(st2.rows.size).toBe(0);
+  });
+
+  test("not macOS: no Grok Bot folder is guessed", () => {
+    const real = process.platform;
+    Object.defineProperty(process, "platform", { value: "linux" });
+    try { expect(defaultRoots().grokBot).toBe(""); } finally { Object.defineProperty(process, "platform", { value: real }); }
   });
 
   test("missing folder is a silent no-op", async () => {

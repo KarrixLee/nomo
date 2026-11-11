@@ -7,9 +7,11 @@
 //      CURRENT pairing (an end carries no blob, so it clears the phone row regardless of which key
 //      sealed the record's stale blob) and its file deleted. Records with LIVE pids are left alone.
 //   3. When paired, scans the agents' history and sends the daily activity summary NOW (heatmap +
-//      streak), skipping the watchdog's 6 h upload gate for this one call. Runs after step 1, so no
-//      watchdog is writing activity-days.json meanwhile; the respawned watchdog reads the fresh
-//      lastUpload/hash from that file and does not re-send the same rows.
+//      streak), skipping the watchdog's 6 h upload gate for this one call. It runs after step 1, but a
+//      hook or the Grok Bot job CAN start a new watchdog (or scheduled run) meanwhile, so two scans may
+//      overlap. No lock: every event is deduped by id, files are written atomically, so the worst case is
+//      one extra upload or the other writer's last save winning. A watchdog started afterwards reads the
+//      fresh lastUpload/hash and does not re-send the same rows.
 //   4. Pairing, keys, and config.json are NOT touched — that is `unpair`'s job.
 //
 // Interactive command (same output contract as unpair): sequential stdout lines, ALWAYS exit 0 —

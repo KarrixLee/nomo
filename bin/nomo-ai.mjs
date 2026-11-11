@@ -32,7 +32,7 @@
 //     marketplace is install-time behaviour; it has no business in an update.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
@@ -652,7 +652,37 @@ const AGENTS = [
       STATUS.get("grokbot")?.installed
         ? ["nothing to restart — the next hourly run uses the update"]
         : ["if this Mac is not paired yet, pair it (then scan the QR):", `  ${cli} pair`, "check it works:", `  ${cli} status`],
-    uninstallScript: GROKBOT_SCRIPT,
+    // Done HERE, not by the checkout's script: it must work after ~/.nomo is gone. Only our one label/file.
+    uninstall() {
+      if (process.platform !== "darwin") {
+        say(`  ${dim("nothing to remove — the Grok Bot job only exists on macOS")}`);
+        return null;
+      }
+      const plist = grokbotPlist();
+      const target = `gui/${process.getuid?.() ?? ""}/gg.nomo.activity`;
+      if (DRY) {
+        say(`  ${dim("would run:")} launchctl bootout ${target}`);
+        say(`  ${dim("would remove:")} ${plist}`);
+        return null;
+      }
+      const loaded = spawnSync("launchctl", ["print", target], { encoding: "utf8" }).status === 0;
+      let fail = null;
+      if (loaded) {
+        const r = spawnSync("launchctl", ["bootout", target], { encoding: "utf8" });
+        if (r.status !== 0) fail = `launchctl bootout ${target} failed: ${`${r.stderr ?? ""}${r.stdout ?? ""}`.trim() || r.error?.message || `exit ${r.status}`}`;
+      }
+      const had = existsSync(plist);
+      rmSync(plist, { force: true });
+      if (fail) {
+        err(`  ${fail}`);
+        err(`  ${had ? `Removed ${plist}, so it will not start again after you log out.` : ""} To stop it now: launchctl bootout ${target}`);
+      } else {
+        say(`  ${loaded ? `unloaded and removed ${plist}` : had ? `removed ${plist}` : "not installed — nothing to remove"}`);
+      }
+      // Order does not matter: unpair needs only config.json and the plugin files, both left in place.
+      say(`  ${dim("pairing is untouched — to disconnect this Mac from your phone, run `bunx nomo-ai unpair` (before or after this)")}`);
+      return fail;
+    },
     detect: () =>
       process.platform === "darwin" &&
       (existsSync("/Applications/Grok Bot.app") || existsSync(join(homedir(), "Library", "Application Support", "Grok Bot"))),
@@ -1096,6 +1126,11 @@ function uninstall(selected) {
   const failures = [];
   for (const agent of AGENTS.filter((a) => selected.has(a.id))) {
     say(bold(agent.label));
+    if (agent.uninstall) {
+      if (agent.uninstall()) failures.push(agent);
+      say();
+      continue;
+    }
     if (!agent.uninstallScript) {
       say(`  ${dim("not covered by nomo-ai — remove it with:")}`);
       say(`    ${bold(agent.manualUninstall)}`);
@@ -1142,23 +1177,46 @@ const COMMANDS = {
 
 const ccDir = () => process.env.NOMO_CC_DIR || join(homedir(), ".config", "cc-status");
 
-/** How to run `entry` from the installed plugin, or undefined when there is none. In order:
- *   1. the copy hooks last ran (the hook shim's stamp, "<rev> <root>") — the shim's own first choice;
- *   2. the ~/.nomo checkout (OpenCode, Cursor, Antigravity, Grok Bot);
- *   3. the hook shim itself, which scans the Claude Code / Codex plugin caches for the newest copy —
+/** A plugin copy's version, from its own manifest; "" when unreadable. @param {string} root */
+function pluginVersion(root) {
+  for (const m of [".claude-plugin", ".codex-plugin"]) {
+    try {
+      const v = JSON.parse(readFileSync(join(root, m, "plugin.json"), "utf8")).version;
+      if (typeof v === "string") return v;
+    } catch {}
+  }
+  return "";
+}
+
+/** Is version `a` strictly newer than `b`? Numeric per component; unreadable reads as 0.0.0.
+ *  @param {string} a @param {string} b */
+function versionNewer(a, b) {
+  const p = (/** @type {string} */ v) => v.split(/[-+]/)[0].split(".").map((n) => (/^\d+$/.test(n) ? Number(n) : 0));
+  const x = p(a), y = p(b);
+  for (let i = 0; i < Math.max(x.length, y.length, 3); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) > (y[i] ?? 0);
+  return false;
+}
+
+/** How to run `entry` from the installed plugin, or undefined when there is none.
+ *   1. the copy hooks last ran (the hook shim's stamp, "<rev> <root>" — used only with both fields and
+ *      an ABSOLUTE root, so a malformed stamp can never run code relative to the current folder) and the
+ *      ~/.nomo checkout (OpenCode, Cursor, Antigravity, Grok Bot): whichever is the higher plugin version,
+ *      the stamp on a tie — an older copy may lack what the command is for (reset sending activity);
+ *   2. the hook shim itself, which scans the Claude Code / Codex plugin caches for the newest copy —
  *      only when one of those caches really holds Nomo (the shim exits silently when it finds nothing).
  *  @param {string} entry @returns {[string, string[]] | undefined} */
 function installedEntry(entry) {
-  const at = (/** @type {string} */ root) =>
-    existsSync(join(root, "scripts", "run.sh")) && existsSync(join(root, "dist", `${entry}.mjs`))
-      ? /** @type {[string, string[]]} */ ([join(root, "scripts", "run.sh"), [join(root, "dist", `${entry}.mjs`)]])
-      : undefined;
-  let stamped = "";
+  const usable = (/** @type {string} */ root) =>
+    existsSync(join(root, "scripts", "run.sh")) && existsSync(join(root, "dist", `${entry}.mjs`));
+  /** @type {string[]} */
+  const roots = [];
   try {
-    stamped = readFileSync(join(ccDir(), "hook-shim.stamp"), "utf8").trim().replace(/^\S+\s+/, "");
+    const m = /^\S+\s+(\/.*)$/.exec(readFileSync(join(ccDir(), "hook-shim.stamp"), "utf8").trim());
+    if (m && usable(m[1])) roots.push(m[1]);
   } catch {}
-  const found = (stamped && at(stamped)) || at(join(CHECKOUT, "plugin"));
-  if (found) return found;
+  if (usable(join(CHECKOUT, "plugin"))) roots.push(join(CHECKOUT, "plugin"));
+  const best = roots.reduce((x, y) => (versionNewer(pluginVersion(y), pluginVersion(x)) ? y : x), roots[0] ?? "");
+  if (best) return [join(best, "scripts", "run.sh"), [join(best, "dist", `${entry}.mjs`)]];
   const shim = join(ccDir(), "hook-shim.sh");
   const inCache = hostHasNomo(join(homedir(), ".claude", "plugins", "cache"), "nomo-cc") ||
     hostHasNomo(join(homedir(), ".codex", "plugins", "cache"), "nomo");
@@ -1258,15 +1316,22 @@ async function askYesNo(q) {
  *  which decides the form the Next: hints print. Never fails the run. `mayAsk` is false under --yes.
  *  @param {boolean} flag @param {boolean} mayAsk */
 async function offerShortCommand(flag, mayAsk) {
+  // Ask only in a real terminal, never in a dry run (`-n --global` still shows the plan). Asked even when
+  // agents were named — the owner's one exception to "an agent flag means non-interactive".
+  // NOMO_AI_TEST_ASK=1 is a test seam (the suite has no terminal). It can only make a question appear,
+  // default No; the one thing a "y" on stdin can then do is the same `-g nomo-ai` install shown first.
+  // Anyone able to set this process's environment could already run anything (NODE_OPTIONS, PATH).
+  const canAsk = mayAsk && !DRY && (interactive() || process.env.NOMO_AI_TEST_ASK === "1");
   const state = shortCommandState();
   if (state === "ours") return true;
   if (state === "foreign") {
-    say(dim("Another program called `nomo` is already on your PATH — keep using `bunx nomo-ai`."));
-    say();
+    if (canAsk || flag) {
+      say(dim("Another program called `nomo` is already on your PATH — keep using `bunx nomo-ai`."));
+      say();
+    }
     return false;
   }
-  // NOMO_AI_TEST_ASK: test seam — the suite has no terminal, and this is the only prompt it needs to drive.
-  if (!flag && !(mayAsk && (interactive() || process.env.NOMO_AI_TEST_ASK === "1"))) return false;
+  if (!flag && !canAsk) return false;
   if (!flag && !(await askYesNo(`Also install the short ${bold("nomo")} command, so you can type ${bold("nomo pair")}? (y/N) `))) {
     say();
     return false;
@@ -1366,11 +1431,17 @@ async function main() {
     ? AGENTS.filter((a) => a.skipUndetectedUnderAll && !args.named.has(a.id) && !a.detect())
     : [];
   for (const a of skipped) selected.delete(a.id);
+  // The Grok Bot leg is for a Mac whose ONE agent is Grok Bot: any other agent's hooks already run the
+  // same activity scan. So -y / --all add it only when it is the only agent here; naming --grokbot always
+  // does, and the picker still lists it (unticked) for a deliberate choice.
+  const grokLeftOut = !!selected?.has("grokbot") && !args.named?.has("grokbot") && found.some((id) => id !== "grokbot");
+  if (grokLeftOut) selected?.delete("grokbot");
 
   preflight(selected, explicit);
 
   // An agent flag IS the non-interactive signal — asking for confirmation of a selection the caller
-  // just spelled out is theatre. Otherwise: prompt unless told not to, and refuse to guess when there
+  // just spelled out is theatre. (One stated exception, the owner's choice: the optional short-command
+  // question at the end is still asked in a real terminal when agents were named — see offerShortCommand.) Otherwise: prompt unless told not to, and refuse to guess when there
   // is no terminal to ask (a CI run that silently installed three agents is the worse outcome).
   if (!explicit && !args.yes) {
     if (!interactive()) {
@@ -1397,6 +1468,7 @@ async function main() {
   for (const a of skipped) {
     say(`${a.label} was not found on this machine — skipped. Name it with --${a.id} to install it anyway.\n`);
   }
+  if (grokLeftOut) say("Grok Bot left out — another agent here already sends its activity. Name it with --grokbot to install it anyway.\n");
 
   if (REF) refCaveat(selected);
 

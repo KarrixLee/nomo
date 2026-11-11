@@ -8,8 +8,8 @@ import { basename as basename3 } from "node:path";
 
 // src/core/activity.ts
 import { createHash as createHash2, randomUUID } from "node:crypto";
-import { createReadStream, existsSync as existsSync2 } from "node:fs";
-import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { constants as fsConstants, createReadStream, existsSync as existsSync2 } from "node:fs";
+import { open as open2, readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { basename as basename2, dirname as dirname2 } from "node:path";
 import * as zlib from "node:zlib";
 
@@ -1115,7 +1115,7 @@ function localDate(ts) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 function addEvent(state, ev) {
-  if (!Number.isFinite(ev.ts))
+  if (!Number.isFinite(ev.ts) || Number.isNaN(new Date(ev.ts).getTime()))
     return false;
   const d = localDate(ev.ts);
   const key = `${d}|${ev.agent}`;
@@ -1412,7 +1412,7 @@ var defaultRoots = () => ({
   claude: `${process.env.HOME}/.claude/projects`,
   codex: codexHome(),
   opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`,
-  grokBot: `${process.platform === "darwin" ? `${process.env.HOME}/Library/Application Support` : process.platform === "win32" ? process.env.APPDATA : process.env.XDG_CONFIG_HOME || `${process.env.HOME}/.config`}/Grok Bot/sand-client-persistence`
+  grokBot: process.platform === "darwin" ? `${process.env.HOME}/Library/Application Support/Grok Bot/sand-client-persistence` : ""
 });
 async function readClaude(root, cursor, sink, progress, seen) {
   for (const f of await listFiles(root, (n) => n.endsWith(".jsonl"))) {
@@ -1542,18 +1542,36 @@ function base32(s) {
   }
   return Buffer.from(out).toString("utf8");
 }
+var GB_MAX_BYTES = 4194304;
 var GB_KEY = /\.transcript\.replicas\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
-async function readGrokBot(dir, sink) {
+async function readGrokBot(dir, sink, now) {
+  if (!dir)
+    return;
   const events = [];
-  for (const f of await listFiles(dir, (n) => n.endsWith(".blob"))) {
-    const bot = base32(basename2(f, ".blob"))?.match(GB_KEY)?.[1];
+  const names = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  for (const ent of names) {
+    if (!ent.isFile() || !ent.name.endsWith(".blob"))
+      continue;
+    const bot = base32(basename2(ent.name, ".blob"))?.match(GB_KEY)?.[1];
     if (!bot)
       continue;
     try {
+      const fh = await open2(`${dir}/${ent.name}`, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
+      let text;
+      try {
+        const st = await fh.stat();
+        if (!st.isFile() || st.size > GB_MAX_BYTES)
+          continue;
+        text = await fh.readFile("utf8");
+      } finally {
+        await fh.close();
+      }
       const keep = (k, v) => typeof v === "string" && k !== "kind" && k !== "role" && k !== "id" ? undefined : v;
-      for (const e of JSON.parse(await readFile2(f, "utf8"), keep).value.entries) {
+      for (const e of JSON.parse(text, keep).value.entries) {
         const kind = e?.kind === "message" && e.role === "user" ? "turn" : e?.kind === "send-message" ? "assistant" : null;
-        if (!kind || e.isStreaming || !Number.isFinite(e.timestampMs) || typeof e.id !== "string")
+        if (!kind || e.isStreaming || typeof e.id !== "string")
+          continue;
+        if (!Number.isFinite(e.timestampMs) || e.timestampMs <= 0 || e.timestampMs > now + 86400000)
           continue;
         events.push({ ts: e.timestampMs, agent: "grokbot", sessionId: bot, kind, id: `gb:${bot}:${e.id}` });
       }
@@ -1588,7 +1606,7 @@ async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
     await readOpenCode(roots.opencode, sink, since("opencode"));
   } catch {}
   try {
-    await readGrokBot(roots.grokBot, sink);
+    await readGrokBot(roots.grokBot, sink, now);
   } catch {}
   for (const p of Object.keys(cursor))
     if (!seen.has(p))
