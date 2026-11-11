@@ -78,9 +78,15 @@ bunx nomo-ai uninstall --cursor   # remove Nomo from an agent you name
 
 They run the same plugin code as the in-agent commands (`/nomo-cc:pair`, `$nomo-reset`, `/nomo-status`,
 …), and pairing, sessions and the watchdog are shared by every agent on a computer, so one `reset` or
-`pair` here covers all of them. After `bun add -g nomo-ai` (or `npm install -g nomo-ai`) the short form
-`nomo pair`, `nomo status`, … works too. Never type `bunx nomo` or `npx nomo`: the npm package named
-`nomo` is someone else's.
+`pair` here covers all of them.
+
+**Short `nomo` command (optional).** At the end of an install in a terminal, the installer asks whether to
+also install `nomo`, so you can type `nomo pair`, `nomo status`, … (default No; `--global` says yes
+without asking, and it is never asked without a terminal or with `-y`). Yes runs `bun add -g nomo-ai`
+(or `npm install -g nomo-ai` when not run from bun) — no `sudo`. If that fails, or its folder is not on
+your PATH, it says so in one line and `bunx nomo-ai …` keeps working. Uninstall leaves it; remove it with
+`bun remove -g nomo-ai` (or `npm uninstall -g nomo-ai`). Never type `bunx nomo` or `npx nomo`: the npm
+package named `nomo` is someone else's.
 
 **Grok Bot only (macOS).** The Grok Bot app has no hooks, so `--grokbot` adds an hourly background job
 instead (see [Grok Bot background job](#grok-bot-background-job)); then pair with `bunx nomo-ai pair`.
@@ -523,6 +529,11 @@ process. Codex has no plugin update verb: with a `local` marketplace (`source_ty
   runtime rules in [Runtime and launch](#runtime-and-launch) apply. Nothing installed → one line saying
   to run `bunx nomo-ai` first. Output and exit status are the entry's own. An unknown word is refused,
   never treated as an install.
+- **Short command offer.** Only after Nomo is installed, only in a terminal (or with `--global`), default
+  No. It runs exactly `bun add -g nomo-ai` or `npm install -g nomo-ai` (shown first; `-n` only shows it),
+  never with `sudo`, and a failure never changes the exit status. A `nomo` already on PATH counts as
+  this package only if it resolves to `bin/nomo-ai.mjs` beside a `package.json` named `nomo-ai`; any
+  other `nomo` is left alone and never run.
 - `--ref <branch|tag>` applies only to the `~/.nomo` checkout (Claude/Codex marketplaces read the
   default branch, and the installer says so). The checkout is left **detached** so a later plain run
   recognises the pin and refuses to fast-forward it.

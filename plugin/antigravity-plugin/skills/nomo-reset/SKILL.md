@@ -1,6 +1,6 @@
 ---
 name: nomo-reset
-description: Clear stuck or ghost Nomo sessions from the iPhone app without disconnecting the phone. Run ONLY when the user types /nomo-reset — never on your own.
+description: Clear stuck or ghost Nomo sessions from the iPhone app without disconnecting the phone, and send the activity summary (heatmap and streak) now. Run ONLY when the user types /nomo-reset — never on your own.
 ---
 
 **How to talk to the user.** Nomo users are often not technical. Reply in plain, friendly words,

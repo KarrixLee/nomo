@@ -1,6 +1,6 @@
 ---
 name: nomo-reset
-description: Reset stuck Nomo session state — stop the watchdog and clear dead/phantom session rows without unpairing
+description: Reset stuck Nomo session state — stop the watchdog, clear dead/phantom session rows and send the activity summary (heatmap and streak) now, without unpairing
 disable-model-invocation: true
 ---
 

@@ -292,3 +292,127 @@ describe("commands: pair / status / reset / uninstall", () => {
   });
 });
 
+
+describe("the optional short `nomo` command", () => {
+  /** A machine where the Claude leg succeeds (fake `claude`) and `npm` is a fake that logs its argv.
+   *  npm modes: ok = links <home>/gbin/nomo → this package's bin; fail = exits 1; offpath = exits 0 but
+   *  its bin folder is not on PATH. `foreign` puts some other program called `nomo` on PATH. */
+  async function box(npm: "ok" | "fail" | "offpath", opts: { foreign?: boolean } = {}) {
+    const h = await mkdtemp(join(tmpdir(), "nomo-ai-short-"));
+    homes.push(h);
+    const bin = join(h, "bin");
+    const gbin = join(h, "gbin");
+    await mkdir(bin, { recursive: true });
+    await mkdir(gbin, { recursive: true });
+    await writeFile(join(bin, "claude"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const log = join(h, "npm.log");
+    const install = npm === "ok" ? `ln -s '${NOMO_AI}' '${gbin}/nomo'; exit 0` : npm === "fail" ? "exit 1" : "exit 0";
+    await writeFile(join(bin, "npm"), `#!/bin/sh\necho "$*" >> '${log}'\ncase "$1" in\n  prefix) echo '${h}/elsewhere'; exit 0 ;;\n  install) ${install} ;;\nesac\nexit 0\n`, { mode: 0o755 });
+    if (opts.foreign) await writeFile(join(bin, "nomo"), "#!/bin/sh\necho not ours\n", { mode: 0o755 });
+    return { h, log, path: `${bin}:${gbin}:/usr/bin:/bin` };
+  }
+  async function cli(b: { h: string; path: string }, flags: string[], ask: boolean, answer = "") {
+    const proc = spawnTestProcess({
+      cmd: [Bun.which("node")!, NOMO_AI, ...flags],
+      cwd: b.h,
+      env: isolatedTestEnv(b.h, { NO_COLOR: "1", PATH: b.path, npm_config_user_agent: "", NOMO_AI_TEST_ASK: ask ? "1" : undefined }),
+      stdin: new Blob([answer]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    return { code: await proc.exited, out: `${out}${err}` };
+  }
+  const npmCalls = async (log: string) => (await readFile(log, "utf8").catch(() => "")).trim();
+  const Q = "Also install the short nomo command, so you can type nomo pair? (y/N)";
+
+  test("no terminal: never asked, never installed; hints keep `bunx nomo-ai`", async () => {
+    const b = await box("ok");
+    const r = await cli(b, ["--claude"], false);
+    expect(r.code).toBe(0);
+    expect(r.out).not.toContain(Q);
+    expect(await npmCalls(b.log)).toBe("");
+    expect(r.out).toContain("`bunx nomo-ai pair` from any folder");
+  });
+
+  test("asked in a terminal; Enter (default No) installs nothing", async () => {
+    const b = await box("ok");
+    const r = await cli(b, ["--claude"], true, "\n");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(Q);
+    expect(await npmCalls(b.log)).toBe("");
+    expect(r.out).toContain("`bunx nomo-ai pair` from any folder");
+  });
+
+  test("--yes never asks", async () => {
+    const b = await box("ok");
+    const r = await cli(b, ["--claude", "-y"], true, "y\n");
+    expect(r.out).not.toContain(Q);
+    expect(await npmCalls(b.log)).toBe("");
+  });
+
+  test("yes: shows and runs `npm install -g nomo-ai`, confirms it is ours, hints switch to `nomo`", async () => {
+    const b = await box("ok");
+    const r = await cli(b, ["--claude"], true, "y\n");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("$ npm install -g nomo-ai");
+    expect(await npmCalls(b.log)).toBe("install -g nomo-ai");
+    expect(r.out).toContain("`nomo pair` from any folder");
+  });
+
+  test("a failed install is one line with the hand command, and the exit status stays 0", async () => {
+    const b = await box("fail");
+    const r = await cli(b, ["--claude"], true, "y\n");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("Could not install it (nothing else changed). To try by hand: npm install -g nomo-ai");
+    expect(r.out).toContain("`bunx nomo-ai pair` from any folder");
+  });
+
+  test("installed but its bin folder is not on PATH: says which folder, keeps `bunx nomo-ai`", async () => {
+    const b = await box("offpath");
+    const r = await cli(b, ["--claude"], true, "y\n");
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`Installed, but ${b.h}/elsewhere/bin is not on your PATH`);
+    expect(r.out).toContain("`bunx nomo-ai pair` from any folder");
+  });
+
+  test("another program called `nomo` on PATH: not asked, not run, one line, `bunx nomo-ai` kept", async () => {
+    const b = await box("ok", { foreign: true });
+    const r = await cli(b, ["--claude"], true, "y\n");
+    expect(r.out).toContain("Another program called `nomo` is already on your PATH");
+    expect(r.out).not.toContain(Q);
+    expect(r.out).not.toContain("not ours"); // never executed
+    expect(await npmCalls(b.log)).toBe("");
+  });
+
+  test("ours already on PATH: no question, hints use `nomo`", async () => {
+    const b = await box("ok");
+    const { symlink } = await import("node:fs/promises");
+    await symlink(NOMO_AI, join(b.h, "gbin", "nomo"));
+    const r = await cli(b, ["--claude"], true, "y\n");
+    expect(r.out).not.toContain(Q);
+    expect(await npmCalls(b.log)).toBe("");
+    expect(r.out).toContain("`nomo pair` from any folder");
+  });
+
+  test("--global installs without asking; with -n it only shows the plan", async () => {
+    const b = await box("ok");
+    const dry = await cli(b, ["--claude", "--global", "-n"], false);
+    expect(dry.code).toBe(0);
+    expect(dry.out).toContain("would run: npm install -g nomo-ai");
+    expect(await npmCalls(b.log)).toBe("");
+    const r = await cli(b, ["--claude", "--global"], false);
+    expect(r.out).not.toContain(Q);
+    expect(await npmCalls(b.log)).toBe("install -g nomo-ai");
+  });
+
+  test("uninstall leaves the short command and names how to remove it", async () => {
+    const b = await box("ok");
+    const { symlink } = await import("node:fs/promises");
+    await symlink(NOMO_AI, join(b.h, "gbin", "nomo"));
+    const r = await cli(b, ["uninstall", "--claude"], false);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("The short `nomo` command stays. To remove it too: npm uninstall -g nomo-ai");
+    expect(await npmCalls(b.log)).toBe("");
+  });
+});

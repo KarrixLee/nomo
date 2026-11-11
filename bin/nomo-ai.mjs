@@ -32,7 +32,7 @@
 //     marketplace is install-time behaviour; it has no business in an update.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, readdirSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
@@ -103,6 +103,8 @@ Options:
   -y, --yes               no prompt; install every agent detected on this machine
       --uninstall         same as the \`uninstall\` command
   -n, --dry-run           print the commands that would run, run nothing
+      --global            also install the short \`nomo\` command (asked, default No, in a
+                          terminal; this flag says yes without asking)
       --ref <branch|tag>  OpenCode, Cursor, Antigravity and Grok Bot only: install from
                           this ref of the repo instead of its default branch. Claude Code
                           and Codex install through their own marketplaces, which read the
@@ -645,10 +647,10 @@ const AGENTS = [
             `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
             `node ${GROKBOT_SCRIPT}`,
           ],
-    next: () =>
+    next: (/** @type {string} */ cli) =>
       STATUS.get("grokbot")?.installed
         ? ["nothing to restart — the next hourly run uses the update"]
-        : ["if this Mac is not paired yet, pair it (then scan the QR):", "  bunx nomo-ai pair", "check it works:", "  bunx nomo-ai status"],
+        : ["if this Mac is not paired yet, pair it (then scan the QR):", `  ${cli} pair`, "check it works:", `  ${cli} status`],
     uninstallScript: GROKBOT_SCRIPT,
     detect: () =>
       process.platform === "darwin" &&
@@ -735,6 +737,7 @@ function parseArgs(argv) {
   let all = false;
   let yes = false;
   let uninstall = false;
+  let global = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") return { help: true };
@@ -742,6 +745,7 @@ function parseArgs(argv) {
     else if (a === "-y" || a === "--yes") yes = true;
     else if (a === "-n" || a === "--dry-run") DRY = true;
     else if (a === "--uninstall") uninstall = true;
+    else if (a === "--global") global = true;
     else if (a === "--all") {
       all = true;
       for (const ag of AGENTS) picked.add(ag.id);
@@ -755,7 +759,7 @@ function parseArgs(argv) {
       named.add(a.slice(2));
     } else return { bad: a };
   }
-  return { picked, yes, all, named, uninstall };
+  return { picked, yes, all, named, uninstall, global };
 }
 
 /** --ref reaches exactly one leg. Saying so out loud is the whole point: a flag that reads as
@@ -1111,6 +1115,8 @@ function uninstall(selected) {
     }
     say();
   }
+  // Not removed here: every agent's terminal commands use it, not just the one being removed.
+  if (shortCommandState() === "ours") say(dim(`The short \`nomo\` command stays. To remove it too: ${globalInstallCmd(true).join(" ")}`));
   return failures.length > 0 ? 1 : 0;
 }
 
@@ -1181,6 +1187,108 @@ function runCommand(name, rest) {
     return exec(["wait"]);
   }
   return code;
+}
+
+// ── the short `nomo` command (optional) ──────────────────────────────────────────────────────────
+//
+// `nomo pair` instead of `bunx nomo-ai pair`, by installing this same package globally (its second bin
+// is `nomo`). Offered once after a successful install, default No; `--global` says yes without asking.
+// Never `bunx nomo` / `npx nomo`: that npm package is someone else's. No sudo, ever — a failed install
+// is one line and the run's exit status is unchanged.
+
+/** Is `nomo` on PATH, and is it THIS package? Decided from the file it resolves to (bin/nomo-ai.mjs
+ *  with a package.json named nomo-ai beside it) — a foreign `nomo` is never executed to find out.
+ *  `node_modules/.bin` entries are skipped: npx/bunx put the package's own bins there while it runs,
+ *  which is not an install.
+ *  @returns {"ours" | "foreign" | "missing"} */
+function shortCommandState() {
+  for (const dir of (process.env.PATH || "").split(":")) {
+    if (!dir || dir.endsWith("/node_modules/.bin")) continue;
+    const p = join(dir, "nomo");
+    try {
+      accessSync(p, constants.X_OK);
+    } catch {
+      continue;
+    }
+    try {
+      const real = realpathSync(p);
+      const pkg = JSON.parse(readFileSync(join(dirname(real), "..", "package.json"), "utf8"));
+      return real.endsWith("/bin/nomo-ai.mjs") && pkg.name === "nomo-ai" ? "ours" : "foreign";
+    } catch {
+      return "foreign";
+    }
+  }
+  return "missing";
+}
+
+/** bun when this run came from bun (bunx / `bun x` say so in npm_config_user_agent), else npm.
+ *  @param {boolean} [remove] */
+function globalInstallCmd(remove = false) {
+  const bun = !!process.versions.bun || /^bun\//.test(process.env.npm_config_user_agent || "") || (!onPath("npm") && onPath("bun"));
+  if (bun) return ["bun", remove ? "remove" : "add", "-g", "nomo-ai"];
+  return ["npm", remove ? "uninstall" : "install", "-g", "nomo-ai"];
+}
+
+/** The folder the package manager links global commands into, for the not-on-PATH line. */
+function globalBinDir(/** @type {string} */ pm) {
+  const r = pm === "bun"
+    ? spawnSync("bun", ["pm", "bin", "-g"], { encoding: "utf8", timeout: 5000 })
+    : spawnSync("npm", ["prefix", "-g"], { encoding: "utf8", timeout: 5000 });
+  const out = (r.stdout || "").trim().split("\n").pop() || "";
+  return out ? (pm === "bun" ? out : join(out, "bin")) : "its global bin folder";
+}
+
+/** A yes/no question, default No. Only ever called with a terminal (or the test seam).
+ *  @param {string} q */
+async function askYesNo(q) {
+  const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+  try {
+    return /^y(es)?$/i.test((await rl.question(q)).trim());
+  } catch {
+    say();
+    return false; // Ctrl-D
+  } finally {
+    rl.close();
+  }
+}
+
+/** Offer (or, with --global, do) the global install. Returns whether `nomo` is now usable and ours —
+ *  which decides the form the Next: hints print. Never fails the run. `mayAsk` is false under --yes.
+ *  @param {boolean} flag @param {boolean} mayAsk */
+async function offerShortCommand(flag, mayAsk) {
+  const state = shortCommandState();
+  if (state === "ours") return true;
+  if (state === "foreign") {
+    say(dim("Another program called `nomo` is already on your PATH — keep using `bunx nomo-ai`."));
+    say();
+    return false;
+  }
+  // NOMO_AI_TEST_ASK: test seam — the suite has no terminal, and this is the only prompt it needs to drive.
+  if (!flag && !(mayAsk && (interactive() || process.env.NOMO_AI_TEST_ASK === "1"))) return false;
+  if (!flag && !(await askYesNo(`Also install the short ${bold("nomo")} command, so you can type ${bold("nomo pair")}? (y/N) `))) {
+    say();
+    return false;
+  }
+  const [pm, ...rest] = globalInstallCmd();
+  say(bold("Short `nomo` command"));
+  const fail = run(pm, rest);
+  if (DRY) {
+    say();
+    return false;
+  }
+  if (fail) {
+    say(`  Could not install it (nothing else changed). To try by hand: ${[pm, ...rest].join(" ")}`);
+    say();
+    return false;
+  }
+  if (shortCommandState() === "ours") {
+    say("  ok");
+    say();
+    return true;
+  }
+  say(`  Installed, but ${globalBinDir(pm)} is not on your PATH — add it, or keep using \`bunx nomo-ai\`.`);
+  say();
+  return false;
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────────────────────────
@@ -1313,15 +1421,20 @@ async function main() {
   }
 
   const done = AGENTS.filter((a) => selected.has(a.id) && !failures.some((f) => f.agent === a));
+  // The optional short command: only once Nomo is actually here (a leg succeeded, or it already was).
+  const short = done.length > 0 || AGENTS.some((a) => STATUS.get(a.id)?.installed)
+    ? await offerShortCommand(!!args.global, !args.yes)
+    : false;
+  const cli = short ? "nomo" : "bunx nomo-ai";
   if (done.length > 0 && !DRY) {
     say(bold("Next:"));
     for (const a of done) {
       say(`  ${a.label}`);
       // A two-space prefix marks a line to TYPE (as in showUpdate): no bullet, so it copies clean.
-      for (const step of a.next()) say(step.startsWith("  ") ? `      ${bold(step.trim())}` : `    - ${step}`);
+      for (const step of a.next(cli)) say(step.startsWith("  ") ? `      ${bold(step.trim())}` : `    - ${step}`);
     }
     say();
-    say(dim("Pairing is one QR scan from the Nomo app's Sessions tab. One pairing covers every agent."));
+    say(dim(`Pairing is one QR scan from the Nomo app's Sessions tab (\`${cli} pair\` from any folder). One pairing covers every agent.`));
     say(dim("Docs: https://docs.nomo.gg"));
   }
 
