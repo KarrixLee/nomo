@@ -189,7 +189,8 @@ agent: session count, prompt count, which 5-minute slots had activity, and token
 each message's time, id and whether you or the bot sent it, plus the bot's id — never the text, the bot's
 name or your account id; the text is discarded while the file is read. The ids stay on your computer (as
 short hashes, only to avoid counting a message twice). What is sent for Grok Bot is, per day, how many
-Bots you used, how many messages you sent and when you were active, with no token counts. Rows are kept in
+Bots you used, how many messages you sent and when you were active, with no token counts; a day counts
+only when you sent Grok Bot a message that day. Rows are kept in
 `~/.config/cc-status/activity-days.json` (at most 400 days) and, at most every 6 hours and only when
 changed, sealed and uploaded to `/v1/cc/full` (`what: "activity"`); right after pairing a new phone the
 existing rows go up once within about a minute, and after a plugin update new rows go up at the next

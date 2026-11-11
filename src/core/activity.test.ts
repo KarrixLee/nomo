@@ -234,6 +234,40 @@ describe("grok bot", () => {
     expect(buildPayload(st2, NOW).days).toEqual(buildPayload(st, NOW).days);
   });
 
+  const slots = (r: { b: string }) => {
+    const b = Buffer.from(r.b, "base64");
+    return [...Array(288).keys()].filter((i) => b[i >> 3] & (0x80 >> (i & 7)));
+  };
+
+  test("a day counts only if the person sent a message that day; output from any Bot counts on such a day", async () => {
+    transcript(BOT_A, [
+      reply("t1s0", "2026-11-05T01:00:00Z"), // 10:00 JST 11-05: a routine, nobody prompted that day
+      prompt("t2u", "2026-11-06T01:00:00Z"), // 10:00 JST 11-06
+    ]);
+    transcript(BOT_B, [reply("t7s0", "2026-11-06T03:00:00Z")]); // 12:00 JST 11-06, no prompt to B
+    const st = emptyState();
+    await scanAll(st, {}, roots, NOW);
+    expect(row(st, "2026-11-05", "grokbot")).toBeUndefined();
+    const r6 = row(st, "2026-11-06", "grokbot")!;
+    expect(r6).toMatchObject({ s: 2, t: 1 });
+    expect(slots(r6)).toEqual([120, 144]);
+  });
+
+  test("output dropped earlier counts once a prompt arrives later that day; re-scans stay idempotent", async () => {
+    transcript(BOT_A, [reply("t1s0", "2026-11-07T01:00:00Z")]); // 10:00 JST
+    const st = emptyState();
+    await scanAll(st, {}, roots, NOW);
+    expect(row(st, "2026-11-07", "grokbot")).toBeUndefined();
+    transcript(BOT_A, [reply("t1s0", "2026-11-07T01:00:00Z"), prompt("t2u", "2026-11-07T11:00:00Z")]); // 20:00 JST
+    await scanAll(st, {}, roots, NOW);
+    const r7 = row(st, "2026-11-07", "grokbot")!;
+    expect(r7).toMatchObject({ s: 1, t: 1 });
+    expect(slots(r7)).toEqual([120, 240]);
+    const st2 = parseState(serializeState(st));
+    await scanAll(st2, {}, roots, NOW);
+    expect(buildPayload(st2, NOW).days).toEqual(buildPayload(st, NOW).days);
+  });
+
   test("missing folder is a silent no-op", async () => {
     rmSync(roots.grokBot, { recursive: true });
     const st = emptyState();

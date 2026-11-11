@@ -10,7 +10,8 @@
 // prompt or reply text (a user line's text is looked at only to tell a real prompt from a tool echo).
 // Grok Bot: only each entry's kind/role, id and timestamp plus the bot uuid from the file name are used —
 // never its text, the bot's name or the account id in the key (decoded, matched, discarded). The ids only
-// feed the local dedupe hashes and the per-day Bot count; message text is dropped while parsing.
+// feed the local dedupe hashes and the per-day Bot count; message text is dropped while parsing. A Grok
+// Bot day counts only when the person sent a message that day (bot output alone never makes a day).
 // What leaves the Mac: per day+agent session/turn counts, a 5-minute activity bitmap and per-model
 // token sums, sealed with the pairing's e2eKey. No project names or paths (`p` is reserved, unsent).
 //
@@ -465,8 +466,15 @@ const GB_KEY = /\.transcript\.replicas\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-
 
 /** Grok Bot keeps the latest ~200 entries per bot in `<base32(key)>.blob`; files are tiny, so every cycle
  *  re-reads them all and the hot-row id hashes absorb the overlap (no cursor). Entry ids are per-bot turn
- *  counters (`t12u` = the person's turn 12, `t12s3` = a bot reply to it), so the id carries the bot uuid. */
+ *  counters (`t12u` = the person's turn 12, `t12s3` = a bot reply to it), so the id carries the bot uuid.
+ *
+ *  A DAY COUNTS ONLY IF THE PERSON SENT A MESSAGE THAT LOCAL DAY (any Bot). Bot output is kept only on
+ *  such days, so a scheduled routine or a task running past midnight cannot keep the streak alive on its
+ *  own. Dropped output is not sunk (nor hashed): a prompt later that day makes the next scan count it.
+ *  Ceiling: once a prompt has left the app's ~200-entry window, its surviving replies count only if an
+ *  earlier scan already counted them. */
 async function readGrokBot(dir: string, sink: Sink): Promise<void> {
+  const events: ActivityEvent[] = [];
   for (const f of await listFiles(dir, (n) => n.endsWith(".blob"))) {
     const bot = base32(basename(f, ".blob"))?.match(GB_KEY)?.[1];
     if (!bot) continue; // roster, usage cache, ui state, …
@@ -477,10 +485,12 @@ async function readGrokBot(dir: string, sink: Sink): Promise<void> {
       for (const e of JSON.parse(await readFile(f, "utf8"), keep).value.entries) {
         const kind = e?.kind === "message" && e.role === "user" ? "turn" : e?.kind === "send-message" ? "assistant" : null;
         if (!kind || e.isStreaming || !Number.isFinite(e.timestampMs) || typeof e.id !== "string") continue;
-        sink({ ts: e.timestampMs, agent: "grokbot", sessionId: bot, kind, id: `gb:${bot}:${e.id}` });
+        events.push({ ts: e.timestampMs, agent: "grokbot", sessionId: bot, kind, id: `gb:${bot}:${e.id}` });
       }
     } catch { /* corrupt file or unknown schema: skip it */ }
   }
+  const prompted = new Set(events.filter((ev) => ev.kind === "turn").map((ev) => localDate(ev.ts)));
+  for (const ev of events) if (prompted.has(localDate(ev.ts))) sink(ev);
 }
 
 /** Scan every agent into `state`, updating `cursor`. `checkpoint` is awaited every SAVE_EVERY_BYTES so

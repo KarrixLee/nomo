@@ -1544,6 +1544,7 @@ function base32(s) {
 }
 var GB_KEY = /\.transcript\.replicas\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 async function readGrokBot(dir, sink) {
+  const events = [];
   for (const f of await listFiles(dir, (n) => n.endsWith(".blob"))) {
     const bot = base32(basename2(f, ".blob"))?.match(GB_KEY)?.[1];
     if (!bot)
@@ -1554,10 +1555,14 @@ async function readGrokBot(dir, sink) {
         const kind = e?.kind === "message" && e.role === "user" ? "turn" : e?.kind === "send-message" ? "assistant" : null;
         if (!kind || e.isStreaming || !Number.isFinite(e.timestampMs) || typeof e.id !== "string")
           continue;
-        sink({ ts: e.timestampMs, agent: "grokbot", sessionId: bot, kind, id: `gb:${bot}:${e.id}` });
+        events.push({ ts: e.timestampMs, agent: "grokbot", sessionId: bot, kind, id: `gb:${bot}:${e.id}` });
       }
     } catch {}
   }
+  const prompted = new Set(events.filter((ev) => ev.kind === "turn").map((ev) => localDate(ev.ts)));
+  for (const ev of events)
+    if (prompted.has(localDate(ev.ts)))
+      sink(ev);
 }
 async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
   const sink = (ev) => {
