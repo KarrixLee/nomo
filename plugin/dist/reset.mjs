@@ -3,6 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/reset.ts
 import { execFileSync as execFileSync2 } from "node:child_process";
+import { existsSync as existsSync3 } from "node:fs";
 import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
 import { basename as basename3 } from "node:path";
 
@@ -1715,6 +1716,13 @@ function classifyResetSession(record, isAlive) {
     return "clear";
   return isAlive(record.pid) ? "keep" : "clear";
 }
+function grokBotJobInstalled(path = `${process.env.HOME}/Library/LaunchAgents/gg.nomo.activity.plist`) {
+  try {
+    return process.platform === "darwin" && existsSync3(path);
+  } catch {
+    return false;
+  }
+}
 function psCommandOf(pid) {
   try {
     const out = execFileSync2("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
@@ -1770,19 +1778,20 @@ async function reset(deps = {}) {
   const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
   const isAlive = deps.isAlive ?? pidAlive;
   const wd = await stopWatchdog(deps);
-  if (wd === "killed")
-    print("Stopped the watchdog (it restarts automatically on your next session).");
-  else if (wd === "stale-pidfile")
-    print("Removed a stale watchdog pidfile (no watchdog was running).");
-  else
-    print("No watchdog running.");
-  const config = await (deps.loadConfigFn ?? loadConfig)();
   let files = [];
   try {
     files = (await readdir2(sessionsDir)).filter((f) => f.endsWith(".json"));
   } catch {
     files = [];
   }
+  const grokBotWording = files.length === 0 && grokBotJobInstalled(deps.grokBotPlistPath);
+  if (wd === "killed") {
+    print(grokBotWording ? "Stopped the watchdog (the hourly Grok Bot job keeps counting your days)." : "Stopped the watchdog (it restarts automatically on your next session).");
+  } else if (wd === "stale-pidfile")
+    print("Removed a stale watchdog pidfile (no watchdog was running).");
+  else
+    print("No watchdog running.");
+  const config = await (deps.loadConfigFn ?? loadConfig)();
   let cleared = 0;
   let ended = 0;
   let kept = 0;

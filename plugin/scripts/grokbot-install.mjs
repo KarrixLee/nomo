@@ -33,6 +33,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const RUN = join(ROOT, "scripts", "run.sh");
 const WATCHDOG = join(ROOT, "dist", "cc-watchdog.mjs");
 const LABEL = "gg.nomo.activity";
+// Same path as grokBotJobInstalled's default in src/entries/reset.ts (reset reads it) — keep them in step.
 const PLIST = join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
 const INTERVAL_S = 3600;
 

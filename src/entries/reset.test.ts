@@ -71,6 +71,7 @@ describe("reset (end-to-end with injected seams)", () => {
     }) as unknown as typeof fetch;
 
     const code = await reset({
+      grokBotPlistPath: "/nonexistent/gg.nomo.activity.plist", // never the developer's real one
       print: (l) => lines.push(l),
       fetchFn,
       loadConfigFn: async () => CONFIG,
@@ -114,6 +115,7 @@ describe("reset (end-to-end with injected seams)", () => {
     const killed: number[] = [];
     const lines: string[] = [];
     const code = await reset({
+      grokBotPlistPath: "/nonexistent/gg.nomo.activity.plist", // never the developer's real one
       print: (l) => lines.push(l),
       fetchFn: (async () => { throw new Error("must not POST while unpaired"); }) as unknown as typeof fetch,
       loadConfigFn: async () => null,
@@ -136,6 +138,7 @@ describe("reset (end-to-end with injected seams)", () => {
     const dir = await mkdtemp(join(tmpdir(), "nomo-reset-"));
     const lines: string[] = [];
     const code = await reset({
+      grokBotPlistPath: "/nonexistent/gg.nomo.activity.plist", // never the developer's real one
       print: (l) => lines.push(l),
       loadConfigFn: async () => null,
       sessionsDir: join(dir, "sessions"), // doesn't exist
@@ -153,6 +156,7 @@ describe("reset (end-to-end with injected seams)", () => {
       const lines: string[] = [];
       const seen: unknown[] = [];
       const code = await reset({
+      grokBotPlistPath: "/nonexistent/gg.nomo.activity.plist", // never the developer's real one
         print: (l) => lines.push(l),
         loadConfigFn: async () => config,
         sessionsDir: join(dir, "sessions"),
@@ -188,6 +192,38 @@ describe("reset (end-to-end with injected seams)", () => {
       expect(r.code).toBe(0);
       expect(r.seen).toEqual([]);
       expect(r.all).not.toContain("activity");
+    });
+  });
+
+  describe("the stopped-watchdog line on a computer with the Grok Bot job", () => {
+    const run = async (opts: { plist: boolean; session: boolean }) => {
+      const dir = await mkdtemp(join(tmpdir(), "nomo-reset-"));
+      const sessions = join(dir, "sessions");
+      const { mkdir } = await import("node:fs/promises");
+      await mkdir(sessions, { recursive: true });
+      if (opts.session) await writeFile(join(sessions, "live.json"), JSON.stringify(rec({ pid: 222 })));
+      const plist = join(dir, "gg.nomo.activity.plist");
+      if (opts.plist) await writeFile(plist, "<plist/>");
+      await writeFile(join(dir, "watchdog.pid"), "555");
+      const lines: string[] = [];
+      const code = await reset({
+        print: (l) => lines.push(l), loadConfigFn: async () => null, sessionsDir: sessions,
+        watchdogPidPath: join(dir, "watchdog.pid"), grokBotPlistPath: plist,
+        isAlive: (pid) => pid === 222, commandOf: () => "bun /x/dist/cc-watchdog.mjs", killPid: () => {},
+      });
+      expect(code).toBe(0);
+      return lines[0];
+    };
+    const GROK = "Stopped the watchdog (the hourly Grok Bot job keeps counting your days).";
+    const TODAY = "Stopped the watchdog (it restarts automatically on your next session).";
+    test("job installed and no session records: names the hourly job", async () => {
+      expect(await run({ plist: true, session: false })).toBe(process.platform === "darwin" ? GROK : TODAY);
+    });
+    test("job installed but a session record exists: today's line", async () => {
+      expect(await run({ plist: true, session: true })).toBe(TODAY);
+    });
+    test("no job: today's line", async () => {
+      expect(await run({ plist: false, session: false })).toBe(TODAY);
     });
   });
 });
