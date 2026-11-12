@@ -3115,7 +3115,7 @@ function renderOther(r, print) {
       print(cont(`→ ${p.fix}`));
   }
   if (r.problems.length > 0)
-    print(cont(`→ full detail: run ${ui.status} inside ${ui.name}`));
+    print(cont(`→ full detail: run ${ui.status} inside ${ui.name}, or bunx nomo-ai status`));
 }
 function countCodexHookEvents(raw) {
   let parsed;
@@ -3328,6 +3328,7 @@ async function statusCmd(deps = {}) {
   const codexAppServerAvailable = deps.codexAppServerAvailable ?? (() => codexAppServerSocketAvailable());
   const audience = deps.audience;
   const ui = AGENT_UI[audience ?? "claude"];
+  const pairHint = audience ? `${ui.pair} (or bunx nomo-ai pair)` : "bunx nomo-ai pair (or your agent's pair command)";
   print(audience ? `Nomo ${PLUGIN_VERSION} · ${AGENT_UI[audience].name}` : `Nomo ${PLUGIN_VERSION}`);
   let raw = null;
   try {
@@ -3340,10 +3341,10 @@ async function statusCmd(deps = {}) {
     print(row("Phone", `paired · ${config.url} · pairing ${config.pairingId.slice(0, 8)}…`));
   } else if (pending) {
     print(row("Phone", "waiting for the QR scan — pairing was started but no phone has claimed it"));
-    print(cont(`→ run ${ui.pair} to finish or retry`));
+    print(cont(`→ run ${pairHint} to finish or retry`));
   } else {
     print(row("Phone", "NOT PAIRED — nothing from this computer reaches the app"));
-    print(cont(`→ run ${ui.pair}`));
+    print(cont(`→ run ${pairHint}`));
   }
   const [rtName, rtVersion] = deps.runtime ?? (process.versions.bun ? ["bun", process.versions.bun] : ["node", process.versions.node]);
   const floor = runtimeFloorWarning(rtName, rtVersion);
@@ -3379,7 +3380,7 @@ async function statusCmd(deps = {}) {
       print(row("Approvals", "on — permission prompts are held and sent to your phone"));
     } else {
       print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));
-      print(cont(`→ run ${ui.approvalsOn}`));
+      print(cont(audience ? `→ run ${ui.approvalsOn}` : `→ run your agent's approvals command, e.g. ${ui.approvalsOn}`));
     }
   }
   const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0 };

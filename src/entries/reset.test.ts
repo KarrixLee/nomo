@@ -100,7 +100,7 @@ describe("reset (end-to-end with injected seams)", () => {
     expect(all).toContain("Stopped the watchdog");
     expect(all).toContain("Cleared 3 stale session records (3 end signals delivered to your phone).");
     expect(all).toContain("Left 1 live session untouched.");
-    expect(all).toContain("Pairing and keys were not touched");
+    expect(all).toContain("Pairing and keys were not touched — to disconnect this computer, run bunx nomo-ai unpair (or your agent's unpair command).");
   });
 
   test("a recycled pid is NOT killed; unpaired sweep still clears locally", async () => {

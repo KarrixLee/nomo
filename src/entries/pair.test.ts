@@ -1192,7 +1192,9 @@ describe("statusCmd", () => {
     const out = lines.join("\n");
     expect(out).toContain("Phone");
     expect(out).toContain("NOT PAIRED");
-    expect(out).toContain("→ run /nomo-cc:pair");
+    // Run from a terminal (no agent asked): the fix must work with no agent at all (a Grok Bot-only Mac).
+    expect(out).toContain("→ run bunx nomo-ai pair (or your agent's pair command)");
+    expect(out).not.toContain("/nomo-cc:pair");
     // Delivery and Approvals are meaningless on an unpaired machine — printing them would be four
     // lines of reassurance about a bridge that does not exist.
     expect(out).not.toContain("Delivery");
@@ -1268,9 +1270,9 @@ describe("statusCmd", () => {
     // fixes it is spelled differently in each — /nomo-cc:pair, $nomo-pair, /nomo-pair. Telling a Codex
     // user to type a Claude slash command is the same confusion this whole change is about.
     for (const [audience, heading, pairCmd] of [
-      ["claude", "Claude Code — you are here", "→ run /nomo-cc:pair"],
-      ["codex", "Codex — you are here", "→ run $nomo-pair"],
-      ["opencode", "OpenCode — you are here", "→ run /nomo-pair"],
+      ["claude", "Claude Code — you are here", "→ run /nomo-cc:pair (or bunx nomo-ai pair)"],
+      ["codex", "Codex — you are here", "→ run $nomo-pair (or bunx nomo-ai pair)"],
+      ["opencode", "OpenCode — you are here", "→ run /nomo-pair (or bunx nomo-ai pair)"],
     ] as const) {
       lines.length = 0;
       await statusCmd({
@@ -1387,7 +1389,7 @@ describe("statusCmd", () => {
       expect(out).toContain(`! The OpenCode plugin points at ${gone}, which is gone`);
       expect(out).toContain("→ re-run plugin/scripts/opencode-install.sh from your nomo checkout");
       // A problem in somebody else's agent still points at where the detail lives.
-      expect(out).toContain("→ full detail: run /nomo-status inside OpenCode");
+      expect(out).toContain("→ full detail: run /nomo-status inside OpenCode, or bunx nomo-ai status");
     });
   });
 
@@ -1410,6 +1412,15 @@ describe("statusCmd", () => {
       // The fix must be a command THIS host accepts — a Codex user cannot type a Claude slash command.
       if (paused) expect(out).toContain("→ run $nomo-approvals on");
     }
+    // From a terminal (no agent asked) there is no approvals command to type, so it says whose it is.
+    lines.length = 0;
+    await statusCmd({
+      print, configPath, lastSendPath: join(dir, "last-send"),
+      sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"),
+      codexConfigPath: join(dir, "config.toml"), codexHooksPath: join(dir, "hooks.json"),
+      noHoldPath, codexAppServerAvailable: async () => false, isAlive: () => false,
+    });
+    expect(lines.join("\n")).toContain("→ run your agent's approvals command, e.g. /nomo-cc:approvals on");
   });
 });
 

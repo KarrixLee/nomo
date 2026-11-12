@@ -197,7 +197,7 @@ function renderOther(r: AgentReport, print: (l: string) => void): void {
     print(cont(`! ${p.what}`));
     if (p.fix) print(cont(`→ ${p.fix}`));
   }
-  if (r.problems.length > 0) print(cont(`→ full detail: run ${ui.status} inside ${ui.name}`));
+  if (r.problems.length > 0) print(cont(`→ full detail: run ${ui.status} inside ${ui.name}, or bunx nomo-ai status`));
 }
 
 /** How many hook events in a codex hooks.json register OUR command (grepping for CODEX_HOOK_MARKER
@@ -471,6 +471,9 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   /** The commands to name in a fix. With no calling agent there is no right prefix to suggest, so the
    *  no-argument render falls back to Claude's — the same thing it did before this change. */
   const ui = AGENT_UI[audience ?? "claude"];
+  // A fix that always works: the terminal form needs no agent (a Grok Bot-only Mac has none). Inside an
+  // agent its own command comes first; run from a terminal (no audience), the terminal form does.
+  const pairHint = audience ? `${ui.pair} (or bunx nomo-ai pair)` : "bunx nomo-ai pair (or your agent's pair command)";
 
   // ── header ────────────────────────────────────────────────────────────────────────────────────
   // The build, because every bug report starts with "which version?" and nothing else on this screen
@@ -498,10 +501,10 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   } else if (pending) {
     // Mid-pairing: the QR was printed but no phone has claimed yet — not broken, just unfinished.
     print(row("Phone", "waiting for the QR scan — pairing was started but no phone has claimed it"));
-    print(cont(`→ run ${ui.pair} to finish or retry`));
+    print(cont(`→ run ${pairHint} to finish or retry`));
   } else {
     print(row("Phone", "NOT PAIRED — nothing from this computer reaches the app"));
-    print(cont(`→ run ${ui.pair}`));
+    print(cont(`→ run ${pairHint}`));
   }
 
   // The runtime run.sh picked for every hook (this command runs under the same one).
@@ -549,7 +552,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
       print(row("Approvals", "on — permission prompts are held and sent to your phone"));
     } else {
       print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));
-      print(cont(`→ run ${ui.approvalsOn}`));
+      print(cont(audience ? `→ run ${ui.approvalsOn}` : `→ run your agent's approvals command, e.g. ${ui.approvalsOn}`));
     }
   }
 

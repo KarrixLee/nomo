@@ -1824,7 +1824,7 @@ async function reset(deps = {}) {
     else
       print("Could not send your activity summary right now — it will be sent again automatically later.");
   }
-  print("Pairing and keys were not touched — use the unpair command if you want that.");
+  print("Pairing and keys were not touched — to disconnect this computer, run bunx nomo-ai unpair (or your agent's unpair command).");
   return 0;
 }
 if (__require.main == __require.module) {
