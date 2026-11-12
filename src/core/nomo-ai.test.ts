@@ -11,7 +11,9 @@
 // with no exports (it runs main() on import) — the same reason hook-shim.test.ts drives the real shell
 // scripts rather than reimplementing them. `--dry-run` guarantees nothing is installed or written.
 
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -391,66 +393,106 @@ describe("the optional short `nomo` command", () => {
     if (opts.foreign) await writeFile(join(bin, "nomo"), "#!/bin/sh\necho not ours\n", { mode: 0o755 });
     return { h, log, path: `${bin}:${gbin}:/usr/bin:/bin` };
   }
-  async function cli(b: { h: string; path: string }, flags: string[], ask: boolean, answer = "") {
+  /** Run the installer. `tty: undefined` = plain pipes (no terminal). Otherwise it runs under a REAL
+   *  pty via `script -q /dev/null …` (macOS): once the prompt appears, `tty` is typed — or, for null,
+   *  stdin is closed so the pty delivers end-of-input (^D). stdin stays open otherwise until exit. */
+  async function cli(b: { h: string; path: string }, flags: string[], tty?: string | null) {
+    const env = isolatedTestEnv(b.h, { NO_COLOR: "1", PATH: b.path, npm_config_user_agent: "" });
+    if (tty === undefined) {
+      const proc = spawnTestProcess({
+        cmd: [Bun.which("node")!, NOMO_AI, ...flags], cwd: b.h, env, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+      });
+      const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+      return { code: await proc.exited, out: `${out}${err}` };
+    }
+    // BSD script refuses a socket or a FIFO as stdin (tcgetattr: EOPNOTSUPP), and bun's "pipe" is a
+    // socket. So the test writes a FIFO, `cat` copies it into a real pipe, and closing the FIFO is what
+    // makes the pty deliver end-of-input (^D). Once script (= node) exits, cat is stopped so sh returns
+    // script's status, which is node's.
+    const fifo = join(b.h, `pty-in-${Math.random().toString(36).slice(2)}`);
+    expect(spawnSync("mkfifo", [fifo]).status).toBe(0);
     const proc = spawnTestProcess({
-      cmd: [Bun.which("node")!, NOMO_AI, ...flags],
-      cwd: b.h,
-      env: isolatedTestEnv(b.h, { NO_COLOR: "1", PATH: b.path, npm_config_user_agent: "", NOMO_AI_TEST_ASK: ask ? "1" : undefined }),
-      stdin: new Blob([answer]),
-      stdout: "pipe",
-      stderr: "pipe",
+      cmd: ["/bin/sh", "-c", 'cat "$0" | { /usr/bin/script -q /dev/null "$@"; s=$?; pkill -P $$ cat; exit $s; }', fifo, Bun.which("node")!, NOMO_AI, ...flags],
+      cwd: b.h, env, stdin: "ignore", stdout: "pipe", stderr: "pipe",
     });
-    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-    return { code: await proc.exited, out: `${out}${err}` };
+    const input = await open(fifo, "w"); // resolves once script has opened its end
+    let out = "";
+    let sent = false;
+    const dec = new TextDecoder();
+    for await (const chunk of proc.stdout) {
+      out += dec.decode(chunk);
+      if (!sent && out.includes("(Y/n)")) {
+        sent = true;
+        if (tty === null) await input.close();
+        else await input.write(tty);
+      }
+    }
+    const code = await proc.exited;
+    await input.close().catch(() => {});
+    const err = await new Response(proc.stderr).text();
+    return { code, out: `${out}${err}`.replace(/\r/g, "") };
   }
   const npmCalls = async (log: string) => (await readFile(log, "utf8").catch(() => "")).trim();
-  const Q = "Also install the short nomo command, so you can type nomo pair? (y/N)";
+  const Q = "Also install the short nomo command, so you can type nomo pair? (Y/n)";
+  const hasPty = process.platform === "darwin" && existsSync("/usr/bin/script");
 
   test("no terminal: never asked, never installed; hints keep `bunx nomo-ai`", async () => {
     const b = await box("ok");
-    const r = await cli(b, ["--claude"], false);
+    const r = await cli(b, ["--claude"]);
     expect(r.code).toBe(0);
     expect(r.out).not.toContain(Q);
     expect(await npmCalls(b.log)).toBe("");
     expect(r.out).toContain("`bunx nomo-ai pair` from any folder");
   });
 
-  test("asked in a terminal; Enter (default No) installs nothing", async () => {
+  test.skipIf(!hasPty)("real terminal: Return (the default, Yes) installs, and the hints switch to `nomo`", async () => {
     const b = await box("ok");
-    const r = await cli(b, ["--claude"], true, "\n");
+    const r = await cli(b, ["--claude"], "\n");
     expect(r.code).toBe(0);
     expect(r.out).toContain(Q);
-    expect(await npmCalls(b.log)).toBe("");
-    expect(r.out).toContain("`bunx nomo-ai pair` from any folder");
-  });
-
-  test("--yes never asks", async () => {
-    const b = await box("ok");
-    const r = await cli(b, ["--claude", "-y"], true, "y\n");
-    expect(r.out).not.toContain(Q);
-    expect(await npmCalls(b.log)).toBe("");
-  });
-
-  test("yes: shows and runs `npm install -g nomo-ai`, confirms it is ours, hints switch to `nomo`", async () => {
-    const b = await box("ok");
-    const r = await cli(b, ["--claude"], true, "y\n");
-    expect(r.code).toBe(0);
     expect(r.out).toContain("$ npm install -g nomo-ai");
     expect(await npmCalls(b.log)).toBe("install -g nomo-ai");
     expect(r.out).toContain("`nomo pair` from any folder");
+  }, 20_000);
+
+  test.skipIf(!hasPty)("real terminal: `n` and unrecognised answers skip; `yes` installs", async () => {
+    for (const [answer, installs] of [["n\n", false], ["no\n", false], ["maybe\n", false], ["yes\n", true]] as const) {
+      const b = await box("ok");
+      const r = await cli(b, ["--claude"], answer);
+      expect(r.code).toBe(0);
+      expect(await npmCalls(b.log)).toBe(installs ? "install -g nomo-ai" : "");
+      expect(r.out).toContain(installs ? "`nomo pair` from any folder" : "`bunx nomo-ai pair` from any folder");
+    }
+  }, 40_000);
+
+  test.skipIf(!hasPty)("real terminal: end of input (Ctrl-D) at the prompt = No; the hints still print and the exit is 0", async () => {
+    const b = await box("ok");
+    const r = await cli(b, ["--claude"], null);
+    expect(r.code).toBe(0); // was 13 ("unsettled top-level await") with the hints never printed
+    expect(r.out).not.toContain("unsettled");
+    expect(r.out).toContain("Next:");
+    expect(r.out).toContain("`bunx nomo-ai pair` from any folder");
+    expect(await npmCalls(b.log)).toBe("");
+  }, 20_000);
+
+  test("--yes never asks", async () => {
+    const b = await box("ok");
+    const r = await cli(b, ["--claude", "-y"], hasPty ? "\n" : undefined);
+    expect(r.out).not.toContain(Q);
+    expect(await npmCalls(b.log)).toBe("");
   });
 
-  test("a failed install is one line with the hand command, and the exit status stays 0", async () => {
+  test.skipIf(!hasPty)("a failed install is one line with the hand command, and the exit status stays 0", async () => {
     const b = await box("fail");
-    const r = await cli(b, ["--claude"], true, "y\n");
+    const r = await cli(b, ["--claude"], "\n");
     expect(r.code).toBe(0);
     expect(r.out).toContain("Could not install it (nothing else changed). To try by hand: npm install -g nomo-ai");
     expect(r.out).toContain("`bunx nomo-ai pair` from any folder");
   });
 
-  test("installed but its bin folder is not on PATH: says which folder, keeps `bunx nomo-ai`", async () => {
+  test.skipIf(!hasPty)("installed but its bin folder is not on PATH: says which folder, keeps `bunx nomo-ai`", async () => {
     const b = await box("offpath");
-    const r = await cli(b, ["--claude"], true, "y\n");
+    const r = await cli(b, ["--claude"], "\n");
     expect(r.code).toBe(0);
     expect(r.out).toContain(`Installed, but ${b.h}/elsewhere/bin is not on your PATH`);
     expect(r.out).toContain("`bunx nomo-ai pair` from any folder");
@@ -458,8 +500,8 @@ describe("the optional short `nomo` command", () => {
 
   test("another program called `nomo` on PATH: not asked, not run, one line, `bunx nomo-ai` kept", async () => {
     const b = await box("ok", { foreign: true });
-    const r = await cli(b, ["--claude"], true, "y\n");
-    expect(r.out).toContain("Another program called `nomo` is already on your PATH");
+    const r = await cli(b, ["--claude"], hasPty ? "\n" : undefined);
+    if (hasPty) expect(r.out).toContain("Another program called `nomo` is already on your PATH");
     expect(r.out).not.toContain(Q);
     expect(r.out).not.toContain("not ours"); // never executed
     expect(await npmCalls(b.log)).toBe("");
@@ -469,7 +511,7 @@ describe("the optional short `nomo` command", () => {
     const b = await box("ok");
     const { symlink } = await import("node:fs/promises");
     await symlink(NOMO_AI, join(b.h, "gbin", "nomo"));
-    const r = await cli(b, ["--claude"], true, "y\n");
+    const r = await cli(b, ["--claude"], hasPty ? "\n" : undefined);
     expect(r.out).not.toContain(Q);
     expect(await npmCalls(b.log)).toBe("");
     expect(r.out).toContain("`nomo pair` from any folder");
@@ -477,22 +519,22 @@ describe("the optional short `nomo` command", () => {
 
   test("-n: never asked (even in a terminal); a foreign `nomo` is not mentioned in a non-TTY run", async () => {
     const b = await box("ok");
-    const r = await cli(b, ["--claude", "-n"], true, "y\n");
+    const r = await cli(b, ["--claude", "-n"], hasPty ? "\n" : undefined);
     expect(r.out).not.toContain(Q);
     expect(r.out).not.toContain("would run: npm");
     expect(await npmCalls(b.log)).toBe("");
     const f = await box("ok", { foreign: true });
-    const quiet = await cli(f, ["--claude"], false);
+    const quiet = await cli(f, ["--claude"]);
     expect(quiet.out).not.toContain("Another program called `nomo`");
   });
 
   test("--global installs without asking; with -n it only shows the plan", async () => {
     const b = await box("ok");
-    const dry = await cli(b, ["--claude", "--global", "-n"], false);
+    const dry = await cli(b, ["--claude", "--global", "-n"]);
     expect(dry.code).toBe(0);
     expect(dry.out).toContain("would run: npm install -g nomo-ai");
     expect(await npmCalls(b.log)).toBe("");
-    const r = await cli(b, ["--claude", "--global"], false);
+    const r = await cli(b, ["--claude", "--global"]);
     expect(r.out).not.toContain(Q);
     expect(await npmCalls(b.log)).toBe("install -g nomo-ai");
   });
@@ -501,7 +543,7 @@ describe("the optional short `nomo` command", () => {
     const b = await box("ok");
     const { symlink } = await import("node:fs/promises");
     await symlink(NOMO_AI, join(b.h, "gbin", "nomo"));
-    const r = await cli(b, ["uninstall", "--claude"], false);
+    const r = await cli(b, ["uninstall", "--claude"]);
     expect(r.code).toBe(0);
     expect(r.out).toContain("The short `nomo` command stays. To remove it too: npm uninstall -g nomo-ai");
     expect(await npmCalls(b.log)).toBe("");

@@ -104,7 +104,7 @@ Options:
   -y, --yes               no prompt; install every agent detected on this machine
       --uninstall         same as the \`uninstall\` command
   -n, --dry-run           print the commands that would run, run nothing
-      --global            also install the short \`nomo\` command (asked, default No, in a
+      --global            also install the short \`nomo\` command (asked, default Yes, in a
                           terminal; this flag says yes without asking)
       --ref <branch|tag>  OpenCode, Cursor, Antigravity and Grok Bot only: install from
                           this ref of the repo instead of its default branch. Claude Code
@@ -936,6 +936,7 @@ function chooseArrows(selected) {
       if (!live) return;
       live = false;
       stdin.off("keypress", onKey);
+      stdin.off("end", onEnd);
       process.stdout.off("resize", onResize);
       process.off("SIGINT", onSigint);
       process.off("exit", teardown);
@@ -956,6 +957,7 @@ function chooseArrows(selected) {
     // it. It is also nearly unreachable — in raw mode Ctrl-C is delivered as the \u0003 byte below,
     // not as a signal — so it is here for a `kill -INT` from elsewhere.
     const onSigint = () => finish("interrupt");
+    const onEnd = () => finish("quit");
     // A resize is not a keypress, so without this the frame sits at the old width until the user
     // happens to touch a key — every line in it fitted to a window that no longer exists. It goes
     // through the same teardown as the rest: node keeps a SIGWINCH handler alive for as long as one
@@ -994,6 +996,9 @@ function chooseArrows(selected) {
     process.on("exit", teardown);
     emitKeypressEvents(stdin, /** @type {any} */ (KEYS));
     stdin.on("keypress", onKey);
+    // In raw mode Ctrl-D is a key (handled above); a stdin that actually ENDS (pty hangup) would
+    // otherwise leave this promise pending and node would exit 13 on the unsettled await.
+    stdin.once("end", onEnd);
     try {
       stdin.setRawMode(true);
     } catch {
@@ -1030,18 +1035,13 @@ async function chooseNumbered(selected) {
   try {
     for (;;) {
       render(selected);
-      let answer;
-      try {
-        answer = (
-          await rl.question(`Type a number to toggle, ${bold("Enter")} to install, ${bold("q")} to quit: `)
-        ).trim();
-      } catch {
-        // Ctrl+D closes stdin and node:readline/promises rejects with an AbortError. That is a user
-        // saying "no", not a crash — printing a stack trace at someone who pressed Ctrl+D is exactly
-        // the noise this file's error handling exists to avoid.
+      // Ctrl+D (end of input) is a user saying "no", not a crash — see ask() for why it needs help.
+      const line = await ask(rl, `Type a number to toggle, ${bold("Enter")} to install, ${bold("q")} to quit: `);
+      if (line === null) {
         say();
         return false;
       }
+      const answer = line.trim();
       if (answer === "") return selected.size > 0;
       if (answer === "q" || answer === "quit") return false;
       let understood = false;
@@ -1267,7 +1267,8 @@ function runCommand(name, rest) {
 // ── the short `nomo` command (optional) ──────────────────────────────────────────────────────────
 //
 // `nomo pair` instead of `bunx nomo-ai pair`, by installing this same package globally (its second bin
-// is `nomo`). Offered once after a successful install, default No; `--global` says yes without asking.
+// is `nomo`). Offered once after a successful install in a terminal, default Yes (Return installs, n
+// skips); `--global` says yes without asking.
 // Never `bunx nomo` / `npx nomo`: that npm package is someone else's. No sudo, ever — a failed install
 // is one line and the run's exit status is unchanged.
 
@@ -1313,15 +1314,37 @@ function globalBinDir(/** @type {string} */ pm) {
   return out ? (pm === "bun" ? out : join(out, "bin")) : "its global bin folder";
 }
 
-/** A yes/no question, default No. Only ever called with a terminal (or the test seam).
+/** One line from `rl`, or null at end of input. node:readline/promises leaves `question()` PENDING
+ *  forever when stdin ends (Ctrl-D on an empty line, a closed pipe): nothing else keeps the event loop
+ *  alive, so node quit with "unsettled top-level await" and exit 13 — after a successful install, with
+ *  the Next: hints never printed. So a close (or a stdin that already ended) settles it as null.
+ *  @param {import("node:readline/promises").Interface} rl @param {string} q
+ *  @returns {Promise<string | null>} */
+function ask(rl, q) {
+  if (process.stdin.readableEnded || process.stdin.destroyed) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const onClose = () => resolve(null);
+    rl.once("close", onClose);
+    rl.question(q).then(
+      (a) => { rl.off("close", onClose); resolve(a); },
+      () => resolve(null), // an abort is the same "no answer"
+    );
+  });
+}
+
+/** A yes/no question, default YES: Return, `y` or `yes` → yes; `n`, `no` or anything else → no; end of
+ *  input (Ctrl-D, closed stdin) → no — nothing is installed without an explicit Return or yes. Ctrl-C
+ *  is the terminal's own SIGINT and ends the process. Only ever called with a terminal.
  *  @param {string} q */
 async function askYesNo(q) {
   const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
   try {
-    return /^y(es)?$/i.test((await rl.question(q)).trim());
-  } catch {
-    say();
-    return false; // Ctrl-D
+    const a = await ask(rl, q);
+    if (a === null) {
+      say();
+      return false;
+    }
+    return /^(y(es)?)?$/i.test(a.trim());
   } finally {
     rl.close();
   }
@@ -1332,11 +1355,10 @@ async function askYesNo(q) {
  *  @param {boolean} flag @param {boolean} mayAsk */
 async function offerShortCommand(flag, mayAsk) {
   // Ask only in a real terminal, never in a dry run (`-n --global` still shows the plan). Asked even when
-  // agents were named — the owner's one exception to "an agent flag means non-interactive".
-  // NOMO_AI_TEST_ASK=1 is a test seam (the suite has no terminal). It can only make a question appear,
-  // default No; the one thing a "y" on stdin can then do is the same `-g nomo-ai` install shown first.
-  // Anyone able to set this process's environment could already run anything (NODE_OPTIONS, PATH).
-  const canAsk = mayAsk && !DRY && (interactive() || process.env.NOMO_AI_TEST_ASK === "1");
+  // agents were named — the owner's one exception to "an agent flag means non-interactive". The
+  // question defaults to YES, so it is never asked without a terminal and never under `-y` (mayAsk):
+  // a scripted `-y` run must not turn into a global install. `--global` is the explicit opt-in there.
+  const canAsk = mayAsk && !DRY && interactive();
   const state = shortCommandState();
   if (state === "ours") return true;
   if (state === "foreign") {
@@ -1347,7 +1369,7 @@ async function offerShortCommand(flag, mayAsk) {
     return false;
   }
   if (!flag && !canAsk) return false;
-  if (!flag && !(await askYesNo(`Also install the short ${bold("nomo")} command, so you can type ${bold("nomo pair")}? (y/N) `))) {
+  if (!flag && !(await askYesNo(`Also install the short ${bold("nomo")} command, so you can type ${bold("nomo pair")}? (Y/n) `))) {
     say();
     return false;
   }
