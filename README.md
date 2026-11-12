@@ -59,8 +59,8 @@ bunx nomo-ai     # or: npx nomo-ai
 ```
 
 It detects which agents are on this computer and installs Nomo for each through that agent's own
-install path (`--claude` `--codex` `--opencode` `--cursor` `--antigravity` `--grokbot` pick agents;
-`-n` prints the plan and runs nothing). Installing never pairs your phone and has no `postinstall` hook;
+install path (`--claude` `--codex` `--opencode` `--cursor` `--antigravity` pick agents; `-n` prints
+the plan and runs nothing). Installing never pairs your phone and has no `postinstall` hook;
 pairing is the separate, explicit `bunx nomo-ai pair` (or the pair command inside your agent). The two
 agent config files it merges into directly are undone with `bunx nomo-ai uninstall --cursor` and
 `bunx nomo-ai uninstall --antigravity` (also spelled `--uninstall`; the same as
@@ -89,12 +89,6 @@ or with `-n`; `--global` says yes without asking. Yes runs `bun add -g nomo-ai` 
 your PATH, it says so in one line and `bunx nomo-ai …` keeps working. Uninstall leaves it; remove it with
 `bun remove -g nomo-ai` (or `npm uninstall -g nomo-ai`). Never type `bunx nomo` or `npx nomo`: the npm
 package named `nomo` is someone else's.
-
-**Grok Bot only (macOS).** The Grok Bot app has no hooks, so `--grokbot` adds an hourly background job
-instead (see [Grok Bot background job](#grok-bot-background-job)); then pair with `bunx nomo-ai pair`.
-`bunx nomo-ai uninstall --grokbot` removes the job. With another agent installed you do not need it:
-that agent already runs the same scan, so `-y` and `--all` add it only when Grok Bot is the only agent
-found (name `--grokbot` to add it anyway).
 
 The full guides live at [docs.nomo.gg](https://docs.nomo.gg):
 
@@ -167,7 +161,7 @@ valid. The page is deleted when pairing completes.
 |---|---|---|
 | Relay Worker (`https://api.nomo.gg`, or `NOMO_WORKER_URL` at pair time) | every session event; approval holds; pairing; unpair; the activity summary | `/v1/cc/event`, `/v1/cc/decision*`, `/v1/cc/full`, `/v1/cc/pair/*` |
 | Your iPhone, on the same network (only if LAN is turned on in the app) | commands and answers | `POST /v1/lan`, sealed under `K_lan` |
-| `github.com/KarrixLee/nomo` via `git` | `bunx nomo-ai` (OpenCode, Cursor, Antigravity, Grok Bot legs) and `/nomo-update` | clone / fetch / pull of this repo |
+| `github.com/KarrixLee/nomo` via `git` | `bunx nomo-ai` (OpenCode, Cursor, Antigravity legs) and `/nomo-update` | clone / fetch / pull of this repo |
 | The npm registry, via your package manager | only if you answer yes to the short `nomo` command, or pass `--global` | `bun add -g nomo-ai` or `npm install -g nomo-ai` |
 
 Nothing else: no analytics, no crash reporting, no reads of agent credentials.
@@ -185,16 +179,9 @@ file's changed lines.
 
 **Daily activity summary — counts only, sealed.** While paired, the watchdog reads your agents' local
 history read-only — Claude Code transcripts (`~/.claude/projects`), Codex rollouts and its
-`state_5.sqlite` / `thread_history_1.sqlite`, OpenCode's `opencode.db`, and the Grok Bot app's saved
-chats (`~/Library/Application Support/Grok Bot/sand-client-persistence`) — and builds one row per day per
+`state_5.sqlite` / `thread_history_1.sqlite`, OpenCode's `opencode.db` — and builds one row per day per
 agent: session count, prompt count, which 5-minute slots had activity, and token totals per model. It
-**never** puts prompt or reply text, project names or paths into the summary. From Grok Bot it uses only
-each message's time, id and whether you or the bot sent it, plus the bot's id — never the text, the bot's
-name or your account id; every other text value (message text, names, attachments) is dropped as the
-file is parsed, so it is never held in memory. The ids stay on your computer (as
-short hashes, only to avoid counting a message twice). What is sent for Grok Bot is, per day, how many
-Bots you used, how many messages you sent and when you were active, with no token counts; a day counts
-only when you sent Grok Bot a message that day. Rows are kept in
+**never** puts prompt or reply text, project names or paths into the summary. Rows are kept in
 `~/.config/cc-status/activity-days.json` (at most 400 days) and, at most every 6 hours and only when
 changed, sealed and uploaded to `/v1/cc/full` (`what: "activity"`); right after pairing a new phone the
 existing rows go up once within about a minute, and after a plugin update new rows go up at the next
@@ -222,8 +209,7 @@ computer names from the app's own App Group container. It never leaves the devic
 | `~/.config/opencode/plugins/nomo.js`, `commands/nomo-*.md` | OpenCode stub + commands | `opencode-install.sh` |
 | `~/.cursor/hooks.json` (merged), `~/.cursor/skills/nomo-*/` | Cursor hooks + skills (`$CURSOR_CONFIG_DIR` if set) | `cursor-install.mjs` |
 | `~/.gemini/config/hooks.json` (`"nomo"` block), `~/.gemini/config/plugins/nomo/` | Antigravity hooks + plugin | `antigravity-install.mjs` |
-| `~/Library/LaunchAgents/gg.nomo.activity.plist` (`0644`) | hourly Grok Bot job (macOS) | `grokbot-install.mjs` |
-| `~/.nomo/` | git checkout of this repo (OpenCode, Cursor, Antigravity, Grok Bot installer) | `bunx nomo-ai` |
+| `~/.nomo/` | git checkout of this repo (OpenCode, Cursor, Antigravity installer) | `bunx nomo-ai` |
 
 Claude Code and Codex install through their own marketplaces; Nomo writes nothing into `~/.claude` or
 `~/.codex` except the Codex `notify` line above. `NOMO_CC_DIR` (testing only) moves the state folder;
@@ -371,27 +357,6 @@ real installs never set it, and anything that can set your agent's environment c
   else's and the installer refuses. The `/nomo-*` skills run only Nomo's own local commands and never
   print the pairing link or QR secret. Uninstall deletes only that block and the marked folder.
 
-### Grok Bot background job
-
-- **What it is.** One per-user macOS LaunchAgent, `gg.nomo.activity`, in
-  `~/Library/LaunchAgents/gg.nomo.activity.plist`. No `sudo`, no system-wide daemon, no hooks. It is
-  only for a Mac whose one agent is the Grok Bot app.
-- **What it runs.** `/bin/sh ~/.nomo/plugin/scripts/run.sh ~/.nomo/plugin/dist/cc-watchdog.mjs
-  --scheduled` at login and then once an hour, at low (background) priority. `run.sh` picks bun or node
-  each time (see [Runtime and launch](#runtime-and-launch)).
-- **What it does.** `--scheduled` is a one-shot activity run, not the session watchdog. If a watchdog is
-  already running (started by any agent), it exits at once — that one sends the activity. Otherwise it
-  scans the activity history described in [What leaves your computer](#what-leaves-your-computer) once,
-  uploads it if due (same rules: at most every 6 hours, only when changed; nothing when unpaired), and
-  exits. It does not claim the watchdog, serve sessions, open the LAN listener or keep running.
-- **Network.** Its only request is that sealed activity upload to `/v1/cc/full`. Pairing is done by
-  `bunx nomo-ai pair`, which starts the normal watchdog to finish the pairing and send the first upload.
-- **Pair, check, send now, disconnect:** `bunx nomo-ai pair`, `bunx nomo-ai status`, `bunx nomo-ai reset`,
-  `bunx nomo-ai unpair` (unpair works before or after removing the job).
-- **Remove it** with `bunx nomo-ai uninstall --grokbot` (works even if `~/.nomo` is gone). It unloads
-  the job and deletes the plist, nothing else; your pairing stays. By hand:
-  `launchctl bootout gui/$(id -u)/gg.nomo.activity` then `rm ~/Library/LaunchAgents/gg.nomo.activity.plist`.
-
 ### Runtime and launch
 
 - **Your project's runtime config is never loaded.** Hooks run with your project as working folder, and
@@ -525,7 +490,7 @@ process. Codex has no plugin update verb: with a `local` marketplace (`source_ty
   versions end up fighting over one watchdog. The npm package ships only `bin/`, not the plugin bundle.
 - With no flags and no terminal it refuses rather than guessing; every failure names the step, exit code
   and the command to run by hand, and the exit status is non-zero if any agent failed.
-- Updates: OpenCode, Cursor, Antigravity and Grok Bot legs update `~/.nomo` themselves (the checkout is the
+- Updates: OpenCode, Cursor and Antigravity legs update `~/.nomo` themselves (the checkout is the
   version). Claude Code and Codex rows only **print** the host command, because install begins with
   `marketplace add`, which would silently repoint a marketplace you aimed elsewhere (a fork, a local
   checkout). A Codex `local` marketplace prints nothing, since there is nothing to run.

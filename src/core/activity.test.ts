@@ -3,12 +3,11 @@ process.env.TZ = "Asia/Tokyo"; // before any Date use: day bucketing is local-ti
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { PLUGIN_VERSION } from "./shared";
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  addEvent, buildPayload, Cursor, defaultRoots, emptyState, freeze, loadMachineId, localDate, maybeUpload, parseClaudeLine, parseCodexLine,
+  addEvent, buildPayload, Cursor, emptyState, freeze, loadMachineId, localDate, maybeUpload, parseClaudeLine, parseCodexLine,
   parseState, runActivityCycle, scanAll, serializeState, startActivityLoop, State,
 } from "./activity";
 
@@ -21,10 +20,10 @@ const user = (uuid: string, ts: string, content: unknown = "hi", extra = {}) => 
 });
 
 let dir: string;
-let roots: { claude: string; codex: string; opencode: string; grokBot: string };
+let roots: { claude: string; codex: string; opencode: string };
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "nomo-activity-"));
-  roots = { claude: join(dir, "projects"), codex: join(dir, "codex"), opencode: join(dir, "none.db"), grokBot: join(dir, "grokbot") };
+  roots = { claude: join(dir, "projects"), codex: join(dir, "codex"), opencode: join(dir, "none.db") };
   mkdirSync(join(roots.claude, "p"), { recursive: true });
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -185,133 +184,10 @@ describe("codex sqlite backfill", () => {
   });
 });
 
-describe("grok bot", () => {
-  const BOT_A = "00000000-0000-4000-8000-00000000000a", BOT_B = "00000000-0000-4000-8000-00000000000b";
-  // Grok Bot names each blob by the lowercase, unpadded base32 of its key.
-  const b32 = (s: string) => {
-    const A = "abcdefghijklmnopqrstuvwxyz234567";
-    let bits = "", out = "";
-    for (const byte of Buffer.from(s)) bits += byte.toString(2).padStart(8, "0");
-    for (let i = 0; i < bits.length; i += 5) out += A[parseInt(bits.slice(i, i + 5).padEnd(5, "0"), 2)];
-    return out;
-  };
-  const blob = (key: string, body: string) => writeFileSync(join(roots.grokBot, `${b32(key)}.blob`), body);
-  const transcript = (bot: string, entries: unknown[]) =>
-    blob(`sand.client.slice.account.grok%7Cuser_TEST.transcript.replicas.${bot}`,
-      JSON.stringify({ schemaVersion: 1, value: { entries, epochHint: 1, acceptedSequenceHint: 1, persistedAt: 0 } }));
-  const ms = (iso: string) => Date.parse(iso);
-  const prompt = (id: string, iso: string, extra = {}) => ({ kind: "message", id, role: "user", content: "made up", isStreaming: false, clientNonce: "n", requestId: "r", seq: 1, timestampMs: ms(iso), ...extra });
-  const reply = (id: string, iso: string) => ({ kind: "send-message", id, requestId: "r", message: { type: "text", content: "made up" }, seq: 2, timestampMs: ms(iso) });
-
-  beforeEach(() => mkdirSync(roots.grokBot, { recursive: true }));
-
-  test("prompts are turns, bot output is not; per-bot ids and sessions; other blobs, corrupt files and odd entries skipped; re-scan idempotent", async () => {
-    transcript(BOT_A, [
-      prompt("t1u", "2026-11-03T01:00:00Z"), reply("t1s0", "2026-11-03T01:00:10Z"), reply("t1s1", "2026-11-03T01:06:00Z"),
-      prompt("t2u", "2026-11-03T16:00:00Z"), // 01:00 JST 11-04
-      { kind: "event", id: "event-x", event: { type: "automation-changed" }, seq: 3, timestampMs: ms("2026-11-03T02:00:00Z") },
-      { kind: "voice-call", id: "voice-call-x", call: {}, seq: 4, timestampMs: ms("2026-11-03T03:00:00Z") },
-      prompt("t3u", "2026-11-03T04:00:00Z", { isStreaming: true }),
-      prompt("t4u", "2026-11-03T04:00:00Z", { timestampMs: "nope" }),
-      null,
-    ]);
-    transcript(BOT_B, [prompt("t1u", "2026-11-03T01:30:00Z")]); // same entry id as BOT_A's, different bot
-    blob("sand.client.slice.account.grok%7Cuser_TEST.roster.last-roster", JSON.stringify({ schemaVersion: 1, value: { entries: [prompt("t9u", "2026-11-03T05:00:00Z")] } }));
-    blob(`sand.client.slice.account.grok%7Cuser_TEST.transcript.replicas.${"00000000-0000-4000-8000-00000000000c"}`, "{not json");
-    writeFileSync(join(roots.grokBot, "NOT-BASE32.blob"), "{}");
-
+describe("addEvent", () => {
+  test("a finite ts past Date's range is refused (never a NaN day)", () => {
     const st = emptyState();
-    await scanAll(st, {}, roots, NOW);
-    const r3 = row(st, "2026-11-03", "grokbot")!;
-    expect(r3).toMatchObject({ s: 2, t: 2, u: [] });
-    // slots: 10:00 JST (A prompt + reply), 10:05 (A reply), 10:30 (B prompt)
-    const b = Buffer.from(r3.b, "base64");
-    const on = [...Array(288).keys()].filter((i) => b[i >> 3] & (0x80 >> (i & 7)));
-    expect(on).toEqual([120, 121, 126]);
-    expect(row(st, "2026-11-04", "grokbot")).toMatchObject({ s: 1, t: 1 });
-
-    const st2 = parseState(serializeState(st)); // re-read every cycle: nothing counts twice
-    await scanAll(st2, {}, roots, NOW);
-    expect(buildPayload(st2, NOW).days).toEqual(buildPayload(st, NOW).days);
-  });
-
-  const slots = (r: { b: string }) => {
-    const b = Buffer.from(r.b, "base64");
-    return [...Array(288).keys()].filter((i) => b[i >> 3] & (0x80 >> (i & 7)));
-  };
-
-  test("a day counts only if the person sent a message that day; output from any Bot counts on such a day", async () => {
-    transcript(BOT_A, [
-      reply("t1s0", "2026-10-29T01:00:00Z"), // 10:00 JST 10-29: a routine, nobody prompted that day
-      prompt("t2u", "2026-10-30T01:00:00Z"), // 10:00 JST 10-30
-    ]);
-    transcript(BOT_B, [reply("t7s0", "2026-10-30T03:00:00Z")]); // 12:00 JST 10-30, no prompt to B
-    const st = emptyState();
-    await scanAll(st, {}, roots, NOW);
-    expect(row(st, "2026-10-29", "grokbot")).toBeUndefined();
-    const r6 = row(st, "2026-10-30", "grokbot")!;
-    expect(r6).toMatchObject({ s: 2, t: 1 });
-    expect(slots(r6)).toEqual([120, 144]);
-  });
-
-  test("output dropped earlier counts once a prompt arrives later that day; re-scans stay idempotent", async () => {
-    transcript(BOT_A, [reply("t1s0", "2026-10-31T01:00:00Z")]); // 10:00 JST
-    const st = emptyState();
-    await scanAll(st, {}, roots, NOW);
-    expect(row(st, "2026-10-31", "grokbot")).toBeUndefined();
-    transcript(BOT_A, [reply("t1s0", "2026-10-31T01:00:00Z"), prompt("t2u", "2026-10-31T11:00:00Z")]); // 20:00 JST
-    await scanAll(st, {}, roots, NOW);
-    const r7 = row(st, "2026-10-31", "grokbot")!;
-    expect(r7).toMatchObject({ s: 1, t: 1 });
-    expect(slots(r7)).toEqual([120, 240]);
-    const st2 = parseState(serializeState(st));
-    await scanAll(st2, {}, roots, NOW);
-    expect(buildPayload(st2, NOW).days).toEqual(buildPayload(st, NOW).days);
-  });
-
-  test("only regular *.blob files directly in the folder are read: FIFO, symlink, oversize and *.blob directories are skipped", async () => {
-    const key = (bot: string) => `${b32(`sand.client.slice.account.grok%7Cuser_TEST.transcript.replicas.${bot}`)}.blob`;
-    const body = (entries: unknown[], pad = 0) =>
-      JSON.stringify({ schemaVersion: 1, value: { entries, epochHint: 1, acceptedSequenceHint: 1, persistedAt: 0 } }) + " ".repeat(pad);
-    transcript(BOT_A, [prompt("t1u", "2026-11-03T01:00:00Z")]); // the one real file
-    const C = "00000000-0000-4000-8000-00000000000c", D = "00000000-0000-4000-8000-00000000000d";
-    const E = "00000000-0000-4000-8000-00000000000e", F = "00000000-0000-4000-8000-00000000000f";
-    expect(spawnSync("mkfifo", [join(roots.grokBot, key(C))]).status).toBe(0); // would block a plain read forever
-    const outside = join(roots.grokBot, "..", "elsewhere.json");
-    writeFileSync(outside, body([prompt("t1u", "2026-11-02T01:00:00Z")]));
-    symlinkSync(outside, join(roots.grokBot, key(D)));
-    writeFileSync(join(roots.grokBot, key(E)), body([prompt("t1u", "2026-11-01T01:00:00Z")], 4 * 1024 * 1024));
-    mkdirSync(join(roots.grokBot, key(F)));
-    writeFileSync(join(roots.grokBot, key(F), key(F)), body([prompt("t1u", "2026-10-31T01:00:00Z")]));
-    const st = emptyState();
-    await scanAll(st, {}, roots, NOW);
-    expect([...st.rows.values()].filter((r) => r.a === "grokbot").map((r) => r.d)).toEqual(["2026-11-03"]);
-  }, 10_000);
-
-  test("out-of-range timestamps are dropped (never a NaN day), and addEvent refuses them for every agent", async () => {
-    transcript(BOT_A, [
-      prompt("t1u", "2026-11-03T01:00:00Z"),
-      prompt("t2u", "x", { timestampMs: 1e20 }), prompt("t3u", "x", { timestampMs: -5 }), prompt("t4u", "x", { timestampMs: 0 }),
-      prompt("t5u", "x", { timestampMs: NOW + 2 * 86_400_000 }),
-    ]);
-    const st = emptyState();
-    await scanAll(st, {}, roots, NOW);
-    expect([...st.rows.keys()]).toEqual(["2026-11-03|grokbot"]);
-    const st2 = emptyState();
-    expect(addEvent(st2, { ts: 1e20, agent: "claude", sessionId: "s", kind: "turn", id: "x" })).toBe(false);
-    expect(st2.rows.size).toBe(0);
-  });
-
-  test("not macOS: no Grok Bot folder is guessed", () => {
-    const real = process.platform;
-    Object.defineProperty(process, "platform", { value: "linux" });
-    try { expect(defaultRoots().grokBot).toBe(""); } finally { Object.defineProperty(process, "platform", { value: real }); }
-  });
-
-  test("missing folder is a silent no-op", async () => {
-    rmSync(roots.grokBot, { recursive: true });
-    const st = emptyState();
-    await scanAll(st, {}, roots, NOW);
+    expect(addEvent(st, { ts: 1e20, agent: "claude", sessionId: "s", kind: "turn", id: "x" })).toBe(false);
     expect(st.rows.size).toBe(0);
   });
 });
@@ -402,7 +278,7 @@ describe("upload", () => {
     const daysPath = join(dir, "days.json");
     writeFileSync(daysPath, serializeState(st));
     const calls: string[] = [];
-    const missing = { claude: join(dir, "nope"), codex: join(dir, "nope"), opencode: join(dir, "nope.db"), grokBot: join(dir, "nope") };
+    const missing = { claude: join(dir, "nope"), codex: join(dir, "nope"), opencode: join(dir, "nope.db") };
     await runActivityCycle({ config: cfg("new"), daysPath, cursorPath: join(dir, "cur.json"), roots: missing, now: () => NOW + 60_000, fetchFn: okFetch(calls), scan: false });
     expect(calls).toEqual(["new"]);
     expect(parseState(await Bun.file(daysPath).text()).lastPairing).toBe("new");
@@ -412,19 +288,19 @@ describe("upload", () => {
 describe("plugin update (lastVersion)", () => {
   const config = { url: "https://w", pairingId: "p", pcSecret: "s", e2eKey: new Uint8Array(32) } as any;
   const ok = (calls: string[]) => (async (url: string) => { calls.push(url); return new Response("{}"); }) as unknown as typeof fetch;
-  const grok = (st: State, id: string) => addEvent(st, { ts: NOW - 3_600_000, agent: "grokbot", sessionId: "b", kind: "turn", id });
+  const turn = (st: State, id: string) => addEvent(st, { ts: NOW - 3_600_000, agent: "claude", sessionId: "b", kind: "turn", id });
 
   test("a different last-upload version skips the 6 h wait once; then the gate applies again", async () => {
     const calls: string[] = [];
     const st = emptyState();
-    grok(st, "e1");
+    turn(st, "e1");
     expect(await maybeUpload(st, config, NOW, ok(calls))).toBe(true);
     expect(st.lastVersion).toBe(PLUGIN_VERSION);
-    grok(st, "e2"); // new rows, < 6 h later, same version: gated
+    turn(st, "e2"); // new rows, < 6 h later, same version: gated
     expect(await maybeUpload(st, config, NOW + 60_000, ok(calls))).toBe(false);
     st.lastVersion = "2.4.1"; // the previous version made the last upload
     expect(await maybeUpload(st, config, NOW + 120_000, ok(calls))).toBe(true);
-    grok(st, "e3");
+    turn(st, "e3");
     expect(await maybeUpload(st, config, NOW + 180_000, ok(calls))).toBe(false); // gated again
     expect(calls).toHaveLength(2);
   });
@@ -432,7 +308,7 @@ describe("plugin update (lastVersion)", () => {
   test("a version change alone does not re-send unchanged rows", async () => {
     const calls: string[] = [];
     const st = emptyState();
-    grok(st, "e1");
+    turn(st, "e1");
     expect(await maybeUpload(st, config, NOW, ok(calls))).toBe(true);
     st.lastVersion = "2.4.1";
     expect(await maybeUpload(st, config, NOW + 60_000, ok(calls))).toBe(false);
@@ -440,7 +316,7 @@ describe("plugin update (lastVersion)", () => {
 
   test("a state file from before lastVersion parses, and its first changed cycle uploads", async () => {
     const st = emptyState();
-    grok(st, "e1");
+    turn(st, "e1");
     const old = JSON.parse(serializeState(st));
     Object.assign(old, { lastUpload: NOW, lastHash: "stale", lastPairing: "p" });
     delete old.lastVersion;
@@ -454,7 +330,7 @@ describe("plugin update (lastVersion)", () => {
 describe("forced upload (reset)", () => {
   test("force bypasses the 6 h gate and the unchanged-hash skip; the normal gates are untouched", async () => {
     const st = emptyState();
-    addEvent(st, { ts: NOW - 3_600_000, agent: "grokbot", sessionId: "b", kind: "turn", id: "e1" });
+    addEvent(st, { ts: NOW - 3_600_000, agent: "claude", sessionId: "b", kind: "turn", id: "e1" });
     const calls: string[] = [];
     const ok = (async (url: string) => { calls.push(url); return new Response("{}"); }) as unknown as typeof fetch;
     const config = { url: "https://w", pairingId: "p", pcSecret: "s", e2eKey: new Uint8Array(32) } as any;
@@ -471,14 +347,14 @@ describe("forced upload (reset)", () => {
     const dir = await mkdtemp(join(tmpdir(), "nomo-act-force-"));
     try {
       const daysPath = join(dir, "days.json");
-      const base = { daysPath, cursorPath: join(dir, "cur.json"), roots: { claude: join(dir, "x"), codex: join(dir, "x"), opencode: join(dir, "x"), grokBot: join(dir, "x") } as any, now: () => NOW, scan: false };
+      const base = { daysPath, cursorPath: join(dir, "cur.json"), roots: { claude: join(dir, "x"), codex: join(dir, "x"), opencode: join(dir, "x") } as any, now: () => NOW, scan: false };
       const config = { url: "https://w", pairingId: "p", pcSecret: "s", e2eKey: new Uint8Array(32) } as any;
       const ok = (async () => new Response("{}")) as unknown as typeof fetch;
       const down = (async () => { throw new Error("offline"); }) as unknown as typeof fetch;
       expect(await runActivityCycle({ ...base, config: null })).toBe("unpaired");
       expect(await runActivityCycle({ ...base, config, fetchFn: ok, force: true })).toBe("empty");
       const st = emptyState();
-      addEvent(st, { ts: NOW - 3_600_000, agent: "grokbot", sessionId: "b", kind: "turn", id: "e1" });
+      addEvent(st, { ts: NOW - 3_600_000, agent: "claude", sessionId: "b", kind: "turn", id: "e1" });
       await writeFile(daysPath, serializeState(st));
       expect(await runActivityCycle({ ...base, config, fetchFn: down, force: true })).toBe("not-sent");
       expect(await runActivityCycle({ ...base, config, fetchFn: ok, force: true })).toBe("sent");
@@ -516,7 +392,7 @@ describe("machine id (mid)", () => {
     const key = new Uint8Array(32);
     const blobs: string[] = [];
     const fetchFn = (async (_u: string, init: any) => { blobs.push(JSON.parse(init.body).blob); return new Response("{}"); }) as any;
-    const missing = { claude: join(dir, "nope"), codex: join(dir, "nope"), opencode: join(dir, "nope.db"), grokBot: join(dir, "nope") };
+    const missing = { claude: join(dir, "nope"), codex: join(dir, "nope"), opencode: join(dir, "nope.db") };
     for (const pid of ["one", "two"]) {
       await runActivityCycle({ config: { url: "https://w", pairingId: pid, pcSecret: "s", e2eKey: key } as any, daysPath, cursorPath: join(dir, "cur.json"), roots: missing, now: () => NOW, fetchFn, scan: false });
     }

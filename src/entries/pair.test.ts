@@ -1192,7 +1192,7 @@ describe("statusCmd", () => {
     const out = lines.join("\n");
     expect(out).toContain("Phone");
     expect(out).toContain("NOT PAIRED");
-    // Run from a terminal (no agent asked): the fix must work with no agent at all (a Grok Bot-only Mac).
+    // Run from a terminal (no agent asked): the fix must work with no agent at all.
     expect(out).toContain("→ run bunx nomo-ai pair (or your agent's pair command)");
     expect(out).not.toContain("/nomo-cc:pair");
     // Delivery and Approvals are meaningless on an unpaired machine — printing them would be four

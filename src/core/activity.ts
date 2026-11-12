@@ -1,26 +1,22 @@
 // activity — NOM-142 daily activity summary. Reads each agent's LOCAL history (Claude Code transcripts,
-// Codex rollouts + its SQLite state, OpenCode's SQLite db, the Grok Bot app's transcript replicas),
-// folds it into per-(local day, agent) rows of COUNTS ONLY, and uploads the rows E2E-sealed through the
-// blind /v1/cc/full slot. Driven by the watchdog (startActivityLoop): once at start, then hourly; an
-// upload needs changed rows AND ≥6 h since the last one — except the first upload to a NEW pairing
-// (re-pair), which goes out within a minute, and the first changed rows after a plugin update (the last
-// upload's version is kept), which skip the 6 h wait once. `reset` forces one upload on demand.
+// Codex rollouts + its SQLite state, OpenCode's SQLite db), folds it into per-(local day, agent) rows
+// of COUNTS ONLY, and uploads the rows E2E-sealed through the blind /v1/cc/full slot. Driven by the
+// watchdog (startActivityLoop): once at start, then hourly; an upload needs changed rows AND ≥6 h since
+// the last one — except the first upload to a NEW pairing (re-pair), which goes out within a minute,
+// and the first changed rows after a plugin update (the last upload's version is kept), which skip the
+// 6 h wait once. `reset` forces one upload on demand.
 //
 // PRIVACY: an event carries a timestamp, a session id, a kind, a model id and token counts — never
 // prompt or reply text (a user line's text is looked at only to tell a real prompt from a tool echo).
-// Grok Bot: only each entry's kind/role, id and timestamp plus the bot uuid from the file name are used —
-// never its text, the bot's name or the account id in the key (decoded, matched, discarded). The ids only
-// feed the local dedupe hashes and the per-day Bot count; message text is dropped while parsing. A Grok
-// Bot day counts only when the person sent a message that day (bot output alone never makes a day).
 // What leaves the Mac: per day+agent session/turn counts, a 5-minute activity bitmap and per-model
 // token sums, sealed with the pairing's e2eKey. No project names or paths (`p` is reserved, unsent).
 //
 // IDEMPOTENCE: every event has a stable id (CC message.id+requestId, Codex turn_id / cumulative token
-// total, OpenCode message id, Grok Bot bot uuid + entry id). A HOT row (day within HOT_DAYS) keeps the
-// short hashes of the ids and session ids it counted, so re-reading a line — a shrunk/replaced file, a
-// crashed run, CC copying history into a resumed transcript — never counts twice. Older rows are FROZEN
-// (hashes dropped) and accept no more events; a day with no row yet is accepted (nothing was counted for
-// it), then frozen at the end of the run. The cursor only saves work; correctness never depends on it.
+// total, OpenCode message id). A HOT row (day within HOT_DAYS) keeps the short hashes of the ids and
+// session ids it counted, so re-reading a line — a shrunk/replaced file, a crashed run, CC copying
+// history into a resumed transcript — never counts twice. Older rows are FROZEN (hashes dropped) and
+// accept no more events; a day with no row yet is accepted (nothing was counted for it), then frozen at
+// the end of the run. The cursor only saves work; correctness never depends on it.
 //
 // TOKENS: i = uncached input, cr = cache read, cw = cache write, o = output EXCLUDING reasoning,
 // r = reasoning output (omitted when 0). o + r = all output tokens for every agent.
@@ -29,16 +25,14 @@
 // skips that line/agent, never the watchdog. PORTABLE: runs under node or bun (no Bun.* globals).
 
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, createReadStream, existsSync } from "node:fs";
-import { open, readdir, readFile, stat } from "node:fs/promises";
-import { basename, dirname } from "node:path";
+import { createReadStream, existsSync } from "node:fs";
+import { readdir, readFile, stat } from "node:fs/promises";
+import { dirname } from "node:path";
 import * as zlib from "node:zlib";
 import { encryptBlob } from "./crypto";
 import { atomicWrite, CC_DIR, codexHome, Config, loadConfig, PLUGIN_VERSION } from "./shared";
 
-// "grokbot" = the Grok Bot desktop app (bundle id com.anysphere.sand). App builds before 2.4.2 (19)
-// show it as an unknown agent: counted on the grid and streak, labelled "Grokbot".
-export type ActivityAgent = "claude" | "codex" | "opencode" | "grokbot";
+export type ActivityAgent = "claude" | "codex" | "opencode";
 export interface Tokens { i: number; o: number; cw: number; cr: number; r?: number }
 export interface ActivityEvent {
   ts: number; agent: ActivityAgent; sessionId: string; kind: "turn" | "assistant"; id: string;
@@ -161,7 +155,7 @@ export function parseState(text: string): State {
     st.lastUpload = Number(o.lastUpload) || 0;
     st.lastHash = typeof o.lastHash === "string" ? o.lastHash : "";
     st.lastPairing = typeof o.lastPairing === "string" ? o.lastPairing : ""; // absent in older files
-    st.lastVersion = typeof o.lastVersion === "string" ? o.lastVersion : ""; // absent before 2.4.2's grokbot setup
+    st.lastVersion = typeof o.lastVersion === "string" ? o.lastVersion : ""; // absent before 2.4.2
     for (const r of o.days ?? []) {
       const bits = new Uint8Array(36);
       bits.set(Buffer.from(String(r.b ?? ""), "base64").subarray(0, 36));
@@ -342,14 +336,11 @@ export async function openReadOnly(path: string): Promise<RoDb | null> {
 
 // --- per-agent readers -------------------------------------------------------------------------
 
-export interface Roots { claude: string; codex: string; opencode: string; grokBot: string }
+export interface Roots { claude: string; codex: string; opencode: string }
 export const defaultRoots = (): Roots => ({
   claude: `${process.env.HOME}/.claude/projects`,
   codex: codexHome(),
   opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`,
-  // The app's Electron userData. macOS only for now (the one verified, documented path); "" elsewhere
-  // makes readGrokBot a no-op instead of guessing a folder.
-  grokBot: process.platform === "darwin" ? `${process.env.HOME}/Library/Application Support/Grok Bot/sand-client-persistence` : "",
 });
 
 type Sink = (ev: ActivityEvent) => void;
@@ -450,67 +441,6 @@ async function readOpenCode(dbPath: string, sink: Sink, sinceMs: number): Promis
   } finally { db.close(); }
 }
 
-/** Lowercase unpadded RFC 4648 base32 → utf8 (how Grok Bot names its blobs); null if not base32. */
-function base32(s: string): string | null {
-  const out: number[] = [];
-  let v = 0, bits = 0;
-  for (const ch of s) {
-    const i = "abcdefghijklmnopqrstuvwxyz234567".indexOf(ch);
-    if (i < 0) return null;
-    v = ((v << 5) | i) & 0xffff; bits += 5;
-    if (bits >= 8) { bits -= 8; out.push((v >> bits) & 255); }
-  }
-  return Buffer.from(out).toString("utf8");
-}
-
-const GB_MAX_BYTES = 4 * 1024 * 1024; // ~200 entries per bot are a few hundred KB at most
-const GB_KEY = /\.transcript\.replicas\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
-
-/** Grok Bot keeps the latest ~200 entries per bot in `<base32(key)>.blob`; files are tiny, so every cycle
- *  re-reads them all and the hot-row id hashes absorb the overlap (no cursor). Entry ids are per-bot turn
- *  counters (`t12u` = the person's turn 12, `t12s3` = a bot reply to it), so the id carries the bot uuid.
- *
- *  A DAY COUNTS ONLY IF THE PERSON SENT A MESSAGE THAT LOCAL DAY (any Bot). Bot output is kept only on
- *  such days, so a scheduled routine or a task running past midnight cannot keep the streak alive on its
- *  own. Dropped output is not sunk (nor hashed): a prompt later that day makes the next scan count it.
- *  Ceiling: once a prompt has left the app's ~200-entry window, its surviving replies count only if an
- *  earlier scan already counted them. */
-async function readGrokBot(dir: string, sink: Sink, now: number): Promise<void> {
-  if (!dir) return; // not macOS
-  const events: ActivityEvent[] = [];
-  // NOT recursive, regular files only: a FIFO named like a blob would block the read forever (and with it
-  // every later cycle and `reset`), a symlink could point anywhere. The dirent type filters the listing;
-  // the open itself is O_NONBLOCK|O_NOFOLLOW and re-checked with fstat, so a swap after the listing
-  // cannot block or follow either. Files over GB_MAX_BYTES are skipped unread.
-  const names = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  for (const ent of names) {
-    if (!ent.isFile() || !ent.name.endsWith(".blob")) continue;
-    const bot = base32(basename(ent.name, ".blob"))?.match(GB_KEY)?.[1];
-    if (!bot) continue; // roster, usage cache, ui state, …
-    try {
-      const fh = await open(`${dir}/${ent.name}`, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
-      let text: string;
-      try {
-        const st = await fh.stat();
-        if (!st.isFile() || st.size > GB_MAX_BYTES) continue;
-        text = await fh.readFile("utf8");
-      } finally { await fh.close(); }
-      // The reviver drops every string except kind/role/id AS the file is parsed, so message text, names
-      // and attachments never exist in the parsed data this code (or a later edit) can reach.
-      const keep = (k: string, v: unknown) => (typeof v === "string" && k !== "kind" && k !== "role" && k !== "id" ? undefined : v);
-      for (const e of JSON.parse(text, keep).value.entries) {
-        const kind = e?.kind === "message" && e.role === "user" ? "turn" : e?.kind === "send-message" ? "assistant" : null;
-        if (!kind || e.isStreaming || typeof e.id !== "string") continue;
-        // A real time only: after the epoch and at most a day ahead of this computer's clock.
-        if (!Number.isFinite(e.timestampMs) || e.timestampMs <= 0 || e.timestampMs > now + 86_400_000) continue;
-        events.push({ ts: e.timestampMs, agent: "grokbot", sessionId: bot, kind, id: `gb:${bot}:${e.id}` });
-      }
-    } catch { /* corrupt file or unknown schema: skip it */ }
-  }
-  const prompted = new Set(events.filter((ev) => ev.kind === "turn").map((ev) => localDate(ev.ts)));
-  for (const ev of events) if (prompted.has(localDate(ev.ts))) sink(ev);
-}
-
 /** Scan every agent into `state`, updating `cursor`. `checkpoint` is awaited every SAVE_EVERY_BYTES so
  *  a long first backfill keeps its progress if the watchdog exits mid-way. */
 export async function scanAll(state: State, cursor: Cursor, roots: Roots, now: number, checkpoint: () => Promise<void> = async () => {}): Promise<void> {
@@ -526,7 +456,6 @@ export async function scanAll(state: State, cursor: Cursor, roots: Roots, now: n
   try { await readClaude(roots.claude, cursor, sink, progress, seen); } catch { /* skip agent */ }
   try { await readCodex(roots.codex, cursor, sink, progress, seen, since("codex"), state); } catch { /* skip agent */ }
   try { await readOpenCode(roots.opencode, sink, since("opencode")); } catch { /* skip agent */ }
-  try { await readGrokBot(roots.grokBot, sink, now); } catch { /* skip agent */ }
   for (const p of Object.keys(cursor)) if (!seen.has(p)) delete cursor[p];
 }
 

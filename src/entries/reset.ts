@@ -8,10 +8,10 @@
 //      sealed the record's stale blob) and its file deleted. Records with LIVE pids are left alone.
 //   3. When paired, scans the agents' history and sends the daily activity summary NOW (heatmap +
 //      streak), skipping the watchdog's 6 h upload gate for this one call. It runs after step 1, but a
-//      hook or the Grok Bot job CAN start a new watchdog (or scheduled run) meanwhile, so two scans may
-//      overlap. No lock: every event is deduped by id, files are written atomically, so the worst case is
-//      one extra upload or the other writer's last save winning. A watchdog started afterwards reads the
-//      fresh lastUpload/hash and does not re-send the same rows.
+//      hook CAN start a new watchdog meanwhile, so two scans may overlap. No lock: every event is
+//      deduped by id, files are written atomically, so the worst case is one extra upload or the other
+//      writer's last save winning. A watchdog started afterwards reads the fresh lastUpload/hash and
+//      does not re-send the same rows.
 //   4. Pairing, keys, and config.json are NOT touched — that is `unpair`'s job.
 //
 // Interactive command (same output contract as unpair): sequential stdout lines, ALWAYS exit 0 —
@@ -21,7 +21,6 @@
 // PORTABILITY: bun AND node >= 18 (bundled by build.ts) — no Bun.* APIs.
 
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { basename } from "node:path";
 import { ActivityOutcome, CycleDeps, runActivityCycle } from "../core/activity";
@@ -56,17 +55,8 @@ export interface ResetDeps {
   /** `ps -o command= -p <pid>` — the safety check before killing the pidfile's pid. */
   commandOf?: (pid: number) => string | undefined;
   killPid?: (pid: number) => void;
-  /** The Grok Bot job's plist; defaults to ~/Library/LaunchAgents/gg.nomo.activity.plist. Tests point it at a temp path. */
-  grokBotPlistPath?: string;
   /** The activity cycle (scan + forced upload); tests inject a stub so the real history is never read. */
   activityCycle?: (deps: CycleDeps) => Promise<ActivityOutcome>;
-}
-
-/** Is the hourly Grok Bot job installed here? Its plist is written by plugin/scripts/grokbot-install.mjs
- *  (its PLIST constant — keep the two paths in step). macOS only; any doubt → false. Lives here, not in
- *  core/shared, so no other bundle changes. */
-function grokBotJobInstalled(path: string = `${process.env.HOME}/Library/LaunchAgents/gg.nomo.activity.plist`): boolean {
-  try { return process.platform === "darwin" && existsSync(path); } catch { return false; }
 }
 
 /** The `ps -o command= -p <pid>` line for a pid, or undefined when the pid is gone / ps fails. */
@@ -134,28 +124,18 @@ export async function reset(deps: ResetDeps = {}): Promise<number> {
 
   // 1. Watchdog.
   const wd = await stopWatchdog(deps);
-  // The session records, listed here (before the line below) instead of in step 2; nothing is printed
-  // in between, so the output order is unchanged.
+  if (wd === "killed") print("Stopped the watchdog (it restarts automatically on your next session).");
+  else if (wd === "stale-pidfile") print("Removed a stale watchdog pidfile (no watchdog was running).");
+  else print("No watchdog running.");
+
+  // 2. Session sweep — needs the pairing only for the phone-side end; local cleanup works unpaired.
+  const config = await (deps.loadConfigFn ?? loadConfig)();
   let files: string[] = [];
   try {
     files = (await readdir(sessionsDir)).filter((f) => f.endsWith(".json"));
   } catch {
     files = []; // no sessions dir yet
   }
-  // Grok Bot job installed AND no sessions: "it restarts on your next session" may never happen, while
-  // "the hourly Grok Bot job keeps counting your days" is true whether or not another agent is also
-  // installed — so no per-agent detection is needed. Any doubt → today's wording.
-  const grokBotWording = files.length === 0 && grokBotJobInstalled(deps.grokBotPlistPath);
-  if (wd === "killed") {
-    print(grokBotWording
-      ? "Stopped the watchdog (the hourly Grok Bot job keeps counting your days)."
-      : "Stopped the watchdog (it restarts automatically on your next session).");
-  }
-  else if (wd === "stale-pidfile") print("Removed a stale watchdog pidfile (no watchdog was running).");
-  else print("No watchdog running.");
-
-  // 2. Session sweep — needs the pairing only for the phone-side end; local cleanup works unpaired.
-  const config = await (deps.loadConfigFn ?? loadConfig)();
   let cleared = 0;
   let ended = 0;
   let kept = 0;

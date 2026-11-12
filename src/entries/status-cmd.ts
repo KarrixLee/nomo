@@ -471,7 +471,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   /** The commands to name in a fix. With no calling agent there is no right prefix to suggest, so the
    *  no-argument render falls back to Claude's — the same thing it did before this change. */
   const ui = AGENT_UI[audience ?? "claude"];
-  // A fix that always works: the terminal form needs no agent (a Grok Bot-only Mac has none). Inside an
+  // A fix that always works: the terminal form needs no agent. Inside an
   // agent its own command comes first; run from a terminal (no audience), the terminal form does.
   const pairHint = audience ? `${ui.pair} (or bunx nomo-ai pair)` : "bunx nomo-ai pair (or your agent's pair command)";
 

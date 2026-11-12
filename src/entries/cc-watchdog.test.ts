@@ -15,7 +15,7 @@ import {
   CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid, resolveCodexTuiOwner,
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
   codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPendingUpdate, resealForPairing, shouldReseal, noteResend, resendAllowed, resendBackoffMs, resetResendBackoff, RESEND_BACKOFF_MAX_MS, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
-  enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, scheduledActivityRun, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
+  enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS, pruneStaleDecisionHolds,
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS, RETIRE_AFTER_MS,
   buildWorkingEnvelope, postOutcomeForStatus, provisionalsCoveredByReal, reconcileProvisionalsSweep, recordMovedSince, resetCommandState, resetDoneAttemptMemory, retireDoneStale,
@@ -43,24 +43,6 @@ const rec = (over: Partial<SessionRecord> = {}): SessionRecord => ({
 // record write can't unbound it — see effectiveDoneAttempts). That state is per-process, exactly as it is
 // in the real daemon, so each test starts from a fresh daemon's view of the world.
 beforeEach(() => { resetDoneAttemptMemory(); });
-
-describe("scheduledActivityRun (--scheduled: the hourly launchd job is an activity one-shot)", () => {
-  test("any live watchdog, any version or build: does nothing (that one runs the activity loop)", async () => {
-    let cycles = 0;
-    for (const raw of ["4242 2.4.5 b1", "4242 2.4.1", "4242"]) {
-      const r = await scheduledActivityRun({ readPidfile: () => raw, isLive: () => true, cycle: async () => { cycles++; } });
-      expect(r).toBe("deferred");
-    }
-    expect(cycles).toBe(0);
-  });
-  test("no live watchdog (no pidfile, or a dead pid): exactly one activity cycle", async () => {
-    let cycles = 0;
-    const cycle = async () => { cycles++; };
-    expect(await scheduledActivityRun({ readPidfile: () => { throw new Error("ENOENT"); }, cycle })).toBe("ran");
-    expect(await scheduledActivityRun({ readPidfile: () => "4242 2.4.2", isLive: () => false, cycle })).toBe("ran");
-    expect(cycles).toBe(2);
-  });
-});
 
 describe("per-sweep watchdog pidfile ownership", () => {
   test("a non-owner self-exits at the sweep gate and cleans up its bridge/proxy children", () => {

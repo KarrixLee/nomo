@@ -60,7 +60,7 @@ import {
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
-import { runActivityCycle, startActivityLoop } from "../core/activity";
+import { startActivityLoop } from "../core/activity";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -4619,30 +4619,6 @@ async function run(): Promise<void> {
     activeLanListener = undefined;
     releaseSingleInstance(); // auto-quit on empty: drop our pidfile so the next hook re-spawns
   }
-}
-
-/** `--scheduled` — the Grok Bot leg's hourly launchd job (plugin/scripts/grokbot-install.mjs). An ACTIVITY
- *  ONE-SHOT, never a session watchdog: that job runs at background priority, and a throttled daemon must
- *  never end up serving live sessions (approvals, Live Activity, LAN). So it claims no pidfile, starts no
- *  LAN listener, sweeps nothing and does not linger:
- *    - any live watchdog (any version or build) → do nothing; that one runs the activity loop itself;
- *    - otherwise → one activity cycle with the normal gates (unpaired → nothing), then exit.
- *  Pairing is not its job: `pair` starts a normal watchdog, which completes the pairing and sends the
- *  first upload within a minute. Returns what it did (for tests). */
-export async function scheduledActivityRun(deps: {
-  readPidfile?: () => string; isLive?: (pid: number) => boolean; cycle?: () => Promise<unknown>;
-} = {}): Promise<"deferred" | "ran"> {
-  try {
-    const holder = parseWatchdogPidfile((deps.readPidfile ?? (() => readFileSync(WATCHDOG_PID_PATH, "utf8")))());
-    if (holder && (deps.isLive ?? watchdogHolderIsLive)(holder.pid)) return "deferred";
-  } catch { /* no pidfile → nobody is running */ }
-  await (deps.cycle ?? (() => runActivityCycle()))();
-  return "ran";
-}
-
-if (import.meta.main && process.argv.includes("--scheduled")) {
-  try { await scheduledActivityRun(); } catch { /* silence is the contract */ }
-  process.exit(0);
 }
 
 if (import.meta.main) {

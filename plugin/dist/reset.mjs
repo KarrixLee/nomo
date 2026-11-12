@@ -3,15 +3,14 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/reset.ts
 import { execFileSync as execFileSync2 } from "node:child_process";
-import { existsSync as existsSync3 } from "node:fs";
 import { readdir as readdir2, readFile as readFile3, unlink as unlink2 } from "node:fs/promises";
-import { basename as basename3 } from "node:path";
+import { basename as basename2 } from "node:path";
 
 // src/core/activity.ts
 import { createHash as createHash2, randomUUID } from "node:crypto";
-import { constants as fsConstants, createReadStream, existsSync as existsSync2 } from "node:fs";
-import { open as open2, readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
-import { basename as basename2, dirname as dirname2 } from "node:path";
+import { createReadStream, existsSync as existsSync2 } from "node:fs";
+import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { dirname as dirname2 } from "node:path";
 import * as zlib from "node:zlib";
 
 // src/core/crypto.ts
@@ -1412,8 +1411,7 @@ async function openReadOnly(path) {
 var defaultRoots = () => ({
   claude: `${process.env.HOME}/.claude/projects`,
   codex: codexHome(),
-  opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`,
-  grokBot: process.platform === "darwin" ? `${process.env.HOME}/Library/Application Support/Grok Bot/sand-client-persistence` : ""
+  opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`
 });
 async function readClaude(root, cursor, sink, progress, seen) {
   for (const f of await listFiles(root, (n) => n.endsWith(".jsonl"))) {
@@ -1527,62 +1525,6 @@ async function readOpenCode(dbPath, sink, sinceMs) {
     db.close();
   }
 }
-function base32(s) {
-  const out = [];
-  let v = 0, bits = 0;
-  for (const ch of s) {
-    const i = "abcdefghijklmnopqrstuvwxyz234567".indexOf(ch);
-    if (i < 0)
-      return null;
-    v = (v << 5 | i) & 65535;
-    bits += 5;
-    if (bits >= 8) {
-      bits -= 8;
-      out.push(v >> bits & 255);
-    }
-  }
-  return Buffer.from(out).toString("utf8");
-}
-var GB_MAX_BYTES = 4194304;
-var GB_KEY = /\.transcript\.replicas\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
-async function readGrokBot(dir, sink, now) {
-  if (!dir)
-    return;
-  const events = [];
-  const names = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  for (const ent of names) {
-    if (!ent.isFile() || !ent.name.endsWith(".blob"))
-      continue;
-    const bot = base32(basename2(ent.name, ".blob"))?.match(GB_KEY)?.[1];
-    if (!bot)
-      continue;
-    try {
-      const fh = await open2(`${dir}/${ent.name}`, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | fsConstants.O_NOFOLLOW);
-      let text;
-      try {
-        const st = await fh.stat();
-        if (!st.isFile() || st.size > GB_MAX_BYTES)
-          continue;
-        text = await fh.readFile("utf8");
-      } finally {
-        await fh.close();
-      }
-      const keep = (k, v) => typeof v === "string" && k !== "kind" && k !== "role" && k !== "id" ? undefined : v;
-      for (const e of JSON.parse(text, keep).value.entries) {
-        const kind = e?.kind === "message" && e.role === "user" ? "turn" : e?.kind === "send-message" ? "assistant" : null;
-        if (!kind || e.isStreaming || typeof e.id !== "string")
-          continue;
-        if (!Number.isFinite(e.timestampMs) || e.timestampMs <= 0 || e.timestampMs > now + 86400000)
-          continue;
-        events.push({ ts: e.timestampMs, agent: "grokbot", sessionId: bot, kind, id: `gb:${bot}:${e.id}` });
-      }
-    } catch {}
-  }
-  const prompted = new Set(events.filter((ev) => ev.kind === "turn").map((ev) => localDate(ev.ts)));
-  for (const ev of events)
-    if (prompted.has(localDate(ev.ts)))
-      sink(ev);
-}
 async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
   const sink = (ev) => {
     addEvent(state, ev);
@@ -1605,9 +1547,6 @@ async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
   } catch {}
   try {
     await readOpenCode(roots.opencode, sink, since("opencode"));
-  } catch {}
-  try {
-    await readGrokBot(roots.grokBot, sink, now);
   } catch {}
   for (const p of Object.keys(cursor))
     if (!seen.has(p))
@@ -1716,13 +1655,6 @@ function classifyResetSession(record, isAlive) {
     return "clear";
   return isAlive(record.pid) ? "keep" : "clear";
 }
-function grokBotJobInstalled(path = `${process.env.HOME}/Library/LaunchAgents/gg.nomo.activity.plist`) {
-  try {
-    return process.platform === "darwin" && existsSync3(path);
-  } catch {
-    return false;
-  }
-}
 function psCommandOf(pid) {
   try {
     const out = execFileSync2("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
@@ -1778,20 +1710,19 @@ async function reset(deps = {}) {
   const sessionsDir = deps.sessionsDir ?? SESSIONS_DIR;
   const isAlive = deps.isAlive ?? pidAlive;
   const wd = await stopWatchdog(deps);
+  if (wd === "killed")
+    print("Stopped the watchdog (it restarts automatically on your next session).");
+  else if (wd === "stale-pidfile")
+    print("Removed a stale watchdog pidfile (no watchdog was running).");
+  else
+    print("No watchdog running.");
+  const config = await (deps.loadConfigFn ?? loadConfig)();
   let files = [];
   try {
     files = (await readdir2(sessionsDir)).filter((f) => f.endsWith(".json"));
   } catch {
     files = [];
   }
-  const grokBotWording = files.length === 0 && grokBotJobInstalled(deps.grokBotPlistPath);
-  if (wd === "killed") {
-    print(grokBotWording ? "Stopped the watchdog (the hourly Grok Bot job keeps counting your days)." : "Stopped the watchdog (it restarts automatically on your next session).");
-  } else if (wd === "stale-pidfile")
-    print("Removed a stale watchdog pidfile (no watchdog was running).");
-  else
-    print("No watchdog running.");
-  const config = await (deps.loadConfigFn ?? loadConfig)();
   let cleared = 0;
   let ended = 0;
   let kept = 0;
@@ -1807,7 +1738,7 @@ async function reset(deps = {}) {
       kept++;
       continue;
     }
-    if (config && await postEnd(config, basename3(f, ".json"), fetchFn))
+    if (config && await postEnd(config, basename2(f, ".json"), fetchFn))
       ended++;
     await unlink2(path).catch(() => {});
     cleared++;

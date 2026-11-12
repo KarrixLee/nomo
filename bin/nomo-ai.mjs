@@ -32,7 +32,7 @@
 //     marketplace is install-time behaviour; it has no business in an update.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
@@ -96,9 +96,7 @@ Agents (naming any one of these skips the prompt):
   --opencode              OpenCode
   --cursor                Cursor (desktop app + cursor-agent CLI)
   --antigravity           Google Antigravity (desktop app + agy CLI)
-  --grokbot               Grok Bot desktop app (macOS): an hourly job sends its days to
-                          the Activity widget
-  --all                   all of them (Cursor/Antigravity/Grok Bot only if on this machine)
+  --all                   all of them (Cursor/Antigravity only if on this machine)
 
 Options:
   -y, --yes               no prompt; install every agent detected on this machine
@@ -106,9 +104,9 @@ Options:
   -n, --dry-run           print the commands that would run, run nothing
       --global            also install the short \`nomo\` command (asked, default Yes, in a
                           terminal; this flag says yes without asking)
-      --ref <branch|tag>  OpenCode, Cursor, Antigravity and Grok Bot only: install from
-                          this ref of the repo instead of its default branch. Claude Code
-                          and Codex install through their own marketplaces, which read the
+      --ref <branch|tag>  OpenCode, Cursor and Antigravity only: install from this ref of the
+                          repo instead of its default branch. Claude Code and Codex
+                          install through their own marketplaces, which read the
                           default branch and take no ref — --ref cannot pin them.
   -h, --help              this
   -v, --version           print the version
@@ -119,7 +117,6 @@ ${INVOKED === "nomo" ? "" : "\nShort form: after `bun add -g nomo-ai` (or `npm i
 Uninstall (removes only what Nomo wrote; your phone stays paired for your other agents):
   ${CMD} uninstall --cursor        Nomo's entries in ~/.cursor/hooks.json + /nomo-* skills
   ${CMD} uninstall --antigravity   the "nomo" block in ~/.gemini/config/hooks.json + plugin
-  ${CMD} uninstall --grokbot       the hourly job ~/Library/LaunchAgents/gg.nomo.activity.plist
   (the same as: node ~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall)
 Not covered — each host removes its own install:
   Claude Code   claude plugin uninstall nomo-cc@nomo
@@ -240,9 +237,6 @@ const cursorDir = () => process.env.CURSOR_CONFIG_DIR || join(homedir(), ".curso
 /** Antigravity's installer, and its global customization dir (holds hooks.json). */
 const ANTIGRAVITY_SCRIPT = join(CHECKOUT, "plugin", "scripts", "antigravity-install.mjs");
 const antigravityDir = () => join(homedir(), ".gemini", "config");
-/** Grok Bot's installer (an hourly LaunchAgent; the app has no hooks), and the file it writes. */
-const GROKBOT_SCRIPT = join(CHECKOUT, "plugin", "scripts", "grokbot-install.mjs");
-const grokbotPlist = () => join(homedir(), "Library", "LaunchAgents", "gg.nomo.activity.plist");
 
 /** Is Nomo already installed for this host? Answered from the host's OWN plugin cache
  *  (`<cache>/<marketplace>/<plugin>/`): the MARKETPLACE directory name is whatever the user called it,
@@ -635,79 +629,6 @@ const AGENTS = [
         : null;
     },
   },
-  {
-    // Grok Bot has no hooks (its Bots run on a cloud computer), so nothing would ever start the watchdog
-    // that runs the activity scan. grokbot-install.mjs adds one per-user LaunchAgent that starts the
-    // existing watchdog at login and hourly — see that script's header. macOS only.
-    id: "grokbot",
-    label: "Grok Bot",
-    plan: () =>
-      STATUS.get("grokbot")?.installed
-        ? [`already installed — updates ${CHECKOUT}, then refreshes the hourly job`]
-        : [
-            `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
-            `node ${GROKBOT_SCRIPT}`,
-          ],
-    next: (/** @type {string} */ cli) =>
-      STATUS.get("grokbot")?.installed
-        ? ["nothing to restart — the next hourly run uses the update"]
-        : ["if this Mac is not paired yet, pair it (then scan the QR):", `  ${cli} pair`, "check it works:", `  ${cli} status`],
-    // Done HERE, not by the checkout's script: it must work after ~/.nomo is gone. Only our one label/file.
-    uninstall() {
-      if (process.platform !== "darwin") {
-        say(`  ${dim("nothing to remove — the Grok Bot job only exists on macOS")}`);
-        return null;
-      }
-      const plist = grokbotPlist();
-      const target = `gui/${process.getuid?.() ?? ""}/gg.nomo.activity`;
-      if (DRY) {
-        say(`  ${dim("would run:")} launchctl bootout ${target}`);
-        say(`  ${dim("would remove:")} ${plist}`);
-        return null;
-      }
-      const loaded = spawnSync("launchctl", ["print", target], { encoding: "utf8" }).status === 0;
-      let fail = null;
-      if (loaded) {
-        const r = spawnSync("launchctl", ["bootout", target], { encoding: "utf8" });
-        if (r.status !== 0) fail = `launchctl bootout ${target} failed: ${`${r.stderr ?? ""}${r.stdout ?? ""}`.trim() || r.error?.message || `exit ${r.status}`}`;
-      }
-      const had = existsSync(plist);
-      rmSync(plist, { force: true });
-      if (fail) {
-        err(`  ${fail}`);
-        err(`  ${had ? `Removed ${plist}, so it will not start again after you log out.` : ""} To stop it now: launchctl bootout ${target}`);
-      } else {
-        say(`  ${loaded ? `unloaded and removed ${plist}` : had ? `removed ${plist}` : "not installed — nothing to remove"}`);
-      }
-      // Order does not matter: unpair needs only config.json and the plugin files, both left in place.
-      say(`  ${dim("pairing is untouched — to disconnect this Mac from your phone, run `bunx nomo-ai unpair` (before or after this)")}`);
-      return fail;
-    },
-    detect: () =>
-      process.platform === "darwin" &&
-      (existsSync("/Applications/Grok Bot.app") || existsSync(join(homedir(), "Library", "Application Support", "Grok Bot"))),
-    skipUndetectedUnderAll: true,
-    installed: () => existsSync(grokbotPlist()),
-    install() {
-      if (process.platform !== "darwin") {
-        return { error: "Grok Bot setup is macOS only (it adds a per-user launchd job)", hint: "Nothing was changed." };
-      }
-      const checkout = ensureCheckout("Grok Bot", "grokbot-install.mjs");
-      if (checkout) return checkout;
-      if (!DRY && !existsSync(GROKBOT_SCRIPT)) {
-        return {
-          error: `${GROKBOT_SCRIPT} is missing from the checkout`,
-          hint: REF
-            ? `Does \`${REF}\` have Grok Bot support? Older refs do not ship that script.`
-            : `Delete ${CHECKOUT} and re-run.`,
-        };
-      }
-      const fail = run(process.execPath, [GROKBOT_SCRIPT]);
-      return fail
-        ? { error: fail, hint: `The script's own line above says what it refused and why. Fix that and re-run;\n    ${process.execPath} ${GROKBOT_SCRIPT}` }
-        : null;
-    },
-  },
 ];
 
 /** Fill STATUS, ONCE, before anything is rendered. Everything expensive lives here for one reason:
@@ -797,9 +718,9 @@ function parseArgs(argv) {
  *  "install this version" while two of three legs quietly ignore it is worse than no flag. */
 function refCaveat(selected) {
   /** The two that install from ~/.nomo. @param {{id: string}} a */
-  const pinned = (a) => a.id === "opencode" || a.id === "cursor" || a.id === "antigravity" || a.id === "grokbot";
+  const pinned = (a) => a.id === "opencode" || a.id === "cursor" || a.id === "antigravity";
   const ignoring = AGENTS.filter((a) => !pinned(a) && selected.has(a.id)).map((a) => a.label);
-  say(`${bold("Note:")} --ref ${REF} pins the ${CHECKOUT} checkout (OpenCode, Cursor, Antigravity, Grok Bot) only.`);
+  say(`${bold("Note:")} --ref ${REF} pins the ${CHECKOUT} checkout (OpenCode, Cursor, Antigravity) only.`);
   if (ignoring.length > 0) {
     say(dim(`  ${ignoring.join(" and ")} install through their own marketplace, which takes an`));
     say(dim(`  owner/repo and reads ${REPO}'s default branch. There is no ref to pass it, so`));
@@ -1119,18 +1040,13 @@ function banner() {
 function uninstall(selected) {
   if (selected.size === 0) {
     err("nomo-ai: --uninstall needs to know which agent — name it, e.g.:");
-    err("  bunx nomo-ai uninstall --cursor   (or --antigravity, --grokbot)");
+    err("  bunx nomo-ai uninstall --cursor   (or --antigravity)");
     return 2;
   }
   if (DRY) say(dim("dry run — nothing will be removed\n"));
   const failures = [];
   for (const agent of AGENTS.filter((a) => selected.has(a.id))) {
     say(bold(agent.label));
-    if (agent.uninstall) {
-      if (agent.uninstall()) failures.push(agent);
-      say();
-      continue;
-    }
     if (!agent.uninstallScript) {
       say(`  ${dim("not covered by nomo-ai — remove it with:")}`);
       say(`    ${bold(agent.manualUninstall)}`);
@@ -1159,10 +1075,9 @@ function uninstall(selected) {
 // ── commands: pair / status / reset / unpair ──────────────────────────────────────────────────────────────
 //
 // The same plugin entries the agents' slash commands run (/nomo-cc:pair, $nomo-reset, /nomo-status…),
-// for a human in any folder — and the only way in for a Grok Bot-only Mac, which has no agent to type
-// them into. This package ships no plugin code, so each command finds the INSTALLED copy the way the
-// rest of the plugin does and runs its dist entry through that copy's run.sh (bun/node resolution and
-// bun's --config=/dev/null --env-file=/dev/null live there). Pairing, sessions and the watchdog are one
+// for a human in any folder. This package ships no plugin code, so each command finds the INSTALLED
+// copy the way the rest of the plugin does and runs its dist entry through that copy's run.sh (bun/node
+// resolution and bun's --config=/dev/null --env-file=/dev/null live there). Pairing, sessions and the watchdog are one
 // shared state folder per computer, so one reset or pairing here covers every agent.
 
 /** command → [dist entry, argv]. `pair` is the start + the wait in one go, as the slash commands do in
@@ -1199,7 +1114,7 @@ function versionNewer(a, b) {
 
 /** Every installed copy the hook shim would launch, plus ~/.nomo, in tie-break order: the stamp root
  *  (both fields, ABSOLUTE root only — a malformed stamp can never mean the current folder), ~/.nomo
- *  (OpenCode, Cursor, Antigravity, Grok Bot), then the shim's own cache scan (hook-shim.sh step b):
+ *  (OpenCode, Cursor, Antigravity), then the shim's own cache scan (hook-shim.sh step b):
  *  `~/.codex|.claude/plugins/cache/<marketplace>/<nomo|nomo-cc>/<version>/`, skipping a Codex
  *  `.orphaned_at` (superseded) directory. Marketplace checkouts are never candidates (NOM-134).
  *  @returns {string[]} */
@@ -1455,9 +1370,9 @@ async function main() {
   const selected = explicit ? args.picked : new Set(args.yes ? found : []);
 
   if (!explicit && found.length === 0) {
-    err("\nnomo-ai: found no Claude Code, Codex, OpenCode, Cursor, Antigravity or Grok Bot install on this machine.");
-    err("  Looked for `claude`, `codex`, `opencode`, `cursor-agent`, `agy` on PATH and ~/.claude, ~/.codex, ~/.config/opencode, ~/.cursor, ~/.gemini/config, /Applications/Grok Bot.app.");
-    err("  Name one anyway with --claude / --codex / --opencode / --cursor / --antigravity / --grokbot, or --all.");
+    err("\nnomo-ai: found no Claude Code, Codex, OpenCode, Cursor or Antigravity install on this machine.");
+    err("  Looked for `claude`, `codex`, `opencode`, `cursor-agent`, `agy` on PATH and ~/.claude, ~/.codex, ~/.config/opencode, ~/.cursor, ~/.gemini/config.");
+    err("  Name one anyway with --claude / --codex / --opencode / --cursor / --antigravity, or --all.");
     return 1;
   }
 
@@ -1468,11 +1383,6 @@ async function main() {
     ? AGENTS.filter((a) => a.skipUndetectedUnderAll && !args.named.has(a.id) && !a.detect())
     : [];
   for (const a of skipped) selected.delete(a.id);
-  // The Grok Bot leg is for a Mac whose ONE agent is Grok Bot: any other agent's hooks already run the
-  // same activity scan. So -y / --all add it only when it is the only agent here; naming --grokbot always
-  // does, and the picker still lists it (unticked) for a deliberate choice.
-  const grokLeftOut = !!selected?.has("grokbot") && !args.named?.has("grokbot") && found.some((id) => id !== "grokbot");
-  if (grokLeftOut) selected?.delete("grokbot");
 
   preflight(selected, explicit);
 
@@ -1483,7 +1393,7 @@ async function main() {
   if (!explicit && !args.yes) {
     if (!interactive()) {
       err("\nnomo-ai: not a terminal, so there is nobody to ask.");
-      err("  Pass --yes to install everything detected, or name agents: --claude --codex --opencode --cursor --antigravity --grokbot / --all.");
+      err("  Pass --yes to install everything detected, or name agents: --claude --codex --opencode --cursor --antigravity / --all.");
       return 2;
     }
     const answer = await choose(selected);
@@ -1505,7 +1415,6 @@ async function main() {
   for (const a of skipped) {
     say(`${a.label} was not found on this machine — skipped. Name it with --${a.id} to install it anyway.\n`);
   }
-  if (grokLeftOut) say("Grok Bot left out — another agent here already sends its activity. Name it with --grokbot to install it anyway.\n");
 
   if (REF) refCaveat(selected);
 
@@ -1541,8 +1450,7 @@ async function main() {
     say(bold("Next:"));
     for (const a of done) {
       say(`  ${a.label}`);
-      // A two-space prefix marks a line to TYPE (as in showUpdate): no bullet, so it copies clean.
-      for (const step of a.next(cli)) say(step.startsWith("  ") ? `      ${bold(step.trim())}` : `    - ${step}`);
+      for (const step of a.next()) say(`    - ${step}`);
     }
     say();
     say(dim(`Pairing is one QR scan from the Nomo app's Sessions tab (\`${cli} pair\` from any folder). One pairing covers every agent.`));
