@@ -25,6 +25,7 @@ import { readdir, readFile, unlink } from "node:fs/promises";
 import { basename } from "node:path";
 import { ActivityOutcome, CycleDeps, runActivityCycle } from "../core/activity";
 import { Config, isWatchdogCommand, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
+import { terminalCommand } from "../core/terminal-command";
 
 export type ResetVerdict = "clear" | "keep";
 
@@ -57,6 +58,8 @@ export interface ResetDeps {
   killPid?: (pid: number) => void;
   /** The activity cycle (scan + forced upload); tests inject a stub so the real history is never read. */
   activityCycle?: (deps: CycleDeps) => Promise<ActivityOutcome>;
+  /** The installer's short-command record (see terminalCommand); tests point it at a temp file. */
+  shortCommandPath?: string;
 }
 
 /** The `ps -o command= -p <pid>` line for a pid, or undefined when the pid is gone / ps fails. */
@@ -171,7 +174,7 @@ export async function reset(deps: ResetDeps = {}): Promise<number> {
     else if (outcome === "empty") print("No activity to send yet.");
     else print("Could not send your activity summary right now — it will be sent again automatically later.");
   }
-  print("Pairing and keys were not touched — to disconnect this computer, run bunx nomo-ai unpair (or your agent's unpair command).");
+  print(`Pairing and keys were not touched — to disconnect this computer, run ${terminalCommand("unpair", deps.shortCommandPath)}, or your agent's unpair command.`);
   return 0;
 }
 

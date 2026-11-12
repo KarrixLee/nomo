@@ -1647,6 +1647,21 @@ function startActivityLoop(load = loadConfig, cycle = runActivityCycle) {
   return () => timers.forEach(clearInterval);
 }
 
+// src/core/terminal-command.ts
+import { readFileSync as readFileSync2 } from "node:fs";
+var SHORT_COMMAND_PATH = `${CC_DIR}/short-command`;
+function terminalCommand(cmd, recordPath = SHORT_COMMAND_PATH) {
+  let rec = "";
+  try {
+    rec = readFileSync2(recordPath, "utf8").trim();
+  } catch {}
+  if (rec === "1")
+    return `nomo ${cmd}`;
+  if (rec === "0")
+    return `bunx nomo-ai ${cmd}`;
+  return `nomo ${cmd} (or bunx nomo-ai ${cmd})`;
+}
+
 // src/entries/reset.ts
 function classifyResetSession(record, isAlive) {
   if (!record || typeof record.pid !== "number" || !Number.isFinite(record.pid))
@@ -1764,7 +1779,7 @@ async function reset(deps = {}) {
     else
       print("Could not send your activity summary right now — it will be sent again automatically later.");
   }
-  print("Pairing and keys were not touched — to disconnect this computer, run bunx nomo-ai unpair (or your agent's unpair command).");
+  print(`Pairing and keys were not touched — to disconnect this computer, run ${terminalCommand("unpair", deps.shortCommandPath)}, or your agent's unpair command.`);
   return 0;
 }
 if (__require.main == __require.module) {

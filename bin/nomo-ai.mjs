@@ -32,7 +32,7 @@
 //     marketplace is install-time behaviour; it has no business in an update.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
@@ -70,14 +70,15 @@ const VERSION = JSON.parse(
 /** The name this was run as: `nomo` (the short bin, after `bun add -g nomo-ai`) or `nomo-ai`. Only the
  *  help text uses it. Never suggest `bunx nomo`/`npx nomo`: the npm package `nomo` is someone else's. */
 const INVOKED = (process.argv[1] ?? "").split("/").pop() === "nomo" ? "nomo" : "nomo-ai";
-const CMD = INVOKED === "nomo" ? "nomo" : "bunx nomo-ai";
+/** How the help names commands: `nomo` when run as it or when ours is on PATH, else `bunx nomo-ai`. */
+const CMD = INVOKED === "nomo" || ["ours", "old"].includes(shortCommandState()) ? "nomo" : "bunx nomo-ai";
 /** One help row: the command, padded so the descriptions line up whichever name is shown. */
 const row = (/** @type {string} */ c, /** @type {string} */ what) => `  ${`${CMD}${c}`.padEnd(CMD.length + 12)} ${what}`;
 
 const USAGE = `${INVOKED} ${VERSION} — install (or update) the Nomo plugin for your coding agents.
 
 ${row("", "detect agents, confirm, install")}
-${INVOKED === "nomo" ? "" : `  ${"npx nomo-ai".padEnd(CMD.length + 12)} same, without bun\n`}
+${CMD === "nomo" ? "" : `  ${"npx nomo-ai".padEnd(CMD.length + 12)} same, without bun\n`}
 Commands (from any folder; they run your installed Nomo, shared by every agent here):
 ${row(" pair", "pair this computer with your phone (opens the QR page, then waits")}
 ${row("", "for the scan); `pair code` prints the typeable code instead").replace(CMD, " ".repeat(CMD.length))}
@@ -102,8 +103,8 @@ Options:
   -y, --yes               no prompt; install every agent detected on this machine
       --uninstall         same as the \`uninstall\` command
   -n, --dry-run           print the commands that would run, run nothing
-      --global            also install the short \`nomo\` command (asked, default Yes, in a
-                          terminal; this flag says yes without asking)
+      --no-global         do not install the short \`nomo\` command (installed by default
+                          once an agent is set up, so \`nomo pair\` works from any folder)
       --ref <branch|tag>  OpenCode, Cursor and Antigravity only: install from this ref of the
                           repo instead of its default branch. Claude Code and Codex
                           install through their own marketplaces, which read the
@@ -113,7 +114,7 @@ Options:
 
 Installing never pairs your phone — that stays a deliberate step: \`${CMD} pair\`,
 or from inside the agent (/nomo-cc:pair, $nomo-pair, /nomo-pair).
-${INVOKED === "nomo" ? "" : "\nShort form: after `bun add -g nomo-ai` (or `npm install -g nomo-ai`), `nomo pair`,\n`nomo status`, … work too. Never `bunx nomo` / `npx nomo`: that package is not ours.\n"}
+${CMD === "nomo" ? "" : "\nShort form: the installer also adds the `nomo` command, so `nomo pair`, `nomo status`, …\nwork too. Never `bunx nomo` / `npx nomo`: that package is not ours.\n"}
 Uninstall (removes only what Nomo wrote; your phone stays paired for your other agents):
   ${CMD} uninstall --cursor        Nomo's entries in ~/.cursor/hooks.json + /nomo-* skills
   ${CMD} uninstall --antigravity   the "nomo" block in ~/.gemini/config/hooks.json + plugin
@@ -689,7 +690,7 @@ function parseArgs(argv) {
   let all = false;
   let yes = false;
   let uninstall = false;
-  let global = false;
+  let noGlobal = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") return { help: true };
@@ -697,7 +698,10 @@ function parseArgs(argv) {
     else if (a === "-y" || a === "--yes") yes = true;
     else if (a === "-n" || a === "--dry-run") DRY = true;
     else if (a === "--uninstall") uninstall = true;
-    else if (a === "--global") global = true;
+    // --global was the opt-in when the short command was asked about; it is the default now, so the
+    // flag is still accepted (old scripts and docs) and does nothing.
+    else if (a === "--global") {}
+    else if (a === "--no-global") noGlobal = true;
     else if (a === "--all") {
       all = true;
       for (const ag of AGENTS) picked.add(ag.id);
@@ -711,7 +715,7 @@ function parseArgs(argv) {
       named.add(a.slice(2));
     } else return { bad: a };
   }
-  return { picked, yes, all, named, uninstall, global };
+  return { picked, yes, all, named, uninstall, noGlobal };
 }
 
 /** --ref reaches exactly one leg. Saying so out loud is the whole point: a flag that reads as
@@ -1040,7 +1044,7 @@ function banner() {
 function uninstall(selected) {
   if (selected.size === 0) {
     err("nomo-ai: --uninstall needs to know which agent — name it, e.g.:");
-    err("  bunx nomo-ai uninstall --cursor   (or --antigravity)");
+    err(`  ${CMD} uninstall --cursor   (or --antigravity)`);
     return 2;
   }
   if (DRY) say(dim("dry run — nothing will be removed\n"));
@@ -1068,7 +1072,7 @@ function uninstall(selected) {
     say();
   }
   // Not removed here: every agent's terminal commands use it, not just the one being removed.
-  if (shortCommandState() === "ours") say(dim(`The short \`nomo\` command stays. To remove it too: ${globalInstallCmd(true).join(" ")}`));
+  if (["ours", "old"].includes(shortCommandState())) say(dim(`The short \`nomo\` command stays. To remove it too: ${globalInstallCmd(true).join(" ")}`));
   return failures.length > 0 ? 1 : 0;
 }
 
@@ -1179,19 +1183,18 @@ function runCommand(name, rest) {
   return code;
 }
 
-// ── the short `nomo` command (optional) ──────────────────────────────────────────────────────────
+// ── the short `nomo` command ─────────────────────────────────────────────────────────────────────
 //
 // `nomo pair` instead of `bunx nomo-ai pair`, by installing this same package globally (its second bin
-// is `nomo`). Offered once after a successful install in a terminal, default Yes (Return installs, n
-// skips); `--global` says yes without asking.
+// is `nomo`). Installed after a successful install, asked of nobody; `--no-global` skips it.
 // Never `bunx nomo` / `npx nomo`: that npm package is someone else's. No sudo, ever — a failed install
 // is one line and the run's exit status is unchanged.
 
 /** Is `nomo` on PATH, and is it THIS package? Decided from the file it resolves to (bin/nomo-ai.mjs
  *  with a package.json named nomo-ai beside it) — a foreign `nomo` is never executed to find out.
  *  `node_modules/.bin` entries are skipped: npx/bunx put the package's own bins there while it runs,
- *  which is not an install.
- *  @returns {"ours" | "foreign" | "missing"} */
+ *  which is not an install. "old" is ours at another version than this run's.
+ *  @returns {"ours" | "old" | "foreign" | "missing"} */
 function shortCommandState() {
   for (const dir of (process.env.PATH || "").split(":")) {
     if (!dir || dir.endsWith("/node_modules/.bin")) continue;
@@ -1204,7 +1207,8 @@ function shortCommandState() {
     try {
       const real = realpathSync(p);
       const pkg = JSON.parse(readFileSync(join(dirname(real), "..", "package.json"), "utf8"));
-      return real.endsWith("/bin/nomo-ai.mjs") && pkg.name === "nomo-ai" ? "ours" : "foreign";
+      if (!real.endsWith("/bin/nomo-ai.mjs") || pkg.name !== "nomo-ai") return "foreign";
+      return pkg.version === VERSION ? "ours" : "old";
     } catch {
       return "foreign";
     }
@@ -1247,67 +1251,37 @@ function ask(rl, q) {
   });
 }
 
-/** A yes/no question, default YES: Return, `y` or `yes` → yes; `n`, `no` or anything else → no; end of
- *  input (Ctrl-D, closed stdin) → no — nothing is installed without an explicit Return or yes. Ctrl-C
- *  is the terminal's own SIGINT and ends the process. Only ever called with a terminal.
- *  @param {string} q */
-async function askYesNo(q) {
-  const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-  try {
-    const a = await ask(rl, q);
-    if (a === null) {
-      say();
-      return false;
-    }
-    return /^(y(es)?)?$/i.test(a.trim());
-  } finally {
-    rl.close();
-  }
-}
-
-/** Offer (or, with --global, do) the global install. Returns whether `nomo` is now usable and ours —
- *  which decides the form the Next: hints print. Never fails the run. `mayAsk` is false under --yes.
- *  @param {boolean} flag @param {boolean} mayAsk */
-async function offerShortCommand(flag, mayAsk) {
-  // Ask only in a real terminal, never in a dry run (`-n --global` still shows the plan). Asked even when
-  // agents were named — the owner's one exception to "an agent flag means non-interactive". The
-  // question defaults to YES, so it is never asked without a terminal and never under `-y` (mayAsk):
-  // a scripted `-y` run must not turn into a global install. `--global` is the explicit opt-in there.
-  const canAsk = mayAsk && !DRY && interactive();
+/** Install the short command (or, under -n, show the command). Returns whether `nomo` is now usable
+ *  and ours — which decides the form the Next: hints print. Never fails the run, never asks.
+ *  @param {boolean} noGlobal --no-global: install nothing, say nothing, just report what is there. */
+function installShortCommand(noGlobal) {
   const state = shortCommandState();
-  if (state === "ours") return true;
-  if (state === "foreign") {
-    if (canAsk || flag) {
-      say(dim("Another program called `nomo` is already on your PATH — keep using `bunx nomo-ai`."));
-      say();
-    }
-    return false;
+  if (noGlobal) return state === "ours" || state === "old";
+  const usable = "type nomo pair, nomo status or nomo reset from any folder.";
+  if (state === "ours") {
+    say(dim(`The short command is already installed: ${usable}`));
+    say();
+    return true;
   }
-  if (!flag && !canAsk) return false;
-  if (!flag && !(await askYesNo(`Also install the short ${bold("nomo")} command, so you can type ${bold("nomo pair")}? (Y/n) `))) {
+  if (state === "foreign") {
+    say(dim("Another program called `nomo` is already on your PATH — keep using `bunx nomo-ai`."));
     say();
     return false;
   }
   const [pm, ...rest] = globalInstallCmd();
-  say(bold("Short `nomo` command"));
-  const fail = run(pm, rest);
+  // The package manager's own output is noise for an optional extra; the command line above it and
+  // the one-line result below are what the user needs.
+  const fail = run(pm, rest, { stdio: "ignore" });
   if (DRY) {
     say();
     return false;
   }
-  if (fail) {
-    say(`  Could not install it (nothing else changed). To try by hand: ${[pm, ...rest].join(" ")}`);
-    say();
-    return false;
-  }
-  if (shortCommandState() === "ours") {
-    say("  ok");
-    say();
-    return true;
-  }
-  say(`  Installed, but ${globalBinDir(pm)} is not on your PATH — add it, or keep using \`bunx nomo-ai\`.`);
+  const ok = !fail && shortCommandState() !== "missing";
+  if (fail) say("Could not install the short nomo command — bunx nomo-ai pair works the same.");
+  else if (ok) say(`Installed the short command: ${usable}`);
+  else say(`Installed, but ${globalBinDir(pm)} is not on your PATH — add it, or keep using \`bunx nomo-ai\`.`);
   say();
-  return false;
+  return ok;
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────────────────────────
@@ -1387,8 +1361,7 @@ async function main() {
   preflight(selected, explicit);
 
   // An agent flag IS the non-interactive signal — asking for confirmation of a selection the caller
-  // just spelled out is theatre. (One stated exception, the owner's choice: the optional short-command
-  // question at the end is still asked in a real terminal when agents were named — see offerShortCommand.) Otherwise: prompt unless told not to, and refuse to guess when there
+  // just spelled out is theatre. Otherwise: prompt unless told not to, and refuse to guess when there
   // is no terminal to ask (a CI run that silently installed three agents is the worse outcome).
   if (!explicit && !args.yes) {
     if (!interactive()) {
@@ -1441,10 +1414,17 @@ async function main() {
   }
 
   const done = AGENTS.filter((a) => selected.has(a.id) && !failures.some((f) => f.agent === a));
-  // The optional short command: only once Nomo is actually here (a leg succeeded, or it already was).
-  const short = done.length > 0 || AGENTS.some((a) => STATUS.get(a.id)?.installed)
-    ? await offerShortCommand(!!args.global, !args.yes)
-    : false;
+  // The short command: only once Nomo is actually here (a leg succeeded, or it already was).
+  const nomoHere = done.length > 0 || AGENTS.some((a) => STATUS.get(a.id)?.installed);
+  const short = nomoHere ? installShortCommand(!!args.noGlobal) : false;
+  // Recorded for the plugin's own output (status, reset), which names `nomo …` or `bunx nomo-ai …` from
+  // this file instead of probing PATH. See terminalCommand in src/core/shared.ts.
+  if (nomoHere && !DRY) {
+    try {
+      mkdirSync(ccDir(), { recursive: true });
+      writeFileSync(join(ccDir(), "short-command"), short ? "1\n" : "0\n");
+    } catch {}
+  }
   const cli = short ? "nomo" : "bunx nomo-ai";
   if (done.length > 0 && !DRY) {
     say(bold("Next:"));

@@ -3079,6 +3079,21 @@ function adapterFor(agent) {
 }
 var allAdapters = [claudeAdapter, codexAdapter];
 
+// src/core/terminal-command.ts
+import { readFileSync as readFileSync2 } from "node:fs";
+var SHORT_COMMAND_PATH = `${CC_DIR}/short-command`;
+function terminalCommand(cmd, recordPath = SHORT_COMMAND_PATH) {
+  let rec = "";
+  try {
+    rec = readFileSync2(recordPath, "utf8").trim();
+  } catch {}
+  if (rec === "1")
+    return `nomo ${cmd}`;
+  if (rec === "0")
+    return `bunx nomo-ai ${cmd}`;
+  return `nomo ${cmd} (or bunx nomo-ai ${cmd})`;
+}
+
 // src/entries/status-cmd.ts
 var CODEX_PLUGIN_HOOK_COUNT = 10;
 var AGENT_UI = {
@@ -3106,7 +3121,7 @@ function renderOwn(r, heading, print) {
       print(cont(`→ ${p.fix}`));
   }
 }
-function renderOther(r, print) {
+function renderOther(r, print, statusCmd) {
   const ui = AGENT_UI[r.kind];
   print(subRow(ui.name, r.sessionCount > 0 ? `${r.hooks} · ${r.sessions}` : r.hooks));
   for (const p of r.problems) {
@@ -3115,7 +3130,7 @@ function renderOther(r, print) {
       print(cont(`→ ${p.fix}`));
   }
   if (r.problems.length > 0)
-    print(cont(`→ full detail: run ${ui.status} inside ${ui.name}, or bunx nomo-ai status`));
+    print(cont(`→ full detail: run ${ui.status} inside ${ui.name}, or ${statusCmd}`));
 }
 function countCodexHookEvents(raw) {
   let parsed;
@@ -3328,7 +3343,8 @@ async function statusCmd(deps = {}) {
   const codexAppServerAvailable = deps.codexAppServerAvailable ?? (() => codexAppServerSocketAvailable());
   const audience = deps.audience;
   const ui = AGENT_UI[audience ?? "claude"];
-  const pairHint = audience ? `${ui.pair} (or bunx nomo-ai pair)` : "bunx nomo-ai pair (or your agent's pair command)";
+  const pairCmd = terminalCommand("pair", deps.shortCommandPath);
+  const pairHint = audience ? `${ui.pair}, or ${pairCmd} in a terminal` : `${pairCmd}, or your agent's pair command`;
   print(audience ? `Nomo ${PLUGIN_VERSION} · ${AGENT_UI[audience].name}` : `Nomo ${PLUGIN_VERSION}`);
   let raw = null;
   try {
@@ -3604,7 +3620,7 @@ async function statusCmd(deps = {}) {
       print("");
       print("Also on this computer");
       for (const k of others)
-        renderOther(reports[k], print);
+        renderOther(reports[k], print, terminalCommand("status", deps.shortCommandPath));
     }
   } else {
     for (const k of AGENT_ORDER)

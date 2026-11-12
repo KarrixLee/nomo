@@ -80,6 +80,7 @@ describe("reset (end-to-end with injected seams)", () => {
       commandOf: (pid) => (pid === 555 ? "bun /x/dist/cc-watchdog.mjs" : undefined),
       killPid: (pid) => { killed.push(pid); },
       activityCycle: async () => "sent",
+      shortCommandPath: join(dir, "short-command"), // absent: the installer recorded nothing
     });
 
     expect(code).toBe(0);
@@ -100,7 +101,21 @@ describe("reset (end-to-end with injected seams)", () => {
     expect(all).toContain("Stopped the watchdog");
     expect(all).toContain("Cleared 3 stale session records (3 end signals delivered to your phone).");
     expect(all).toContain("Left 1 live session untouched.");
-    expect(all).toContain("Pairing and keys were not touched — to disconnect this computer, run bunx nomo-ai unpair (or your agent's unpair command).");
+    expect(all).toContain("Pairing and keys were not touched — to disconnect this computer, run nomo unpair (or bunx nomo-ai unpair), or your agent's unpair command.");
+  });
+
+  test("the last line names the short `nomo` command only when the installer recorded it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-reset-"));
+    for (const [rec, want] of [["1", "run nomo unpair, or"], ["0", "run bunx nomo-ai unpair, or"]] as const) {
+      await writeFile(join(dir, "short-command"), `${rec}\n`);
+      const lines: string[] = [];
+      expect(await reset({
+        print: (l) => lines.push(l), loadConfigFn: async () => null,
+        sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"),
+        shortCommandPath: join(dir, "short-command"),
+      })).toBe(0);
+      expect(lines.at(-1)).toBe(`Pairing and keys were not touched — to disconnect this computer, ${want} your agent's unpair command.`);
+    }
   });
 
   test("a recycled pid is NOT killed; unpaired sweep still clears locally", async () => {
