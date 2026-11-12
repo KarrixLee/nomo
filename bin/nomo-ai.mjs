@@ -1418,7 +1418,7 @@ async function main() {
   const nomoHere = done.length > 0 || AGENTS.some((a) => STATUS.get(a.id)?.installed);
   const short = nomoHere ? installShortCommand(!!args.noGlobal) : false;
   // Recorded for the plugin's own output (status, reset), which names `nomo …` or `bunx nomo-ai …` from
-  // this file instead of probing PATH. See terminalCommand in src/core/shared.ts.
+  // this file instead of probing PATH. See terminalCommand in src/core/terminal-command.ts.
   if (nomoHere && !DRY) {
     try {
       mkdirSync(ccDir(), { recursive: true });
