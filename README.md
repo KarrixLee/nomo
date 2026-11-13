@@ -34,7 +34,9 @@ update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
   opened only on your iPhone. The key comes from pairing (QR secret or six-word code, then a per-pairing
   ephemeral **ECDH P-256** exchange) and never passes through a server. [Encryption](#encryption)
 - **The relay is blind.** The Cloudflare Worker that forwards pushes sees routing metadata only — never a
-  title, machine name, status text, command, answer or even which agent sent it.
+  title, machine name, status text, command or answer. The one thing it sees in the clear is the
+  once-a-minute presence ping: which agents have a turn open, and whether one is waiting for approval.
+  A free (not Pro) pairing sends only that ping and the sealed daily activity summary.
   [What leaves your computer](#what-leaves-your-computer)
 - **No telemetry, no credentials.** The plugin's only network peer is that relay (`https://api.nomo.gg`
   by default). It never reads your agents' API keys or logins, and has no analytics. The installer and
@@ -158,7 +160,7 @@ valid. The page is deleted when pairing completes.
 
 | Destination | When | What |
 |---|---|---|
-| Relay Worker (`https://api.nomo.gg`, or `NOMO_WORKER_URL` at pair time) | every session event; approval holds; pairing; unpair; the activity summary | `/v1/cc/event`, `/v1/cc/decision*`, `/v1/cc/full`, `/v1/cc/pair/*` |
+| Relay Worker (`https://api.nomo.gg`, or `NOMO_WORKER_URL` at pair time) | every session event; approval holds; pairing; unpair; the activity summary; presence about once a minute while an agent session is open | `/v1/cc/event`, `/v1/cc/decision*`, `/v1/cc/full`, `/v1/cc/pair/*`, `/v1/cc/presence` |
 | Your iPhone, on the same network (only if LAN is turned on in the app) | commands and answers | `POST /v1/lan`, sealed under `K_lan` |
 | `github.com/KarrixLee/nomo` via `git` | `bunx nomo-ai` (OpenCode, Cursor, Antigravity, Devin legs) and `/nomo-update` | clone / fetch / pull of this repo |
 | The npm registry, via your package manager | `bunx nomo-ai`, for the short `nomo` command (skip with `--no-global`) | `bun add -g nomo-ai` or `npm install -g nomo-ai` |
@@ -191,6 +193,22 @@ was sent. The relay cannot read them and deletes them after
 computer twice — a UUID made once and kept in `~/.config/cc-status/machine-id` (owner-only), **never**
 derived from serial, MAC, hostname or user name; delete the file for a new one.
 
+**Presence — two fields, every pairing.** About once a minute while the watchdog runs (an agent session
+is open), the plugin POSTs `/v1/cc/presence` with exactly `{ "coding": [agent ids], "waiting": true|false }`:
+which agents (`claude`, `codex`, …) have a turn open, and whether any session is waiting for an
+approval. No session id, title, folder, command or text. It is not sealed (the relay keeps it about 3
+minutes so the phone can show "Claude is coding"), and the reply tells the plugin whether the pairing is
+Pro.
+
+**Free pairing (not Pro) — only presence and the activity summary leave the computer.** When the relay
+says a pairing is not Pro (the presence reply, or a 403 `{"error":"entitlement suspended"}` on any
+session route), the plugin writes `~/.config/cc-status/free-mode` and, while it is fresh (15 minutes,
+refreshed by each presence reply), sends **no** session events, opens **no** approval holds (every prompt
+goes straight to the agent's own dialog), uploads **no** plan or permission text, and keys the LAN
+listener off. Sessions are still tracked on disk so presence stays accurate. If the relay goes quiet the
+marker expires and the plugin behaves as Pro again until the next refusal; a 403 is never treated as an
+unpair (only a 404/410 is).
+
 **On the iPhone,** the Live Agents widget (Nomo Pro) reads a snapshot of decrypted titles, states and
 computer names from the app's own App Group container. It never leaves the device.
 
@@ -204,6 +222,7 @@ computer names from the app's own App Group container. It never leaves the devic
 | `~/.config/cc-status/sessions/<conv>.<id>.agy-inbox` (owner-only) | queued Antigravity phone replies, deleted after a day | watchdog |
 | `~/.config/cc-status/hook-shim.sh` (`0700`) | version-stable hook launcher | `run.sh`, pair |
 | `~/.config/cc-status/activity-days.json`, `machine-id` | activity summary, per-computer id | watchdog |
+| `~/.config/cc-status/free-mode` | time the relay last said this pairing is not Pro (counts for 15 minutes) | hooks, watchdog |
 | `~/.config/cc-status/short-command` | `1` or `0`: whether the short `nomo` command is installed, so status and reset name `nomo …` or `bunx nomo-ai …` | `bunx nomo-ai` |
 | `~/.config/cc-status/*-trace.log` (`0600`) | local diagnostics; never uploaded | hooks, watchdog |
 | `~/.codex/config.toml` | Codex `notify` backstop (your existing `notify` is chained, mode kept, one-time `config.toml.bak-nomo`); refuses an unparseable `notify` line | Codex pair |
@@ -233,6 +252,9 @@ real installs never set it, and anything that can set your agent's environment c
   at the terminal, or the agent's hook timeout).
 - **Approvals switch.** One machine-wide flag pauses remote approvals for every agent; prompts then go
   straight to the computer.
+- **Free pairings never hold.** While the pairing is not Pro (see
+  [What leaves your computer](#what-leaves-your-computer)) every prompt goes straight to the agent's own
+  dialog, exactly like the paused switch, and nothing is posted.
 - **Shell cards keep the command.** The model-written one-line description is a caption: shortened
   first, and dropped before the command when space runs out.
 - **The "Always allow" label is display-only.** At hold time the plugin seals what an Always-allow tap
