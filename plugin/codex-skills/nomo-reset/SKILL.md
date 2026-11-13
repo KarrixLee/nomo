@@ -1,6 +1,6 @@
 ---
 name: nomo-reset
-description: Reset stuck Nomo session state — stop the watchdog and clear dead or phantom session rows from the iPhone app WITHOUT unpairing. Use when the user says Nomo sessions are stuck, ghost/phantom sessions won't go away, the Dynamic Island shows a session that ended long ago, or "reset Nomo" — but NOT when they want to disconnect their phone (that's nomo-unpair).
+description: Reset stuck Nomo session state — stop the watchdog and clear dead or phantom session rows from the iPhone app WITHOUT unpairing, and send the activity summary (heatmap and streak) now. Use when the user says Nomo sessions are stuck, ghost/phantom sessions won't go away, the Dynamic Island shows a session that ended long ago, or "reset Nomo" — but NOT when they want to disconnect their phone (that's nomo-unpair).
 ---
 
 ## Step 1 — resolve the plugin path

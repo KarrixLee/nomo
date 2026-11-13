@@ -32,7 +32,7 @@
 //     marketplace is install-time behaviour; it has no business in an update.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, readdirSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
@@ -67,10 +67,25 @@ const VERSION = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
 ).version;
 
-const USAGE = `nomo-ai ${VERSION} — install (or update) the Nomo plugin for your coding agents.
+/** The name this was run as: `nomo` (the short bin, after `bun add -g nomo-ai`) or `nomo-ai`. Only the
+ *  help text uses it. Never suggest `bunx nomo`/`npx nomo`: the npm package `nomo` is someone else's. */
+const INVOKED = (process.argv[1] ?? "").split("/").pop() === "nomo" ? "nomo" : "nomo-ai";
+/** How the help names commands: `nomo` when run as it or when ours is on PATH, else `bunx nomo-ai`. */
+const CMD = INVOKED === "nomo" || ["ours", "old"].includes(shortCommandState()) ? "nomo" : "bunx nomo-ai";
+/** One help row: the command, padded so the descriptions line up whichever name is shown. */
+const row = (/** @type {string} */ c, /** @type {string} */ what) => `  ${`${CMD}${c}`.padEnd(CMD.length + 12)} ${what}`;
 
-  bunx nomo-ai            detect agents, confirm, install
-  npx nomo-ai             same, without bun
+const USAGE = `${INVOKED} ${VERSION} — install (or update) the Nomo plugin for your coding agents.
+
+${row("", "detect agents, confirm, install")}
+${CMD === "nomo" ? "" : `  ${"npx nomo-ai".padEnd(CMD.length + 12)} same, without bun\n`}
+Commands (from any folder; they run your installed Nomo, shared by every agent here):
+${row(" pair", "pair this computer with your phone (opens the QR page, then waits")}
+${row("", "for the scan); `pair code` prints the typeable code instead").replace(CMD, " ".repeat(CMD.length))}
+${row(" status", "is this computer paired, and is each agent set up")}
+${row(" reset", "clear stuck sessions and send your activity summary now")}
+${row(" unpair", "disconnect this computer from your phone (every agent here)")}
+${row(" uninstall", "remove Nomo from the agents you name (see below)")}
 
 An agent that already has Nomo shows an update instead of an install. OpenCode's is
 done for you — it has no marketplace, so its checkout is its version. Claude Code and
@@ -86,7 +101,10 @@ Agents (naming any one of these skips the prompt):
 
 Options:
   -y, --yes               no prompt; install every agent detected on this machine
+      --uninstall         same as the \`uninstall\` command
   -n, --dry-run           print the commands that would run, run nothing
+      --no-global         do not install the short \`nomo\` command (installed by default
+                          once an agent is set up, so \`nomo pair\` works from any folder)
       --ref <branch|tag>  OpenCode, Cursor and Antigravity only: install from this ref of the
                           repo instead of its default branch. Claude Code and Codex
                           install through their own marketplaces, which read the
@@ -94,14 +112,17 @@ Options:
   -h, --help              this
   -v, --version           print the version
 
-Nothing here pairs your phone — that stays a deliberate step you run from inside the
-agent afterwards (/nomo-cc:pair, $nomo-pair, /nomo-pair).
-
-Cursor is the one agent whose config file this writes into directly (hooks.json, merged —
-other tools' entries are left alone). Undo it with:
-  node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall
-Antigravity likewise owns one "nomo" block in ~/.gemini/config/hooks.json. Undo it with:
-  node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall`;
+Installing never pairs your phone — that stays a deliberate step: \`${CMD} pair\`,
+or from inside the agent (/nomo-cc:pair, $nomo-pair, /nomo-pair).
+${CMD === "nomo" ? "" : "\nShort form: the installer also adds the `nomo` command, so `nomo pair`, `nomo status`, …\nwork too. Never `bunx nomo` / `npx nomo`: that package is not ours.\n"}
+Uninstall (removes only what Nomo wrote; your phone stays paired for your other agents):
+  ${CMD} uninstall --cursor        Nomo's entries in ~/.cursor/hooks.json + /nomo-* skills
+  ${CMD} uninstall --antigravity   the "nomo" block in ~/.gemini/config/hooks.json + plugin
+  (the same as: node ~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall)
+Not covered — each host removes its own install:
+  Claude Code   claude plugin uninstall nomo-cc@nomo
+  Codex         codex plugin remove nomo@nomo
+  OpenCode      delete ~/.config/opencode/plugins/nomo.js and ~/.config/opencode/commands/nomo-*.md`;
 
 // ── plumbing ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -401,6 +422,7 @@ const AGENTS = [
       STATUS.get("claude")?.installed
         ? [`run \`${CLAUDE_UPDATE}\`, then restart Claude Code`]
         : ["restart Claude Code so the hooks load", "run /nomo-cc:pair"],
+    manualUninstall: "claude plugin uninstall nomo-cc@nomo",
     detect: () => onPath("claude") || existsSync(join(homedir(), ".claude")),
     installed: () => hostHasNomo(join(homedir(), ".claude", "plugins", "cache"), "nomo-cc"),
     install() {
@@ -439,6 +461,7 @@ const AGENTS = [
           ? ["run the command above, then restart Codex"]
           : ["nothing to run here — this row printed no command on purpose"]
         : ["run /hooks in Codex and trust the seven Nomo entries", "run $nomo-pair"],
+    manualUninstall: "codex plugin remove nomo@nomo",
     detect: () => onPath("codex") || existsSync(join(homedir(), ".codex")),
     installed: () => hostHasNomo(join(homedir(), ".codex", "plugins", "cache"), "nomo"),
     install() {
@@ -470,6 +493,7 @@ const AGENTS = [
       STATUS.get("opencode")?.installed
         ? ["restart OpenCode (plugins load once at server start; no hot reload)"]
         : ["restart OpenCode (plugins load once at server start; no hot reload)", "run /nomo-pair"],
+    manualUninstall: "delete ~/.config/opencode/plugins/nomo.js and ~/.config/opencode/commands/nomo-*.md",
     detect: () =>
       onPath("opencode") ||
       existsSync(join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode")),
@@ -525,6 +549,7 @@ const AGENTS = [
       STATUS.get("cursor")?.installed
         ? ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json"]
         : ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json", "run /nomo-pair"],
+    uninstallScript: CURSOR_SCRIPT,
     detect: () => onPath("cursor-agent") || onPath("cursor") || existsSync(cursorDir()),
     // The one agent whose installer NEEDS the host's own directory to exist (it merges into a file
     // there). Claude and Codex go through their CLI and say so when it is missing; OpenCode's script
@@ -578,6 +603,7 @@ const AGENTS = [
       STATUS.get("antigravity")?.installed
         ? ["restart Antigravity (and any open agy)", "type /nomo-status to check"]
         : ["restart Antigravity (and any open agy)", "type /nomo-pair"],
+    uninstallScript: ANTIGRAVITY_SCRIPT,
     detect: () => onPath("agy") || existsSync(antigravityDir()),
     skipUndetectedUnderAll: true,
     installed: () => {
@@ -663,12 +689,19 @@ function parseArgs(argv) {
   const named = new Set();
   let all = false;
   let yes = false;
+  let uninstall = false;
+  let noGlobal = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") return { help: true };
     else if (a === "-v" || a === "--version") return { showVersion: true };
     else if (a === "-y" || a === "--yes") yes = true;
     else if (a === "-n" || a === "--dry-run") DRY = true;
+    else if (a === "--uninstall") uninstall = true;
+    // --global was the opt-in when the short command was asked about; it is the default now, so the
+    // flag is still accepted (old scripts and docs) and does nothing.
+    else if (a === "--global") {}
+    else if (a === "--no-global") noGlobal = true;
     else if (a === "--all") {
       all = true;
       for (const ag of AGENTS) picked.add(ag.id);
@@ -682,7 +715,7 @@ function parseArgs(argv) {
       named.add(a.slice(2));
     } else return { bad: a };
   }
-  return { picked, yes, all, named };
+  return { picked, yes, all, named, uninstall, noGlobal };
 }
 
 /** --ref reaches exactly one leg. Saying so out loud is the whole point: a flag that reads as
@@ -828,6 +861,7 @@ function chooseArrows(selected) {
       if (!live) return;
       live = false;
       stdin.off("keypress", onKey);
+      stdin.off("end", onEnd);
       process.stdout.off("resize", onResize);
       process.off("SIGINT", onSigint);
       process.off("exit", teardown);
@@ -848,6 +882,7 @@ function chooseArrows(selected) {
     // it. It is also nearly unreachable — in raw mode Ctrl-C is delivered as the \u0003 byte below,
     // not as a signal — so it is here for a `kill -INT` from elsewhere.
     const onSigint = () => finish("interrupt");
+    const onEnd = () => finish("quit");
     // A resize is not a keypress, so without this the frame sits at the old width until the user
     // happens to touch a key — every line in it fitted to a window that no longer exists. It goes
     // through the same teardown as the rest: node keeps a SIGWINCH handler alive for as long as one
@@ -886,6 +921,9 @@ function chooseArrows(selected) {
     process.on("exit", teardown);
     emitKeypressEvents(stdin, /** @type {any} */ (KEYS));
     stdin.on("keypress", onKey);
+    // In raw mode Ctrl-D is a key (handled above); a stdin that actually ENDS (pty hangup) would
+    // otherwise leave this promise pending and node would exit 13 on the unsettled await.
+    stdin.once("end", onEnd);
     try {
       stdin.setRawMode(true);
     } catch {
@@ -922,18 +960,13 @@ async function chooseNumbered(selected) {
   try {
     for (;;) {
       render(selected);
-      let answer;
-      try {
-        answer = (
-          await rl.question(`Type a number to toggle, ${bold("Enter")} to install, ${bold("q")} to quit: `)
-        ).trim();
-      } catch {
-        // Ctrl+D closes stdin and node:readline/promises rejects with an AbortError. That is a user
-        // saying "no", not a crash — printing a stack trace at someone who pressed Ctrl+D is exactly
-        // the noise this file's error handling exists to avoid.
+      // Ctrl+D (end of input) is a user saying "no", not a crash — see ask() for why it needs help.
+      const line = await ask(rl, `Type a number to toggle, ${bold("Enter")} to install, ${bold("q")} to quit: `);
+      if (line === null) {
         say();
         return false;
       }
+      const answer = line.trim();
       if (answer === "") return selected.size > 0;
       if (answer === "q" || answer === "quit") return false;
       let understood = false;
@@ -1000,6 +1033,257 @@ function banner() {
   say(`  ${dim(TAGLINE)}`);
 }
 
+// ── uninstall ────────────────────────────────────────────────────────────────────────────────────
+//
+// An agent flag is REQUIRED: no picker, no "everything detected". Removing is the one action here a
+// stray Enter should never be able to do. Each agent's own installer does the removal (it already
+// knows exactly what it wrote); an agent whose install belongs to its host gets that host's command
+// printed instead — nothing here drives a host's uninstall.
+
+/** @param {Set<string>} selected */
+function uninstall(selected) {
+  if (selected.size === 0) {
+    err("nomo-ai: --uninstall needs to know which agent — name it, e.g.:");
+    err(`  ${CMD} uninstall --cursor   (or --antigravity)`);
+    return 2;
+  }
+  if (DRY) say(dim("dry run — nothing will be removed\n"));
+  const failures = [];
+  for (const agent of AGENTS.filter((a) => selected.has(a.id))) {
+    say(bold(agent.label));
+    if (!agent.uninstallScript) {
+      say(`  ${dim("not covered by nomo-ai — remove it with:")}`);
+      say(`    ${bold(agent.manualUninstall)}`);
+      say();
+      continue;
+    }
+    if (!DRY && !existsSync(agent.uninstallScript)) {
+      failures.push(agent);
+      err(`  ${agent.uninstallScript} is missing — Nomo was not installed from ${CHECKOUT}.`);
+      err(`  Installed from another checkout? Run: node <checkout>/plugin/scripts/${agent.id}-install.mjs --uninstall`);
+      say();
+      continue;
+    }
+    const fail = run(process.execPath, [agent.uninstallScript, "--uninstall"]);
+    if (fail) {
+      failures.push(agent);
+      err(`  ${bold("FAILED")}: ${fail}`);
+    }
+    say();
+  }
+  // Not removed here: every agent's terminal commands use it, not just the one being removed.
+  if (["ours", "old"].includes(shortCommandState())) say(dim(`The short \`nomo\` command stays. To remove it too: ${globalInstallCmd(true).join(" ")}`));
+  return failures.length > 0 ? 1 : 0;
+}
+
+// ── commands: pair / status / reset / unpair ──────────────────────────────────────────────────────────────
+//
+// The same plugin entries the agents' slash commands run (/nomo-cc:pair, $nomo-reset, /nomo-status…),
+// for a human in any folder. This package ships no plugin code, so each command finds the INSTALLED
+// copy the way the rest of the plugin does and runs its dist entry through that copy's run.sh (bun/node
+// resolution and bun's --config=/dev/null --env-file=/dev/null live there). Pairing, sessions and the watchdog are one
+// shared state folder per computer, so one reset or pairing here covers every agent.
+
+/** command → [dist entry, argv]. `pair` is the start + the wait in one go, as the slash commands do in
+ *  two steps; `pair code` is their typeable-code form. */
+/** @type {Record<string, (a: string[]) => [string, string[]]>} */
+const COMMANDS = {
+  pair: (a) => (a[0] === "code" ? ["pair", ["--show-code", ...a.slice(1)]] : ["pair", a]),
+  status: (a) => ["status-cmd", a],
+  reset: (a) => ["reset", a],
+  unpair: (a) => ["unpair", a],
+};
+
+const ccDir = () => process.env.NOMO_CC_DIR || join(homedir(), ".config", "cc-status");
+
+/** A plugin copy's version, from its own manifest; "" when unreadable. @param {string} root */
+function pluginVersion(root) {
+  for (const m of [".claude-plugin", ".codex-plugin"]) {
+    try {
+      const v = JSON.parse(readFileSync(join(root, m, "plugin.json"), "utf8")).version;
+      if (typeof v === "string") return v;
+    } catch {}
+  }
+  return "";
+}
+
+/** Is version `a` strictly newer than `b`? Numeric per component; unreadable reads as 0.0.0.
+ *  @param {string} a @param {string} b */
+function versionNewer(a, b) {
+  const p = (/** @type {string} */ v) => v.split(/[-+]/)[0].split(".").map((n) => (/^\d+$/.test(n) ? Number(n) : 0));
+  const x = p(a), y = p(b);
+  for (let i = 0; i < Math.max(x.length, y.length, 3); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (x[i] ?? 0) > (y[i] ?? 0);
+  return !a.includes("-") && b.includes("-"); // equal numbers: a release outranks its prerelease (as the shim)
+}
+
+/** Every installed copy the hook shim would launch, plus ~/.nomo, in tie-break order: the stamp root
+ *  (both fields, ABSOLUTE root only — a malformed stamp can never mean the current folder), ~/.nomo
+ *  (OpenCode, Cursor, Antigravity), then the shim's own cache scan (hook-shim.sh step b):
+ *  `~/.codex|.claude/plugins/cache/<marketplace>/<nomo|nomo-cc>/<version>/`, skipping a Codex
+ *  `.orphaned_at` (superseded) directory. Marketplace checkouts are never candidates (NOM-134).
+ *  @returns {string[]} */
+function installedRoots() {
+  const roots = [];
+  try {
+    const m = /^\S+\s+(\/.*)$/.exec(readFileSync(join(ccDir(), "hook-shim.stamp"), "utf8").trim());
+    if (m) roots.push(m[1]);
+  } catch {}
+  roots.push(join(CHECKOUT, "plugin"));
+  for (const [host, plugin] of [[".codex", "nomo"], [".claude", "nomo-cc"]]) {
+    const cache = join(homedir(), host, "plugins", "cache");
+    for (const mp of readdirSafe(cache)) {
+      for (const v of readdirSafe(join(cache, mp, plugin))) {
+        const root = join(cache, mp, plugin, v);
+        if (!existsSync(join(root, ".orphaned_at"))) roots.push(root);
+      }
+    }
+  }
+  return roots;
+}
+/** @param {string} dir */
+const readdirSafe = (dir) => {
+  try { return readdirSync(dir); } catch { return []; }
+};
+
+/** How to run `entry`: the HIGHEST plugin version among installedRoots() that has `scripts/run.sh` and
+ *  `dist/<entry>.mjs` (the first such on a tie), through that copy's run.sh. An older copy may lack what
+ *  the command is for (a 2.3.x reset sends no activity). Undefined when nothing is installed.
+ *  @param {string} entry @returns {[string, string[]] | undefined} */
+function installedEntry(entry) {
+  const usable = installedRoots().filter((root) =>
+    existsSync(join(root, "scripts", "run.sh")) && existsSync(join(root, "dist", `${entry}.mjs`)));
+  const version = (/** @type {string} */ root) => pluginVersion(root) || root.slice(root.lastIndexOf("/") + 1);
+  const best = usable.reduce((x, y) => (versionNewer(version(y), version(x)) ? y : x), usable[0] ?? "");
+  return best ? [join(best, "scripts", "run.sh"), [join(best, "dist", `${entry}.mjs`)]] : undefined;
+}
+
+/** Run one command's entry with the terminal attached; its output and exit status are the command's.
+ *  @param {string} name @param {string[]} rest */
+function runCommand(name, rest) {
+  if (rest.includes("-h") || rest.includes("--help")) {
+    say(USAGE);
+    return 0;
+  }
+  const [entry, args] = COMMANDS[name](rest);
+  const how = installedEntry(entry);
+  if (!how) {
+    err("nomo-ai: Nomo is not installed on this computer yet — run `bunx nomo-ai` first.");
+    return 1;
+  }
+  const exec = (/** @type {string[]} */ a) => {
+    const r = spawnSync(how[0], [...how[1], ...a], { stdio: "inherit" });
+    if (r.error) err(`nomo-ai: could not run ${how[0]}: ${r.error.message}`);
+    return r.status ?? 1;
+  };
+  const code = exec(args);
+  // `pair` = start, then wait for the scan, unless the caller already chose a step.
+  if (name === "pair" && code === 0 && !args.some((a) => a === "wait" || a === "wire-notify" || a === "--check")) {
+    return exec(["wait"]);
+  }
+  return code;
+}
+
+// ── the short `nomo` command ─────────────────────────────────────────────────────────────────────
+//
+// `nomo pair` instead of `bunx nomo-ai pair`, by installing this same package globally (its second bin
+// is `nomo`). Installed after a successful install, asked of nobody; `--no-global` skips it.
+// Never `bunx nomo` / `npx nomo`: that npm package is someone else's. No sudo, ever — a failed install
+// is one line and the run's exit status is unchanged.
+
+/** Is `nomo` on PATH, and is it THIS package? Decided from the file it resolves to (bin/nomo-ai.mjs
+ *  with a package.json named nomo-ai beside it) — a foreign `nomo` is never executed to find out.
+ *  `node_modules/.bin` entries are skipped: npx/bunx put the package's own bins there while it runs,
+ *  which is not an install. "old" is ours at another version than this run's.
+ *  @returns {"ours" | "old" | "foreign" | "missing"} */
+function shortCommandState() {
+  for (const dir of (process.env.PATH || "").split(":")) {
+    if (!dir || dir.endsWith("/node_modules/.bin")) continue;
+    const p = join(dir, "nomo");
+    try {
+      accessSync(p, constants.X_OK);
+    } catch {
+      continue;
+    }
+    try {
+      const real = realpathSync(p);
+      const pkg = JSON.parse(readFileSync(join(dirname(real), "..", "package.json"), "utf8"));
+      if (!real.endsWith("/bin/nomo-ai.mjs") || pkg.name !== "nomo-ai") return "foreign";
+      return pkg.version === VERSION ? "ours" : "old";
+    } catch {
+      return "foreign";
+    }
+  }
+  return "missing";
+}
+
+/** bun when this run came from bun (bunx / `bun x` say so in npm_config_user_agent), else npm.
+ *  @param {boolean} [remove] */
+function globalInstallCmd(remove = false) {
+  const bun = !!process.versions.bun || /^bun\//.test(process.env.npm_config_user_agent || "") || (!onPath("npm") && onPath("bun"));
+  if (bun) return ["bun", remove ? "remove" : "add", "-g", "nomo-ai"];
+  return ["npm", remove ? "uninstall" : "install", "-g", "nomo-ai"];
+}
+
+/** The folder the package manager links global commands into, for the not-on-PATH line. */
+function globalBinDir(/** @type {string} */ pm) {
+  const r = pm === "bun"
+    ? spawnSync("bun", ["pm", "bin", "-g"], { encoding: "utf8", timeout: 5000 })
+    : spawnSync("npm", ["prefix", "-g"], { encoding: "utf8", timeout: 5000 });
+  const out = (r.stdout || "").trim().split("\n").pop() || "";
+  return out ? (pm === "bun" ? out : join(out, "bin")) : "its global bin folder";
+}
+
+/** One line from `rl`, or null at end of input. node:readline/promises leaves `question()` PENDING
+ *  forever when stdin ends (Ctrl-D on an empty line, a closed pipe): nothing else keeps the event loop
+ *  alive, so node quit with "unsettled top-level await" and exit 13 — after a successful install, with
+ *  the Next: hints never printed. So a close (or a stdin that already ended) settles it as null.
+ *  @param {import("node:readline/promises").Interface} rl @param {string} q
+ *  @returns {Promise<string | null>} */
+function ask(rl, q) {
+  if (process.stdin.readableEnded || process.stdin.destroyed) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    const onClose = () => resolve(null);
+    rl.once("close", onClose);
+    rl.question(q).then(
+      (a) => { rl.off("close", onClose); resolve(a); },
+      () => resolve(null), // an abort is the same "no answer"
+    );
+  });
+}
+
+/** Install the short command (or, under -n, show the command). Returns whether `nomo` is now usable
+ *  and ours — which decides the form the Next: hints print. Never fails the run, never asks.
+ *  @param {boolean} noGlobal --no-global: install nothing, say nothing, just report what is there. */
+function installShortCommand(noGlobal) {
+  const state = shortCommandState();
+  if (noGlobal) return state === "ours" || state === "old";
+  const usable = "type nomo pair, nomo status or nomo reset from any folder.";
+  if (state === "ours") {
+    say(dim(`The short command is already installed: ${usable}`));
+    say();
+    return true;
+  }
+  if (state === "foreign") {
+    say(dim("Another program called `nomo` is already on your PATH — keep using `bunx nomo-ai`."));
+    say();
+    return false;
+  }
+  const [pm, ...rest] = globalInstallCmd();
+  // The package manager's own output is noise for an optional extra; the command line above it and
+  // the one-line result below are what the user needs.
+  const fail = run(pm, rest, { stdio: "ignore" });
+  if (DRY) {
+    say();
+    return false;
+  }
+  const ok = !fail && shortCommandState() !== "missing";
+  if (fail) say("Could not install the short nomo command — bunx nomo-ai pair works the same.");
+  else if (ok) say(`Installed the short command: ${usable}`);
+  else say(`Installed, but ${globalBinDir(pm)} is not on your PATH — add it, or keep using \`bunx nomo-ai\`.`);
+  say();
+  return ok;
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────────────────────────
 //
 // Wrapped in a function purely so every exit is `process.exitCode` + `return`, never `process.exit()`.
@@ -1008,7 +1292,19 @@ function banner() {
 // i.e. exactly the output a `bunx nomo-ai | tee install.log` would lose.
 
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
+  let argv = process.argv.slice(2);
+  // A first word that is not a flag is a command. An unknown one fails here — never an install.
+  if (argv[0] !== undefined && !argv[0].startsWith("-")) {
+    const [name, ...rest] = argv;
+    if (name === "uninstall") argv = ["--uninstall", ...rest];
+    else if (Object.hasOwn(COMMANDS, name)) return runCommand(name, rest);
+    else {
+      err(`nomo-ai: unknown command: ${name}\n`);
+      err(USAGE);
+      return 2;
+    }
+  }
+  const args = parseArgs(argv);
   if (args.needsValue !== undefined) {
     err(`nomo-ai: ${args.needsValue} needs a branch or tag name\n`);
     err(USAGE);
@@ -1029,6 +1325,8 @@ async function main() {
   }
 
   banner();
+
+  if (args.uninstall) return uninstall(args.picked);
 
   const floor = hookRuntimeFloor();
   if (floor) {
@@ -1116,6 +1414,18 @@ async function main() {
   }
 
   const done = AGENTS.filter((a) => selected.has(a.id) && !failures.some((f) => f.agent === a));
+  // The short command: only once Nomo is actually here (a leg succeeded, or it already was).
+  const nomoHere = done.length > 0 || AGENTS.some((a) => STATUS.get(a.id)?.installed);
+  const short = nomoHere ? installShortCommand(!!args.noGlobal) : false;
+  // Recorded for the plugin's own output (status, reset), which names `nomo …` or `bunx nomo-ai …` from
+  // this file instead of probing PATH. See terminalCommand in src/core/terminal-command.ts.
+  if (nomoHere && !DRY) {
+    try {
+      mkdirSync(ccDir(), { recursive: true });
+      writeFileSync(join(ccDir(), "short-command"), short ? "1\n" : "0\n");
+    } catch {}
+  }
+  const cli = short ? "nomo" : "bunx nomo-ai";
   if (done.length > 0 && !DRY) {
     say(bold("Next:"));
     for (const a of done) {
@@ -1123,7 +1433,7 @@ async function main() {
       for (const step of a.next()) say(`    - ${step}`);
     }
     say();
-    say(dim("Pairing is one QR scan from the Nomo app's Sessions tab. One pairing covers every agent."));
+    say(dim(`Pairing is one QR scan from the Nomo app's Sessions tab (\`${cli} pair\` from any folder). One pairing covers every agent.`));
     say(dim("Docs: https://docs.nomo.gg"));
   }
 

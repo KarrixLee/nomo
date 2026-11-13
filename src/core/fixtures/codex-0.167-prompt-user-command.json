@@ -1,0 +1,36 @@
+{
+  "_provenance": "SOURCE-DERIVED, NOT LIVE (prompt-user rules only load from system /etc/codex/requirements.toml or cloud/MDM requirements; not settable in a throwaway CODEX_HOME). Built from codex-rs @ rust-v0.167.0: core/src/tools/approvals.rs request_approval_with_user_prompt, core/src/tools/sandboxing.rs ExecApprovalRequirement::NeedsHumanApproval, app-server README 'prompt-user', schema CommandExecutionApprovalKind, test core/tests/suite/scenarios_managed_human_approval_tests.rs. Angle-bracket values are placeholders.",
+  "_verified_live": false,
+  "codex_cli": "0.167.0",
+  "requirements_toml_example": "[[rules.prefix_rules]]\npattern = [{ token = \"echo\" }]\ndecision = \"prompt-user\"\njustification = \"A person must approve this command.\"",
+  "hook_stdin": {
+    "session_id": "<thread id>",
+    "turn_id": "<turn id>",
+    "transcript_path": "/Users/me/.codex/sessions/2026/11/09/rollout-<ts>-<thread id>.jsonl",
+    "cwd": "/Users/me/project",
+    "hook_event_name": "PermissionRequest",
+    "model": "<model>",
+    "permission_mode": "default",
+    "tool_name": "Bash",
+    "tool_input": { "command": "echo checkpoint-ok" }
+  },
+  "_hook_notes": "Byte-for-byte the same shape as an ordinary command approval: no field marks it as a prompt-user checkpoint. The hook IS invoked. A hook {behavior:'deny'} wins. A hook {behavior:'allow'} is IGNORED (match arm `Some(Allow) if !ctx.requires_human_approval()`), and Codex then asks a person anyway (terminal / capable app-server client).",
+  "messages": [
+    {
+      "dir": "in",
+      "method": "item/commandExecution/requestApproval",
+      "id": "<request id>",
+      "params": {
+        "threadId": "<thread id>",
+        "turnId": "<turn id>",
+        "itemId": "<call id>",
+        "approvalId": "<unique uuid>",
+        "kind": "humanCommand",
+        "command": "echo checkpoint-ok",
+        "cwd": "/Users/me/project",
+        "startedAtMs": 0
+      },
+      "_note": "Only sent to clients that initialized with capabilities {experimentalApi:true, requiredHumanApproval:true}. Valid replies: accept | decline | cancel. With no capable client connected the command is rejected."
+    }
+  ]
+}

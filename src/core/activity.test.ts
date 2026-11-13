@@ -1,6 +1,8 @@
 process.env.TZ = "Asia/Tokyo"; // before any Date use: day bucketing is local-time
 
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { PLUGIN_VERSION } from "./shared";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -182,6 +184,14 @@ describe("codex sqlite backfill", () => {
   });
 });
 
+describe("addEvent", () => {
+  test("a finite ts past Date's range is refused (never a NaN day)", () => {
+    const st = emptyState();
+    expect(addEvent(st, { ts: 1e20, agent: "claude", sessionId: "s", kind: "turn", id: "x" })).toBe(false);
+    expect(st.rows.size).toBe(0);
+  });
+});
+
 describe("upload", () => {
   test("sends exact v1 envelope once, then waits 6 h and for a change", async () => {
     const st = emptyState();
@@ -272,6 +282,87 @@ describe("upload", () => {
     await runActivityCycle({ config: cfg("new"), daysPath, cursorPath: join(dir, "cur.json"), roots: missing, now: () => NOW + 60_000, fetchFn: okFetch(calls), scan: false });
     expect(calls).toEqual(["new"]);
     expect(parseState(await Bun.file(daysPath).text()).lastPairing).toBe("new");
+  });
+});
+
+describe("plugin update (lastVersion)", () => {
+  const config = { url: "https://w", pairingId: "p", pcSecret: "s", e2eKey: new Uint8Array(32) } as any;
+  const ok = (calls: string[]) => (async (url: string) => { calls.push(url); return new Response("{}"); }) as unknown as typeof fetch;
+  const turn = (st: State, id: string) => addEvent(st, { ts: NOW - 3_600_000, agent: "claude", sessionId: "b", kind: "turn", id });
+
+  test("a different last-upload version skips the 6 h wait once; then the gate applies again", async () => {
+    const calls: string[] = [];
+    const st = emptyState();
+    turn(st, "e1");
+    expect(await maybeUpload(st, config, NOW, ok(calls))).toBe(true);
+    expect(st.lastVersion).toBe(PLUGIN_VERSION);
+    turn(st, "e2"); // new rows, < 6 h later, same version: gated
+    expect(await maybeUpload(st, config, NOW + 60_000, ok(calls))).toBe(false);
+    st.lastVersion = "2.4.1"; // the previous version made the last upload
+    expect(await maybeUpload(st, config, NOW + 120_000, ok(calls))).toBe(true);
+    turn(st, "e3");
+    expect(await maybeUpload(st, config, NOW + 180_000, ok(calls))).toBe(false); // gated again
+    expect(calls).toHaveLength(2);
+  });
+
+  test("a version change alone does not re-send unchanged rows", async () => {
+    const calls: string[] = [];
+    const st = emptyState();
+    turn(st, "e1");
+    expect(await maybeUpload(st, config, NOW, ok(calls))).toBe(true);
+    st.lastVersion = "2.4.1";
+    expect(await maybeUpload(st, config, NOW + 60_000, ok(calls))).toBe(false);
+  });
+
+  test("a state file from before lastVersion parses, and its first changed cycle uploads", async () => {
+    const st = emptyState();
+    turn(st, "e1");
+    const old = JSON.parse(serializeState(st));
+    Object.assign(old, { lastUpload: NOW, lastHash: "stale", lastPairing: "p" });
+    delete old.lastVersion;
+    const parsed = parseState(JSON.stringify(old));
+    expect(parsed.lastVersion).toBe("");
+    expect(parsed.rows.size).toBe(1);
+    expect(await maybeUpload(parsed, config, NOW + 60_000, ok([]))).toBe(true);
+  });
+});
+
+describe("forced upload (reset)", () => {
+  test("force bypasses the 6 h gate and the unchanged-hash skip; the normal gates are untouched", async () => {
+    const st = emptyState();
+    addEvent(st, { ts: NOW - 3_600_000, agent: "claude", sessionId: "b", kind: "turn", id: "e1" });
+    const calls: string[] = [];
+    const ok = (async (url: string) => { calls.push(url); return new Response("{}"); }) as unknown as typeof fetch;
+    const config = { url: "https://w", pairingId: "p", pcSecret: "s", e2eKey: new Uint8Array(32) } as any;
+    expect(await maybeUpload(st, config, NOW, ok)).toBe(true);
+    expect(await maybeUpload(st, config, NOW + 60_000, ok)).toBe(false); // < 6 h, unchanged: gated
+    expect(await maybeUpload(st, config, NOW + 60_000, ok, undefined, true)).toBe(true); // forced
+    expect(st.lastUpload).toBe(NOW + 60_000);
+    expect(await maybeUpload(st, config, NOW + 120_000, ok)).toBe(false); // the next normal cycle is gated off the forced send
+    expect(calls).toHaveLength(2);
+    expect(await maybeUpload(emptyState(), config, NOW, ok, undefined, true)).toBe(false); // no rows: nothing to force
+  });
+
+  test("runActivityCycle reports sent / empty / not-sent / unpaired", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-act-force-"));
+    try {
+      const daysPath = join(dir, "days.json");
+      const base = { daysPath, cursorPath: join(dir, "cur.json"), roots: { claude: join(dir, "x"), codex: join(dir, "x"), opencode: join(dir, "x") } as any, now: () => NOW, scan: false };
+      const config = { url: "https://w", pairingId: "p", pcSecret: "s", e2eKey: new Uint8Array(32) } as any;
+      const ok = (async () => new Response("{}")) as unknown as typeof fetch;
+      const down = (async () => { throw new Error("offline"); }) as unknown as typeof fetch;
+      expect(await runActivityCycle({ ...base, config: null })).toBe("unpaired");
+      expect(await runActivityCycle({ ...base, config, fetchFn: ok, force: true })).toBe("empty");
+      const st = emptyState();
+      addEvent(st, { ts: NOW - 3_600_000, agent: "claude", sessionId: "b", kind: "turn", id: "e1" });
+      await writeFile(daysPath, serializeState(st));
+      expect(await runActivityCycle({ ...base, config, fetchFn: down, force: true })).toBe("not-sent");
+      expect(await runActivityCycle({ ...base, config, fetchFn: ok, force: true })).toBe("sent");
+      // the saved lastUpload/hash keep a respawned watchdog from re-sending the same rows
+      expect(await runActivityCycle({ ...base, config, fetchFn: ok, now: () => NOW + 60_000 })).toBe("not-sent");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
 

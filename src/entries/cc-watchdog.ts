@@ -1886,22 +1886,22 @@ export function buildProvisionalRecord(
 /** Injectable side-effect seams for the discovery step, so it's testable without real fs/network. */
 export interface DiscoverDeps {
   adapters?: AgentAdapter[];
-  post?: (body: object) => Promise<PostOutcome>;
+  post?: (body: object, detail?: PostDetail) => Promise<PostOutcome>;
   readRecords?: () => Promise<SessionRecord[]>;
   writeRecord?: (sessionId: string, rec: SessionRecord) => Promise<void>;
   now?: () => number;
+  trace?: (event: object) => void;
 }
 
 /** One discovery pass: for every adapter that implements discoverLive, surface the live TUIs the hooks
  *  can't see yet as PROVISIONAL sessions. Each new one is POSTed per its turn state — op:start
  *  ("working") for an in-flight turn, op:done ("done") for an idle REPL (see buildProvisionalEnvelope);
- *  only on a delivered POST do we persist the provisional record (so a failed POST simply retries next
- *  sweep — the pid is still not "known"). Best-effort throughout: a discoverLive throw or a POST failure
- *  never derails the sweep. No-ops entirely when no adapter implements discoverLive (Claude) or no TUI
+ *  the provisional record is persisted on every outcome except `revoked` (see the NOM-173 note at the
+ *  write). Best-effort throughout: a discoverLive throw or a POST failure never derails the sweep. No-ops entirely when no adapter implements discoverLive (Claude) or no TUI
  *  is found. */
 export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = {}): Promise<void> {
   const adapters = deps.adapters ?? allAdapters;
-  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const post = deps.post ?? ((body: object, detail?: PostDetail) => postEvent(config, body, { detail }));
   const readRecords = deps.readRecords ?? readAllRecords;
   const writeRecord = deps.writeRecord
     ?? ((sessionId: string, rec: SessionRecord) => atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify(rec), 0o600));
@@ -1920,8 +1920,22 @@ export async function discoverLiveSessions(config: Config, deps: DiscoverDeps = 
       const ts = now();
       const idle = d.idle === true;
       const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey, Math.floor(ts / 1000));
-      const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle));
-      if (outcome !== "delivered") continue; // failed/revoked → retry next sweep, don't persist a ghost
+      const detail: PostDetail = {};
+      const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle), detail);
+      traceFocus(deps, {
+        event: "provisional-create", sessionId: d.sessionId, op: idle ? "done" : "start", outcome,
+        status: detail.status, error: detail.error, ms: detail.ms,
+      });
+      // NOM-173: a non-2xx is NOT proof the start missed the worker. On a slow link the POST is abandoned
+      // at the 2 s budget after the worker already stored the "working" row (measured from mainland China:
+      // 5 of 6 discovery starts timed out yet landed). This record is the ONLY handle the hook reconcile,
+      // the sweep backstop and the pid-death reap use to send that row its end. Skip it and the real hook
+      // makes the pid "known", discovery never retries, and the row stays up until the worker's 1 h sweep.
+      // So persist on every outcome but `revoked` (pairing gone). If the start truly never landed, the
+      // later end is a harmless 200 no-op, and a working record's heartbeat restates the start.
+      // ponytail: assumes an abandoned start is stored before its end (sent ≥ one POST later) reaches the
+      // worker; a worker-side tombstone would close that gap if a trace ever shows it.
+      if (outcome === "revoked") continue;
       await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId, idle));
     }
   }
@@ -1958,7 +1972,8 @@ export function provisionalsCoveredByReal(entries: RecordEntry[], adapters: Agen
 
 /** Injectable seams for the sweep-side provisional reconcile, so it's testable without fs/network. */
 export interface SweepReconcileDeps {
-  post?: (body: object) => Promise<PostOutcome>;
+  post?: (body: object, detail?: PostDetail) => Promise<PostOutcome>;
+  trace?: (event: object) => void;
   readEntries?: () => Promise<RecordEntry[]>;
   deleteRecord?: (sessionId: string) => Promise<void>;
   /** The adapter registry that decides which agents are discovery-capable (see provisionalsCoveredByReal). */
@@ -1971,13 +1986,15 @@ export interface SweepReconcileDeps {
  *  raced the discovery write). POSTs an op:end (worker reuses the last blob) and deletes the provisional
  *  only on a delivered POST — a failed POST leaves it for the next sweep. Best-effort. */
 export async function reconcileProvisionalsSweep(config: Config, deps: SweepReconcileDeps = {}): Promise<void> {
-  const post = deps.post ?? ((body: object) => postEvent(config, body));
+  const post = deps.post ?? ((body: object, detail?: PostDetail) => postEvent(config, body, { detail }));
   const readEntries = deps.readEntries ?? readAllRecordEntries;
   const deleteRecord = deps.deleteRecord ?? ((sessionId: string) => unlink(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
   const now = deps.now ?? Date.now;
   const entries = await readEntries();
   for (const sessionId of provisionalsCoveredByReal(entries, deps.adapters ?? allAdapters)) {
-    const outcome = await post(buildEndEnvelope(sessionId, now()));
+    const detail: PostDetail = {};
+    const outcome = await post(buildEndEnvelope(sessionId, now()), detail);
+    traceFocus(deps, { event: "provisional-end", sessionId, by: "sweep", outcome, status: detail.status, error: detail.error, ms: detail.ms });
     if (outcome === "delivered") await deleteRecord(sessionId);
   }
 }
@@ -3093,6 +3110,64 @@ export async function correctPendingUpdate(
   }
 }
 
+// --- Re-pair reseal (NOM-174: a live session's blob is sealed under the PREVIOUS pairing) ----------
+//
+// A re-pair rotates pairingId + e2eKey and the new pairing's worker row list starts empty. Every record
+// on disk still holds a blob sealed under the OLD key, so buildHeartbeatEnvelope refuses it (correctly —
+// the phone can't open it) and the greet beat, heartbeat and pending-update nets all send nothing. A busy
+// session reappeared on its next hook; an idle one never did. This net rebuilds the record's CURRENT
+// state from its local fields (buildTitleRepairEnvelope — the same plaintext every corrective uses), seals
+// it under the CURRENT key, POSTs it to the CURRENT pairing, and restamps blob + pairingId on a 2xx.
+// The old key is never read and the old blob is never sent. Records with no pairingId are legacy
+// (pre-key-rotation-guard) and skipped. Shares the long timeout + back-off with the pending-update net.
+
+/** Gate: is this record's blob sealed under a pairing other than `pairingId`? Pure. */
+export function shouldReseal(record: SessionRecord, pairingId: string): boolean {
+  return typeof record.pairingId === "string" && record.pairingId.length > 0 && record.pairingId !== pairingId
+    && typeof record.ts === "number" && Number.isFinite(record.ts);
+}
+
+/** The reseal net for one tracked session. Same verdicts as correctPendingUpdate. */
+export async function resealForPairing(
+  config: Config, path: string, sessionId: string, record: SessionRecord, now: number, deps: PendingDoneDeps = {},
+): Promise<"corrected" | "pending" | "uncorrected" | "revoked"> {
+  const post = deps.post ?? ((body: object, detail: PostDetail) =>
+    postEvent(config, body, { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail }));
+  const writeRecord = deps.writeRecord
+    ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
+  const reread = deps.readRecord ?? readRecordAt;
+  try {
+    if (!shouldReseal(record, config.pairingId) || !resendAllowed(now)) return "uncorrected";
+    if (await decisionHoldIsLive(sessionId, now, deps)) return "uncorrected";
+    const fresh = await reread(path);
+    if (!fresh || recordMovedSince(record, fresh) || !shouldReseal(fresh, config.pairingId)) return "uncorrected";
+    // `at` = the record's last real event (what its last hook stamped), so an idle done row ages honestly.
+    const envelope = await buildTitleRepairEnvelope(
+      sessionId, fresh, typeof fresh.title === "string" ? fresh.title : "", (deps.now ?? Date.now)(),
+      config.e2eKey, recordAgent(fresh), Math.floor(fresh.ts / 1000),
+    );
+    const detail: PostDetail = {};
+    const outcome = await post(envelope, detail);
+    const delivered = outcome === "delivered";
+    const backoffMs = outcome === "revoked" ? undefined : noteResend(delivered, now);
+    traceFocus(deps, {
+      event: "reseal", sessionId, outcome, delivered, op: fresh.op, lastEvent: fresh.lastEvent,
+      status: detail.status, error: detail.error, ms: detail.ms, backoffMs,
+    });
+    if (outcome === "revoked") return "revoked";
+    if (!delivered) return "pending";
+    const after = await reread(path);
+    if (after && !recordMovedSince(fresh, after) && shouldReseal(after, config.pairingId)) {
+      try { await writeRecord(path, { ...after, blob: envelope.blob, pairingId: config.pairingId, updatePending: undefined }); } catch {
+        // Restamp didn't land → one redundant reseal next sweep.
+      }
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
+
 // --- Idle-done retire (free the worker cap slot a long-idle done row still occupies) -----------
 //
 // v1.1.6 froze the reap's blob `at` so a resumed-but-idle session AGES OUT of the phone's
@@ -3585,6 +3660,8 @@ export interface PruneHoldsDeps {
   isAlive?: (pid: number) => boolean;
   removeHold?: (sessionId: string) => Promise<void>;
   trace?: (event: object) => void;
+  /** Retires the worker's card for a dead holder's `requestId` (NOM-165). Absent (unpaired) = skip. */
+  resolveCard?: (requestId: string) => Promise<void>;
 }
 
 /** Remove every `.hold` marker among `files` (one SESSIONS_DIR listing, which the sweep already has)
@@ -3613,6 +3690,13 @@ export async function pruneStaleDecisionHolds(files: string[], deps: PruneHoldsD
       let alive = true;
       try { alive = isAlive(hold.pid); } catch { alive = true; }
       if (alive) continue;
+    }
+    // NOM-165: the holder is gone (Codex SIGKILLs the hook when a network approval ends; a closed
+    // terminal SIGTERMs it), so nobody will ever read an answer — retire the phone's card now instead
+    // of leaving live Allow/Deny up until the worker's 30 s poll-liveness sweep. Fire-and-forget off
+    // the sweep path; a resolve on an already-answered record is a worker no-op.
+    if (typeof hold?.requestId === "string" && deps.resolveCard) {
+      void Promise.resolve(deps.resolveCard(hold.requestId)).catch(() => {});
     }
     try { await removeHold(sessionId); removed++; } catch { /* best-effort, like every write here */ }
   }
@@ -3651,7 +3735,7 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
   // Housekeeping FIRST, off the listing we already have: retire the `.hold` markers of hooks that were
   // killed before their `finally` could compare-and-clear. An orphan gates nothing (the correctives'
   // hold gate probes the holder pid), but the directory must not grow one per killed hook forever.
-  await pruneStaleDecisionHolds(files);
+  await pruneStaleDecisionHolds(files, config ? { resolveCard: (id) => resolveOnRelay(config, id) } : {});
   let remaining = 0;
   // Any 2xx POST this sweep proves the pairing is alive → the loop resets the gone-strike streak, so a
   // real success from EITHER the watchdog or the hook clears a stray transient strike.
@@ -3800,7 +3884,14 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
         // Undelivered-update debt (see correctPendingUpdate): only for a session no net above took this
         // sweep. A resend IS this sweep's beat — it carries the same blob — so the heartbeat stands down.
         let resent = false;
+        // Re-pair reseal (see resealForPairing) — before the debt net, which can't send an old-key blob.
         if (!netOwned) {
+          const reseal = await resealForPairing(config, path, sessionId, record, now);
+          if (reseal === "revoked") return { revoked: true };
+          if (reseal === "corrected") delivered = true;
+          resent = reseal === "corrected" || reseal === "pending";
+        }
+        if (!netOwned && !resent) {
           const pendingUpdate = await correctPendingUpdate(config, path, sessionId, record, now);
           if (pendingUpdate === "revoked") return { revoked: true };
           if (pendingUpdate === "corrected") delivered = true;
@@ -3841,7 +3932,11 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
       // delivered gates deletion: a 401/500 (bad secret, Worker error) is NOT success, so we keep the
       // file and retry next sweep rather than silently dropping the session. A 404 means the pairing
       // itself is gone → bail and let the loop tear the config down.
-      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record));
+      const detail: PostDetail = {};
+      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record), { detail });
+      if (record.provisional === true) {
+        traceFocus({}, { event: "provisional-end", sessionId, by: "reap", outcome, status: detail.status, error: detail.error, ms: detail.ms });
+      }
       if (outcome === "revoked") return { revoked: true };
       if (outcome !== "delivered") {
         remaining++;

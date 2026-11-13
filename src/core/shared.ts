@@ -2009,6 +2009,10 @@ export interface DecisionHold {
    *  looking at and masking the live decisionPending. Never read by the feed (it probes `pid`, which
    *  is still the truthful liveness handle) — only by clearDecisionHoldAt. */
   holdId?: string;
+  /** APPEND-LAST, OPTIONAL (NOM-165). The hold's decision requestId, so the watchdog can retire the
+   *  worker's card (`/v1/cc/decision/resolve`) when the holder dies without its `finally` — Codex
+   *  SIGKILLs the hook's process group when a network approval ends. Absent on older markers. */
+  requestId?: string;
 }
 
 /** Deliberately NOT `.json`: every other readdir consumer of SESSIONS_DIR filters on that extension

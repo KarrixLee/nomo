@@ -79,6 +79,8 @@ describe("reset (end-to-end with injected seams)", () => {
       isAlive: (pid) => pid === 222,
       commandOf: (pid) => (pid === 555 ? "bun /x/dist/cc-watchdog.mjs" : undefined),
       killPid: (pid) => { killed.push(pid); },
+      activityCycle: async () => "sent",
+      shortCommandPath: join(dir, "short-command"), // absent: the installer recorded nothing
     });
 
     expect(code).toBe(0);
@@ -99,7 +101,21 @@ describe("reset (end-to-end with injected seams)", () => {
     expect(all).toContain("Stopped the watchdog");
     expect(all).toContain("Cleared 3 stale session records (3 end signals delivered to your phone).");
     expect(all).toContain("Left 1 live session untouched.");
-    expect(all).toContain("Pairing and keys were not touched");
+    expect(all).toContain("Pairing and keys were not touched — to disconnect this computer, run nomo unpair (or bunx nomo-ai unpair), or your agent's unpair command.");
+  });
+
+  test("the last line names the short `nomo` command only when the installer recorded it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-reset-"));
+    for (const [rec, want] of [["1", "run nomo unpair, or"], ["0", "run bunx nomo-ai unpair, or"]] as const) {
+      await writeFile(join(dir, "short-command"), `${rec}\n`);
+      const lines: string[] = [];
+      expect(await reset({
+        print: (l) => lines.push(l), loadConfigFn: async () => null,
+        sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"),
+        shortCommandPath: join(dir, "short-command"),
+      })).toBe(0);
+      expect(lines.at(-1)).toBe(`Pairing and keys were not touched — to disconnect this computer, ${want} your agent's unpair command.`);
+    }
   });
 
   test("a recycled pid is NOT killed; unpaired sweep still clears locally", async () => {
@@ -144,5 +160,49 @@ describe("reset (end-to-end with injected seams)", () => {
     const all = lines.join("\n");
     expect(all).toContain("No watchdog running.");
     expect(all).toContain("No stale sessions to clear.");
+  });
+
+  describe("the activity summary is sent now (forced upload) when paired", () => {
+    const run = async (activityCycle: Parameters<typeof reset>[0] extends infer D ? D extends { activityCycle?: infer F } ? F : never : never, config: Config | null = CONFIG) => {
+      const dir = await mkdtemp(join(tmpdir(), "nomo-reset-"));
+      const lines: string[] = [];
+      const seen: unknown[] = [];
+      const code = await reset({
+        print: (l) => lines.push(l),
+        loadConfigFn: async () => config,
+        sessionsDir: join(dir, "sessions"),
+        watchdogPidPath: join(dir, "watchdog.pid"),
+        activityCycle: activityCycle ? async (d) => { seen.push(d); return activityCycle(d); } : undefined,
+      });
+      return { code, all: lines.join("\n"), seen };
+    };
+
+    test("sent: one plain line, and the cycle was asked to force the upload under the current pairing", async () => {
+      const r = await run(async () => "sent");
+      expect(r.code).toBe(0);
+      expect(r.all).toContain("Sent your activity summary (heatmap and streak) to your phone.");
+      expect(r.seen).toEqual([expect.objectContaining({ config: CONFIG, force: true })]);
+    });
+
+    test("no rows: says there is nothing to send yet", async () => {
+      const r = await run(async () => "empty");
+      expect(r.code).toBe(0);
+      expect(r.all).toContain("No activity to send yet.");
+    });
+
+    test("server unreachable, or the cycle throws: a retry-later line, still exit 0", async () => {
+      for (const cycle of [async () => "not-sent" as const, async () => { throw new Error("disk full"); }]) {
+        const r = await run(cycle);
+        expect(r.code).toBe(0);
+        expect(r.all).toContain("Could not send your activity summary right now — it will be sent again automatically later.");
+      }
+    });
+
+    test("unpaired: the cycle is not run and nothing about activity is printed", async () => {
+      const r = await run(async () => "sent", null);
+      expect(r.code).toBe(0);
+      expect(r.seen).toEqual([]);
+      expect(r.all).not.toContain("activity");
+    });
   });
 });

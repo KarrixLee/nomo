@@ -30,6 +30,7 @@ import {
   opencodeStubPaths, opencodeStubTarget, PLUGIN_VERSION, SESSION_TRACE_PATH, SESSIONS_DIR,
   WATCHDOG_PID_PATH,
 } from "../core/shared";
+import { terminalCommand } from "../core/terminal-command";
 
 /** Where a GLOBAL OpenCode plugin stub lives — see core/shared's opencodeStubPaths for the two
  *  directory names and why both are read.
@@ -95,6 +96,8 @@ export interface StatusDeps {
    *  prompts stay in the terminal and never reach the phone — the single commonest reason a user
    *  reports "my phone never asked me". Injected so a test can point it at a temp file. */
   noHoldPath?: string;
+  /** The installer's short-command record (see terminalCommand); tests point it at a temp file. */
+  shortCommandPath?: string;
   /** Cursor's user-level hooks.json (defaults to `<cursorHome>/hooks.json`), its transcripts dir and
    *  its liveness stamp. Injected so a test never reads the developer's real ~/.cursor. */
   cursorHooksPath?: string;
@@ -190,14 +193,14 @@ function renderOwn(r: AgentReport, heading: string, print: (l: string) => void):
 
 /** Somebody else's agent: one line, plus any problem (never hidden) and a pointer to that agent's own
  *  status for the detail this view dropped. */
-function renderOther(r: AgentReport, print: (l: string) => void): void {
+function renderOther(r: AgentReport, print: (l: string) => void, statusCmd: string): void {
   const ui = AGENT_UI[r.kind];
   print(subRow(ui.name, r.sessionCount > 0 ? `${r.hooks} · ${r.sessions}` : r.hooks));
   for (const p of r.problems) {
     print(cont(`! ${p.what}`));
     if (p.fix) print(cont(`→ ${p.fix}`));
   }
-  if (r.problems.length > 0) print(cont(`→ full detail: run ${ui.status} inside ${ui.name}`));
+  if (r.problems.length > 0) print(cont(`→ full detail: run ${ui.status} inside ${ui.name}, or ${statusCmd}`));
 }
 
 /** How many hook events in a codex hooks.json register OUR command (grepping for CODEX_HOOK_MARKER
@@ -471,6 +474,10 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   /** The commands to name in a fix. With no calling agent there is no right prefix to suggest, so the
    *  no-argument render falls back to Claude's — the same thing it did before this change. */
   const ui = AGENT_UI[audience ?? "claude"];
+  // A fix that always works: the terminal form needs no agent. Inside an
+  // agent its own command comes first; run from a terminal (no audience), the terminal form does.
+  const pairCmd = terminalCommand("pair", deps.shortCommandPath);
+  const pairHint = audience ? `${ui.pair}, or ${pairCmd} in a terminal` : `${pairCmd}, or your agent's pair command`;
 
   // ── header ────────────────────────────────────────────────────────────────────────────────────
   // The build, because every bug report starts with "which version?" and nothing else on this screen
@@ -498,10 +505,10 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   } else if (pending) {
     // Mid-pairing: the QR was printed but no phone has claimed yet — not broken, just unfinished.
     print(row("Phone", "waiting for the QR scan — pairing was started but no phone has claimed it"));
-    print(cont(`→ run ${ui.pair} to finish or retry`));
+    print(cont(`→ run ${pairHint} to finish or retry`));
   } else {
     print(row("Phone", "NOT PAIRED — nothing from this computer reaches the app"));
-    print(cont(`→ run ${ui.pair}`));
+    print(cont(`→ run ${pairHint}`));
   }
 
   // The runtime run.sh picked for every hook (this command runs under the same one).
@@ -549,7 +556,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
       print(row("Approvals", "on — permission prompts are held and sent to your phone"));
     } else {
       print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));
-      print(cont(`→ run ${ui.approvalsOn}`));
+      print(cont(audience ? `→ run ${ui.approvalsOn}` : `→ run your agent's approvals command, e.g. ${ui.approvalsOn}`));
     }
   }
 
@@ -830,7 +837,7 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     if (others.length > 0) {
       print("");
       print("Also on this computer");
-      for (const k of others) renderOther(reports[k], print);
+      for (const k of others) renderOther(reports[k], print, terminalCommand("status", deps.shortCommandPath));
     }
   } else {
     // NO ARGUMENT: nobody is the subject, so every agent is rendered in full — the same total

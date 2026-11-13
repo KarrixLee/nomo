@@ -1,0 +1,104 @@
+{
+  "_provenance": "Live capture: throwaway CODEX_HOME, codex app-server (stdio) driven by a probe client, model gpt-5.6-luna, approval_policy=on-request, sandbox=read-only, approvals_reviewer=user. Hook = tee stdin, exit 0, no decision. app-server traffic for the same apply_patch approval (dir=in: server->client, dir=out: probe reply). Per-file unified diff is in item.changes[].diff; FileChangeRequestApprovalParams carries no patch.",
+  "_verified_live": true,
+  "codex_cli": "0.167.0",
+  "messages": [
+    {
+      "dir": "in",
+      "method": "item/started",
+      "params": {
+        "item": {
+          "type": "fileChange",
+          "id": "exec-61794ba0-b12a-4687-845e-0c673ff93f75",
+          "changes": [
+            {
+              "path": "/Users/me/project/notes.txt",
+              "kind": {
+                "type": "update",
+                "move_path": null
+              },
+              "diff": "@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+            },
+            {
+              "path": "/Users/me/project/todo.txt",
+              "kind": {
+                "type": "add"
+              },
+              "diff": "buy milk\n"
+            }
+          ],
+          "status": "inProgress",
+          "startedAtMs": 1794228201084,
+          "completedAtMs": null
+        },
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "turnId": "01a1c055-80e1-7a91-a8ba-7a5f8ee89348",
+        "startedAtMs": 1794228201084
+      },
+      "emittedAtMs": 1794228201084
+    },
+    {
+      "dir": "in",
+      "method": "item/fileChange/requestApproval",
+      "id": 0,
+      "params": {
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "turnId": "01a1c055-80e1-7a91-a8ba-7a5f8ee89348",
+        "itemId": "exec-61794ba0-b12a-4687-845e-0c673ff93f75",
+        "startedAtMs": 1794228201098,
+        "reason": null,
+        "grantRoot": null
+      }
+    },
+    {
+      "dir": "out",
+      "id": 0,
+      "result": {
+        "decision": "decline"
+      }
+    },
+    {
+      "dir": "in",
+      "method": "serverRequest/resolved",
+      "params": {
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "requestId": 0
+      },
+      "emittedAtMs": 1794228201098
+    },
+    {
+      "dir": "in",
+      "method": "item/completed",
+      "params": {
+        "item": {
+          "type": "fileChange",
+          "id": "exec-61794ba0-b12a-4687-845e-0c673ff93f75",
+          "changes": [
+            {
+              "path": "/Users/me/project/notes.txt",
+              "kind": {
+                "type": "update",
+                "move_path": null
+              },
+              "diff": "@@ -1,2 +1,2 @@\n hello\n-world\n+there\n"
+            },
+            {
+              "path": "/Users/me/project/todo.txt",
+              "kind": {
+                "type": "add"
+              },
+              "diff": "buy milk\n"
+            }
+          ],
+          "status": "declined",
+          "startedAtMs": 1794228201084,
+          "completedAtMs": 1794228201099
+        },
+        "threadId": "01a1c055-76f8-7221-bd63-8c7dbac584db",
+        "turnId": "01a1c055-80e1-7a91-a8ba-7a5f8ee89348",
+        "completedAtMs": 1794228201099
+      },
+      "emittedAtMs": 1794228201099
+    }
+  ]
+}

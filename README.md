@@ -60,10 +60,33 @@ bunx nomo-ai     # or: npx nomo-ai
 
 It detects which agents are on this computer and installs Nomo for each through that agent's own
 install path (`--claude` `--codex` `--opencode` `--cursor` `--antigravity` pick agents; `-n` prints
-the plan and runs nothing). It never pairs your phone and has no `postinstall` hook. The two agent
-config files it merges into directly are undone with
-`node ~/.nomo/plugin/scripts/cursor-install.mjs --uninstall` (Cursor) and
-`node ~/.nomo/plugin/scripts/antigravity-install.mjs --uninstall` (Antigravity).
+the plan and runs nothing). Installing never pairs your phone and has no `postinstall` hook;
+pairing is the separate, explicit `nomo pair` (or the pair command inside your agent). The two
+agent config files it merges into directly are undone with `nomo uninstall --cursor` and
+`nomo uninstall --antigravity` (also spelled `--uninstall`; the same as
+`node ~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall`). An agent flag is required. For Claude
+Code, Codex and OpenCode, uninstall only prints the host's own removal command.
+
+**Commands**, from any folder, for any agent:
+
+```sh
+nomo pair       # pair with your phone (QR page, then waits for the scan); `pair code` for the typeable code
+nomo status     # is this computer paired, and is each agent set up
+nomo reset      # clear stuck sessions and send your activity summary now
+nomo unpair     # disconnect this computer from your phone (every agent on it)
+nomo uninstall --cursor   # remove Nomo from an agent you name
+```
+
+They run the same plugin code as the in-agent commands (`/nomo-cc:pair`, `$nomo-reset`, `/nomo-status`,
+…), and pairing, sessions and the watchdog are shared by every agent on a computer, so one `reset` or
+`pair` here covers all of them.
+
+**Short `nomo` command.** The installer also adds a short `nomo` command (`bun add -g nomo-ai`, or
+`npm install -g nomo-ai` when not run from bun; no `sudo`), so `nomo pair`, `nomo status`, … work from
+any folder; pass `--no-global` to skip it, and remove it with `bun remove -g nomo-ai` (or
+`npm uninstall -g nomo-ai`). Without it, every command works the same as `bunx nomo-ai pair`,
+`bunx nomo-ai status`, … Never type `bunx nomo` or `npx nomo`: the npm package named `nomo` is
+someone else's.
 
 The full guides live at [docs.nomo.gg](https://docs.nomo.gg):
 
@@ -134,9 +157,10 @@ valid. The page is deleted when pairing completes.
 
 | Destination | When | What |
 |---|---|---|
-| Relay Worker (`https://api.nomo.gg`, or `NOMO_WORKER_URL` at pair time) | every session event; approval holds; pairing; unpair | `/v1/cc/event`, `/v1/cc/decision*`, `/v1/cc/full`, `/v1/cc/pair/*` |
+| Relay Worker (`https://api.nomo.gg`, or `NOMO_WORKER_URL` at pair time) | every session event; approval holds; pairing; unpair; the activity summary | `/v1/cc/event`, `/v1/cc/decision*`, `/v1/cc/full`, `/v1/cc/pair/*` |
 | Your iPhone, on the same network (only if LAN is turned on in the app) | commands and answers | `POST /v1/lan`, sealed under `K_lan` |
 | `github.com/KarrixLee/nomo` via `git` | `bunx nomo-ai` (OpenCode, Cursor, Antigravity legs) and `/nomo-update` | clone / fetch / pull of this repo |
+| The npm registry, via your package manager | `bunx nomo-ai`, for the short `nomo` command (skip with `--no-global`) | `bun add -g nomo-ai` or `npm install -g nomo-ai` |
 
 Nothing else: no analytics, no crash reporting, no reads of agent credentials.
 
@@ -145,7 +169,11 @@ pairing secret (headers), the plugin version, whether remote approvals are on, a
 session id, the op (`start` / `update` / `done` / `end`), a priority, timestamps, and — for a Codex
 `request_user_input` question only — `attentionKind: "userInput"`. **Sealed**: everything else —
 title, machine name, folder, status, model, tool name, command, file path, plan text, questions,
-answers, and which agent produced the event.
+answers, and which agent produced the event. The diff on an edit approval (patch or edit content,
+line counts) is sealed the same way as a command, in the card and in a full-text pull. For an
+overwrite (a whole-file write onto an existing file) the plugin reads that file from disk — a regular
+UTF-8 text file up to 2 MiB, never a device, FIFO or directory — so the diff also carries the current
+file's changed lines.
 
 **Daily activity summary — counts only, sealed.** While paired, the watchdog reads your agents' local
 history read-only — Claude Code transcripts (`~/.claude/projects`), Codex rollouts and its
@@ -154,7 +182,10 @@ agent: session count, prompt count, which 5-minute slots had activity, and token
 **never** puts prompt or reply text, project names or paths into the summary. Rows are kept in
 `~/.config/cc-status/activity-days.json` (at most 400 days) and, at most every 6 hours and only when
 changed, sealed and uploaded to `/v1/cc/full` (`what: "activity"`); right after pairing a new phone the
-existing rows go up once within about a minute. The relay cannot read them and deletes them after
+existing rows go up once within about a minute, and after a plugin update new rows go up at the next
+scan instead of waiting the 6 hours. To send it right away, run `nomo reset` (or reset inside your
+agent: `/nomo-cc:reset`, `$nomo-reset`, `/nomo-reset`): it scans and uploads once, then says whether it
+was sent. The relay cannot read them and deletes them after
 **35 days**. The summary carries a random per-computer id (`mid`) so the phone does not count a
 computer twice — a UUID made once and kept in `~/.config/cc-status/machine-id` (owner-only), **never**
 derived from serial, MAC, hostname or user name; delete the file for a new one.
@@ -171,6 +202,7 @@ computer names from the app's own App Group container. It never leaves the devic
 | `~/.config/cc-status/sessions/<conv>.<id>.agy-inbox` (owner-only) | queued Antigravity phone replies, deleted after a day | watchdog |
 | `~/.config/cc-status/hook-shim.sh` (`0700`) | version-stable hook launcher | `run.sh`, pair |
 | `~/.config/cc-status/activity-days.json`, `machine-id` | activity summary, per-computer id | watchdog |
+| `~/.config/cc-status/short-command` | `1` or `0`: whether the short `nomo` command is installed, so status and reset name `nomo …` or `bunx nomo-ai …` | `bunx nomo-ai` |
 | `~/.config/cc-status/*-trace.log` (`0600`) | local diagnostics; never uploaded | hooks, watchdog |
 | `~/.codex/config.toml` | Codex `notify` backstop (your existing `notify` is chained, mode kept, one-time `config.toml.bak-nomo`); refuses an unparseable `notify` line | Codex pair |
 | `~/.config/opencode/plugins/nomo.js`, `commands/nomo-*.md` | OpenCode stub + commands | `opencode-install.sh` |
@@ -461,6 +493,19 @@ process. Codex has no plugin update verb: with a `local` marketplace (`source_ty
   version). Claude Code and Codex rows only **print** the host command, because install begins with
   `marketplace add`, which would silently repoint a marketplace you aimed elsewhere (a fork, a local
   checkout). A Codex `local` marketplace prints nothing, since there is nothing to run.
+- **Commands** (`pair`, `status`, `reset`, `unpair`) run the INSTALLED plugin's own entry, not code from the npm
+  package: the highest plugin version among every installed copy — the copy named in the hook shim's
+  stamp (`~/.config/cc-status`), `~/.nomo`, and each version in the Claude Code / Codex plugin caches
+  (the same copies the hook shim considers; superseded Codex copies are skipped) — through that copy's
+  `run.sh`, so the runtime rules in [Runtime and launch](#runtime-and-launch) apply. Nothing installed → one line saying
+  to run `bunx nomo-ai` first. Output and exit status are the entry's own. An unknown word is refused,
+  never treated as an install.
+- **Short command.** Installed without asking once Nomo is installed (also under `-y`), skipped with
+  `--no-global`, and not reinstalled when this version is already on PATH. It runs exactly `bun add -g nomo-ai` or `npm install -g nomo-ai` (shown first; `-n` only shows it),
+  never with `sudo`, and a failure never changes the exit status. A `nomo` already on PATH counts as
+  this package only if it resolves to `bin/nomo-ai.mjs` beside a `package.json` named `nomo-ai`; any
+  other `nomo` is left alone and never run. The outcome goes to `~/.config/cc-status/short-command`,
+  which the plugin's own output reads (no PATH probe); with no record it names both forms.
 - `--ref <branch|tag>` applies only to the `~/.nomo` checkout (Claude/Codex marketplaces read the
   default branch, and the installer says so). The checkout is left **detached** so a later plain run
   recognises the pin and refuses to fast-forward it.

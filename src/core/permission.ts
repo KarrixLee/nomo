@@ -22,7 +22,7 @@
 // dist/cc-permission.mjs.
 
 import { readFile, realpath, unlink } from "node:fs/promises";
-import { appendFileSync, statSync, truncateSync } from "node:fs";
+import { appendFileSync, closeSync, constants as fsConstants, existsSync, fstatSync, openSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, isAbsolute, relative, resolve } from "node:path";
 import { runHook, buildBlob, OpPlan } from "./hook";
@@ -302,6 +302,52 @@ function codexPassThroughReason(
   // `untrusted` does not use Codex's automatic reviewer even if the configured reviewer says auto.
   if (policy.approvalPolicy === "untrusted" || policy.approvalsReviewer === "user") return undefined;
   return "codex-context-unknown";
+}
+
+/** Codex's system requirements file — the only on-disk home of managed `prompt-user` rules (MDM/cloud
+ *  requirements are invisible to a hook). */
+export const CODEX_REQUIREMENTS_PATH = "/etc/codex/requirements.toml";
+
+/** NOM-165: does a managed `prompt-user` prefix rule cover this command? Codex IGNORES a hook Allow for
+ *  such a command and re-asks at the terminal, so a phone card would offer an Allow that does nothing.
+ *
+ *  Minimal read of Codex's RequirementsExecPolicyPrefixRuleToml: `[[rules.prefix_rules]]` tables with
+ *  `decision = "prompt-user"` and `pattern = [ { token = "x" } | { any_of = ["x", "y"] }, … ]`. Matching
+ *  is deliberately LOOSE — the pattern may start at any token, on a basename too — because over-matching
+ *  only costs the phone card (the terminal prompt still shows) while under-matching is the bug.
+ *  ponytail: no shell parsing / canonical_matching; tighten if real rules over-match. Absent or
+ *  unparsable file → false (today's behaviour). Never throws. */
+export async function codexPromptUserRuleMatches(command: string, path: string = CODEX_REQUIREMENTS_PATH): Promise<boolean> {
+  let text: string;
+  try { text = await readFile(path, "utf8"); } catch { return false; }
+  try {
+    const words = command.split(/[\s'"`;&|()]+/).filter((w) => w.length > 0);
+    for (const table of text.split(/^\s*\[/m)) {
+      if (!/^\[\s*rules\.prefix_rules\s*\]\]/.test(table)) continue;
+      if (!/^\s*decision\s*=\s*["']prompt-user["']/m.test(table)) continue;
+      const at = table.search(/^\s*pattern\s*=\s*\[/m);
+      if (at < 0) continue;
+      // The pattern array, bracket-balanced (it nests `any_of = [...]` and may span lines).
+      const open = table.indexOf("[", table.indexOf("=", at));
+      let depth = 0, end = -1;
+      for (let i = open; i < table.length && end < 0; i++) {
+        if (table[i] === "[") depth++;
+        else if (table[i] === "]" && --depth === 0) end = i;
+      }
+      if (end < 0) continue;
+      const tokens = (table.slice(open + 1, end).match(/\{[^}]*\}/g) ?? []).map((element) => {
+        const quoted = (s: string): string[] => [...s.matchAll(/["']([^"']*)["']/g)].map((m) => m[1]);
+        const anyOf = /any_of\s*=\s*\[([^\]]*)\]/.exec(element);
+        return anyOf ? quoted(anyOf[1]) : quoted(/token\s*=\s*(["'][^"']*["'])/.exec(element)?.[1] ?? "");
+      });
+      if (tokens.length === 0 || tokens.some((alts) => alts.length === 0)) continue;
+      const hit = (word: string, alts: string[]): boolean => alts.includes(word) || alts.includes(basename(word));
+      for (let i = 0; i + tokens.length <= words.length; i++) {
+        if (tokens.every((alts, j) => hit(words[i + j], alts))) return true;
+      }
+    }
+  } catch { /* unparsable → behave as today */ }
+  return false;
 }
 
 /** Serialize ONE PermissionRequest decision for the given agent's stdout contract. Both agents carry
@@ -744,13 +790,19 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
       const cmd = str(toolInput.command);
       return cmd ? truncate(cmd.split("\n")[0]) : toolName;
     }
-    // Codex apply_patch approvals carry a human-readable summary in tool_input.description (there is no
-    // single file_path — a patch can touch many files).
+    // Codex apply_patch: a description if one is ever sent, else the files the V4A patch touches
+    // (0.167 sends only the patch in tool_input.command — NOM-164).
     case "apply_patch": {
       const desc = str(toolInput.description);
-      return desc ? truncate(desc) : toolName;
+      if (desc) return truncate(desc);
+      const files = parseV4APatch(str(toolInput.command) ?? "");
+      if (files.length > 1) return `Edit ${files.length} files`;
+      if (files.length === 0) return toolName;
+      const verb = files[0].kind === "added" ? "Add" : files[0].kind === "deleted" ? "Delete" : "Edit";
+      return truncate(`${verb} ${basename(files[0].path)}`);
     }
     case "Edit":
+    case "MultiEdit":
     case "Write":
     case "Read":
     case "NotebookEdit": {
@@ -789,14 +841,331 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
       }) as { question?: unknown } | undefined;
       return typeof q?.question === "string" ? truncate(q.question) : toolName;
     }
+    // NOM-167: MCP tools, both agents: `mcp__<server>__<tool>` → "<server> · <tool words>". A Claude
+    // connector's server is `claude_ai_<Name>` ("claude_ai_Google_Drive" → "Google Drive").
     default: {
-      if (/^mcp__/.test(toolName)) {
-        const seg = toolName.split("__").pop();
-        return seg && seg.length > 0 ? seg : toolName;
+      const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
+      if (mcp) {
+        const words = (s: string): string => s.replace(/[_-]+/g, " ").trim();
+        const server = words(mcp[1].replace(/^claude_ai_/, ""));
+        const tool = words(mcp[2]);
+        return server && tool ? truncate(`${server} · ${tool}`) : toolName;
       }
       return toolName;
     }
   }
+}
+
+// ---- NOM-166: the edit diff the phone shows before Allow -------------------------------------------
+//
+// One structured shape for Codex apply_patch (V4A text) and Claude Code Edit/MultiEdit/Write. Neither
+// source carries line numbers, so lines have none. A Delete File carries no content, so its removed
+// count is null (unknown) and the summary flags it.
+
+export interface PermissionDiffLine { t: "ctx" | "add" | "del"; s: string }
+export interface PermissionDiffHunk { header?: string; lines: PermissionDiffLine[] }
+export interface PermissionDiffFile {
+  path: string;
+  kind: "modified" | "added" | "deleted" | "renamed";
+  /** Rename source (kind "renamed" only). */
+  from?: string;
+  added: number;
+  /** null = unknown (a deleted file's content is not in the patch; an overwritten file's old content). */
+  removed: number | null;
+  hunks: PermissionDiffHunk[];
+}
+/** `removed` sums the KNOWN counts; `removedUnknown` (present only when true) says at least one file's
+ *  count is unknown, so the phone renders "−4+" rather than a number it cannot vouch for. */
+export interface PermissionDiffSummary { files: number; added: number; removed: number; removedUnknown?: true }
+/** The blob's bounded preview. `truncated` (present only when true): files, lines or line text were left
+ *  out — the full patch is `permissionDetail` (pulled via the permission-detail full-text path when
+ *  `permissionDetailOmitted` says the blob copy was cut). */
+export interface PermissionDiff { files: PermissionDiffFile[]; truncated?: true }
+
+/** Parse V4A patch text (Codex apply_patch). Pure, never throws; unrecognized lines are skipped. */
+export function parseV4APatch(text: string): PermissionDiffFile[] {
+  const files: PermissionDiffFile[] = [];
+  let file: PermissionDiffFile | undefined;
+  let hunk: PermissionDiffHunk | undefined;
+  for (const line of text.split("\n")) {
+    const head = /^\*\*\* (Update|Add|Delete) File: (.+)$/.exec(line);
+    if (head) {
+      const kind = head[1] === "Add" ? "added" : head[1] === "Delete" ? "deleted" : "modified";
+      file = { path: head[2].trim(), kind, added: 0, removed: kind === "deleted" ? null : 0, hunks: [] };
+      files.push(file);
+      hunk = undefined;
+      continue;
+    }
+    if (!file) continue;
+    const move = /^\*\*\* Move to: (.+)$/.exec(line);
+    if (move) { file.from = file.path; file.path = move[1].trim(); file.kind = "renamed"; continue; }
+    if (line.startsWith("***")) continue; // End Patch / End of File
+    if (line.startsWith("@@")) {
+      const header = line.slice(2).trim();
+      hunk = { ...(header ? { header } : {}), lines: [] };
+      file.hunks.push(hunk);
+      continue;
+    }
+    const t = line[0] === "+" ? "add" : line[0] === "-" ? "del" : line[0] === " " ? "ctx" : undefined;
+    if (!t) continue; // ponytail: a bare "" context line is dropped; Codex models emit " " for those
+    if (!hunk) { hunk = { lines: [] }; file.hunks.push(hunk); }
+    hunk.lines.push({ t, s: line.slice(1) });
+    if (t === "add") file.added += 1;
+    else if (t === "del" && file.removed !== null) file.removed += 1;
+  }
+  return files;
+}
+
+/** Context lines kept around each change; changes whose context would overlap share one hunk. */
+const DIFF_CONTEXT_LINES = 3;
+/** Myers is abandoned past this many edits (≈1,000 changed lines). It bounds the O(D²) trace memory
+ *  (~16 MB at the cap) and is the cap that bites in practice: a 20k-line shuffle hits it in ~35 ms
+ *  (M-series Mac, bun). The work cap is the backstop for the O((N+M)·D) snake-following worst case; no
+ *  realistic input measured reaches it. Over either cap → the one-block diff (see diffHunks). */
+const DIFF_MAX_EDITS = 2000;
+const DIFF_MAX_WORK = 4_000_000;
+
+/** Myers O(ND) shortest edit script between two id arrays, or undefined when it would exceed the caps.
+ *  Ops are ctx/del/add over indices into a and b. */
+function myers(a: Int32Array, b: Int32Array): ("ctx" | "del" | "add")[] | undefined {
+  const n = a.length, m = b.length, off = n + m + 1;
+  const v = new Int32Array(2 * off + 1);
+  const trace: Int32Array[] = [];
+  let work = 0;
+  for (let d = 0; d <= n + m; d++) {
+    if (d > DIFF_MAX_EDITS) return undefined;
+    for (let k = -d; k <= d; k += 2) {
+      let x = k === -d || (k !== d && v[off + k - 1] < v[off + k + 1]) ? v[off + k + 1] : v[off + k - 1] + 1;
+      let y = x - k;
+      const x0 = x;
+      while (x < n && y < m && a[x] === b[y]) { x++; y++; }
+      work += x - x0 + 1;
+      v[off + k] = x;
+      if (x >= n && y >= m) {
+        trace.push(v.slice(off - d, off + d + 1));
+        return backtrack(trace, n, m);
+      }
+    }
+    if (work > DIFF_MAX_WORK) return undefined;
+    trace.push(v.slice(off - d, off + d + 1));
+  }
+  return undefined; // unreachable: d = n + m always ends
+}
+
+function backtrack(trace: Int32Array[], n: number, m: number): ("ctx" | "del" | "add")[] {
+  const ops: ("ctx" | "del" | "add")[] = [];
+  let x = n, y = m;
+  for (let d = trace.length - 1; d > 0; d--) {
+    const prev = trace[d - 1];
+    const at = (k: number): number => prev[k + d - 1];
+    const k = x - y;
+    const down = k === -d || (k !== d && at(k - 1) < at(k + 1));
+    const px = at(down ? k + 1 : k - 1);
+    const mx = down ? px : px + 1;            // the point right after this edit…
+    const my = mx - k;                        // …lies on diagonal k, where the snake to (x, y) starts
+    while (x > mx && y > my) { ops.push("ctx"); x--; y--; }
+    if (down) { ops.push("add"); y--; } else { ops.push("del"); x--; }
+  }
+  while (x > 0 && y > 0) { ops.push("ctx"); x--; y--; }
+  return ops.reverse();
+}
+
+/** The old→new line diff as hunks: shared leading/trailing lines are trimmed first, the middle gets a
+ *  bounded Myers diff, and each change keeps DIFF_CONTEXT_LINES of context (overlapping ones merge). Past
+ *  the caps the middle is one del block + one add block — every line still real, counts inflated. */
+function diffHunks(oldText: string, newText: string): PermissionDiffHunk[] {
+  const split = (s: string): string[] => (s.length === 0 ? [] : s.replace(/\n$/, "").split("\n"));
+  const a = split(oldText);
+  const b = split(newText);
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre += 1;
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf += 1;
+  const am = a.slice(pre, a.length - suf), bm = b.slice(pre, b.length - suf);
+  const ids = new Map<string, number>();
+  const id = (s: string): number => { let i = ids.get(s); if (i === undefined) ids.set(s, (i = ids.size)); return i; };
+  const ops = am.length > 0 && bm.length > 0
+    ? myers(Int32Array.from(am, id), Int32Array.from(bm, id)) : undefined;
+  const lines: PermissionDiffLine[] = a.slice(0, pre).map((s) => ({ t: "ctx", s }));
+  if (ops) {
+    let i = 0, j = 0;
+    let run: { del: PermissionDiffLine[]; add: PermissionDiffLine[] } = { del: [], add: [] };
+    const flush = (): void => { lines.push(...run.del, ...run.add); run = { del: [], add: [] }; };
+    for (const op of ops) {
+      if (op === "ctx") { flush(); lines.push({ t: "ctx", s: am[i++] }); j++; }
+      else if (op === "del") run.del.push({ t: "del", s: am[i++] });
+      else run.add.push({ t: "add", s: bm[j++] });
+    }
+    flush();
+  } else {
+    for (const s of am) lines.push({ t: "del", s });
+    for (const s of bm) lines.push({ t: "add", s });
+  }
+  for (const s of a.slice(a.length - suf)) lines.push({ t: "ctx", s });
+  // Group: a change within 2×context of the previous one extends its hunk.
+  const hunks: PermissionDiffHunk[] = [];
+  let cur: PermissionDiffLine[] | undefined;
+  let last = -1;
+  const close = (): void => { if (cur) { cur.push(...lines.slice(last + 1, last + 1 + DIFF_CONTEXT_LINES)); hunks.push({ lines: cur }); } };
+  lines.forEach((l, c) => {
+    if (l.t === "ctx") return;
+    if (cur && c - last - 1 <= 2 * DIFF_CONTEXT_LINES) cur.push(...lines.slice(last + 1, c + 1));
+    else { close(); cur = lines.slice(Math.max(0, c - DIFF_CONTEXT_LINES), c + 1); }
+    last = c;
+  });
+  close();
+  return hunks;
+}
+
+const count = (hunks: PermissionDiffHunk[], t: "add" | "del"): number =>
+  hunks.reduce((n, h) => n + h.lines.filter((l) => l.t === t).length, 0);
+
+/** A Write over an existing file diffs against it only up to this size; bigger → the all-additions card. */
+// 2 MiB covers a ~12k-line bun.lock (1.4 MB): exact diff in 4-16 ms for 80-600 changed lines; a 2 MiB
+// full rewrite hits the Myers edit cap and falls back to one block in ~60 ms (measured 2026-11-10).
+export const OVERWRITE_DIFF_MAX_BYTES = 2 << 20;
+
+/** The text a Write is about to overwrite: the string, null (no such file — the Write creates it), or
+ *  undefined (exists but is not read here → no diff, the plain card). `file_path` is agent input, so:
+ *  stat first (follows a symlink but opens nothing), open only a regular file under the cap, O_NONBLOCK
+ *  so a path swapped for a FIFO after the stat still cannot block the hook, and re-check the opened fd.
+ *  Strict UTF-8 with no NUL, else undefined. Never throws. */
+function readOverwrittenText(path: string): string | null | undefined {
+  let fd: number | undefined;
+  try {
+    const st = statSync(path);
+    if (!st.isFile() || st.size > OVERWRITE_DIFF_MAX_BYTES) return undefined;
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    const fst = fstatSync(fd);
+    if (!fst.isFile() || fst.size > OVERWRITE_DIFF_MAX_BYTES) return undefined;
+    const bytes = readFileSync(fd);
+    if (bytes.length > OVERWRITE_DIFF_MAX_BYTES || bytes.includes(0)) return undefined;
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    return code === "ENOENT" || code === "ENOTDIR" ? null : undefined;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* already closed */ }
+  }
+}
+
+/** The FULL diff for an edit-shaped tool, or undefined (any other tool, or an input without content —
+ *  OpenCode's mapped `Edit` carries only file_path). Pure apart from Write's bounded read of the file it
+ *  overwrites (readOverwrittenText). */
+export function buildPermissionDiff(toolName: string, toolInput: Record<string, unknown>): PermissionDiffFile[] | undefined {
+  const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+  const path = str(toolInput.file_path);
+  const files = (hunks: PermissionDiffHunk[], kind: PermissionDiffFile["kind"] = "modified", removedUnknown = false): PermissionDiffFile[] =>
+    [{ path: path!, kind, added: count(hunks, "add"), removed: removedUnknown ? null : count(hunks, "del"), hunks }];
+  switch (toolName) {
+    case "apply_patch": {
+      const parsed = parseV4APatch(str(toolInput.command) ?? "");
+      return parsed.length > 0 ? parsed : undefined;
+    }
+    case "Edit": {
+      const o = str(toolInput.old_string), n = str(toolInput.new_string);
+      return path && o !== undefined && n !== undefined ? files(diffHunks(o, n)) : undefined;
+    }
+    case "MultiEdit": {
+      const edits = Array.isArray(toolInput.edits) ? toolInput.edits as { old_string?: unknown; new_string?: unknown }[] : [];
+      const hunks = edits.flatMap((e) => typeof e?.old_string === "string" && typeof e.new_string === "string"
+        ? diffHunks(e.old_string, e.new_string) : []);
+      return path && hunks.length > 0 ? files(hunks) : undefined;
+    }
+    case "Write": {
+      const content = str(toolInput.content);
+      if (!path || content === undefined) return undefined;
+      // An overwrite's old content is not in the input, so it is read from disk (same E2E blob as an
+      // Edit's old_string). Unreadable/over-cap/binary → NO diff (like GitHub's "too large to show"):
+      // all-green "+17500" would read as a brand-new file. The card falls back to the plain summary.
+      const old = readOverwrittenText(path);
+      if (old === null) return files(diffHunks("", content), "added");
+      if (old === undefined) return undefined;
+      return files(diffHunks(old, content));
+    }
+    default: return undefined;
+  }
+}
+
+/** The diff rendered back to V4A text — the `permissionDetail` for Claude Code edits, so old apps show
+ *  the change in their hero block and the full-text pull carries one format for both agents. Codex's own
+ *  patch text is used verbatim instead. */
+function renderV4A(files: PermissionDiffFile[]): string {
+  const out: string[] = [];
+  for (const f of files) {
+    out.push(`*** ${f.kind === "added" ? "Add" : f.kind === "deleted" ? "Delete" : "Update"} File: ${f.path}`);
+    for (const h of f.hunks) {
+      if (f.kind !== "added") out.push(h.header ? `@@ ${h.header}` : "@@");
+      for (const l of h.lines) out.push(`${l.t === "add" ? "+" : l.t === "del" ? "-" : " "}${l.s}`);
+    }
+  }
+  return out.join("\n");
+}
+
+/** One line's text cap in the preview (a minified line must not eat the whole frame). */
+const DIFF_LINE_MAX = 240;
+/** Soft cap on the preview's JSON so the old-app `permissionDetail` keeps some room in the same frame.
+ *  ponytail: fixed split; make it budget-relative if the preview proves too short on real patches. */
+const DIFF_PREVIEW_MAX_CHARS = 1400;
+
+/** The preview with the first `k` lines (across files, in order). A file whose first line is past `k`
+ *  is left out; a file with no lines rides while everything before it fits. */
+function previewDiff(files: PermissionDiffFile[], k: number): PermissionDiff {
+  let left = k;
+  let truncated = false;
+  const out: PermissionDiffFile[] = [];
+  for (const f of files) {
+    const total = f.hunks.reduce((n, h) => n + h.lines.length, 0);
+    if (left <= 0 && (total > 0 || truncated)) { truncated = true; break; }
+    const hunks: PermissionDiffHunk[] = [];
+    for (const h of f.hunks) {
+      if (left <= 0) { truncated = true; break; }
+      const lines = h.lines.slice(0, left).map((l) => {
+        const s = capPermissionWireText(l.s, DIFF_LINE_MAX);
+        if (s !== l.s) truncated = true;
+        return { t: l.t, s };
+      });
+      if (lines.length < h.lines.length) truncated = true;
+      left -= lines.length;
+      hunks.push({ ...(h.header ? { header: h.header } : {}), lines });
+    }
+    out.push({ ...f, hunks });
+  }
+  return { files: out, ...(truncated ? { truncated: true as const } : {}) };
+}
+
+/** The `diffSummary` + `diff` tail, fitted LAST into the sealed frame. `frame` must already hold every
+ *  key that rides before it at its WORST case (the caller reserves the full omitted count, so the
+ *  full-text pointer always fits beside the diff). Sheds preview lines, then the preview, then the
+ *  summary — never anything in `frame`. Pure, never throws. */
+export function fitPermissionDiff(
+  frame: Record<string, unknown>, files: PermissionDiffFile[] | undefined, maxChars: number = BLOB_FIT_CHARS,
+): { diffSummary?: PermissionDiffSummary; diff?: PermissionDiff } {
+  if (!files || files.length === 0) return {};
+  const encoder = new TextEncoder();
+  const fits = (tail: object): boolean =>
+    sealedBlobChars(encoder.encode(JSON.stringify({ ...frame, ...tail })).length) <= maxChars;
+  const unknown = files.some((f) => f.removed === null);
+  const diffSummary: PermissionDiffSummary = {
+    files: files.length,
+    added: files.reduce((n, f) => n + f.added, 0),
+    removed: files.reduce((n, f) => n + (f.removed ?? 0), 0),
+    ...(unknown ? { removedUnknown: true as const } : {}),
+  };
+  if (!fits({ diffSummary })) return {};
+  const ok = (k: number): boolean => {
+    const diff = previewDiff(files, k);
+    return JSON.stringify(diff).length <= DIFF_PREVIEW_MAX_CHARS && fits({ diffSummary, diff });
+  };
+  if (!ok(0)) return { diffSummary };
+  let lo = 0;
+  let hi = files.reduce((n, f) => n + f.hunks.reduce((m, h) => m + h.lines.length, 0), 0);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (ok(mid)) lo = mid; else hi = mid - 1;
+  }
+  const diff = previewDiff(files, lo);
+  return diff.files.length > 0 ? { diffSummary, diff } : { diffSummary };
 }
 
 /** Fuller context for the phone card (the append-last `permissionDetail` blob field, shown under the
@@ -807,12 +1176,20 @@ export function buildPermissionSummary(toolName: string, toolInput: Record<strin
  *  applies exactly that at the seal site, keeping as much text as the wire can carry and reporting how
  *  much it had to drop. `MAX_DETAIL_CHARS` is only a sanity bound so a pathological tool_input can't make
  *  the fit's JSON work unbounded (its loss is counted too). Pure and never throws. */
-export function buildPermissionDetail(toolName: string, toolInput: Record<string, unknown>): string {
+export function buildPermissionDetail(
+  toolName: string, toolInput: Record<string, unknown>, precomputedDiff?: PermissionDiffFile[],
+): string {
   const str = (v: unknown): string | undefined => (typeof v === "string" && v.length > 0 ? v : undefined);
   switch (toolName) {
     case "Bash": case "shell": case "local_shell": { const c = str(toolInput.command); return c ?? ""; }
-    case "apply_patch": { const d = str(toolInput.description); return d ?? ""; }
-    case "Edit": case "Write": case "Read": case "NotebookEdit": {
+    // NOM-166: edits carry the patch as V4A text (Codex's verbatim, Claude Code's rendered from the
+    // diff) — old apps show it in the hero block, and a cut copy is pulled whole via permission-detail.
+    case "apply_patch": return str(toolInput.command) ?? str(toolInput.description) ?? "";
+    case "Edit": case "MultiEdit": case "Write": {
+      const diff = precomputedDiff ?? buildPermissionDiff(toolName, toolInput);
+      return diff ? renderV4A(diff) : str(toolInput.file_path) ?? "";
+    }
+    case "Read": case "NotebookEdit": {
       const fp = str(toolInput.file_path); return fp ?? "";
     }
     case "WebFetch": { const u = str(toolInput.url); return u ?? ""; }
@@ -991,6 +1368,7 @@ export function fitPermissionDetail(
   detail: string,
   maxChars: number = BLOB_FIT_CHARS,
   questions: PermissionQuestion[] = [],
+  diffTail: Record<string, unknown> = {},
 ): { detail: string; omitted: number; questions?: PermissionQuestion[] } {
   const all = Array.from(detail);                                  // code points, not UTF-16 units
   const hardLoss = Math.max(0, all.length - MAX_DETAIL_CHARS);
@@ -998,7 +1376,7 @@ export function fitPermissionDetail(
   const encoder = new TextEncoder();
 
   const measure = (d: string, omitted: number, qs: PermissionQuestion[]): number =>
-    sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs))).length);
+    sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs, diffTail))).length);
 
   const worstCase = all.length; // most digits `permissionDetailOmitted` can ever take
 
@@ -1052,7 +1430,8 @@ export function fitPermissionDetail(
 
 /** The decisionPending blob's permission tail, in its FROZEN append-last order:
  *  … permissionToolName, permissionDetail (omitted when empty), permissionDetailOmitted (omitted when
- *  nothing was dropped), permissionQuestions (omitted when there are none / it didn't fit). Every
+ *  nothing was dropped), permissionQuestions (omitted when there are none / it didn't fit), then `tail`
+ *  (NOM-166: diffSummary, diff — edit tools only, see fitPermissionDiff). Every
  *  optional key follows the same "absent, never empty/zero" discipline as the rest of the blob, so an
  *  older iOS decoder is byte-unaffected. Shared by the fit's size prediction and the real seal so the
  *  two can never drift. */
@@ -1061,12 +1440,14 @@ function permissionFrame(
   detail: string,
   omitted: number,
   questions: PermissionQuestion[] = [],
+  tail: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
     ...base,
     ...(detail.length > 0 ? { permissionDetail: detail } : {}),
     ...(omitted > 0 ? { permissionDetailOmitted: omitted } : {}),
     ...(questions.length > 0 ? { permissionQuestions: questions } : {}),
+    ...tail,
   };
 }
 
@@ -1425,6 +1806,8 @@ export interface PermissionHookDeps {
   loadCodexTurnPolicyFn?: (
     transcriptPath: string, turnId: string, sessionId: string,
   ) => Promise<CodexTurnPolicy | null>;
+  /** Codex's requirements.toml for the prompt-user gate (defaults to CODEX_REQUIREMENTS_PATH). */
+  codexRequirementsPath?: string;
   sleep?: (ms: number) => Promise<void>;
   /** Writes the ONE decision line to stdout. Called only on a genuine phone answer. */
   emit?: (line: string) => void;
@@ -1609,6 +1992,14 @@ export async function runPermissionHook(
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null
       ? (input.tool_input as Record<string, unknown>)
       : {};
+    // 4. Codex prompt-user gate (NOM-165): a managed rule makes Codex ignore our Allow and re-ask at the
+    //    terminal anyway, so hand the prompt straight back instead of showing a phone Allow that does
+    //    nothing. A Deny would still work, but a card that can only deny is not worth the round trip.
+    if (agent === "codex" && typeof toolInput.command === "string"
+      && await codexPromptUserRuleMatches(toolInput.command, deps.codexRequirementsPath)) {
+      trace({ event: "exit", reason: "codex-prompt-user" });
+      return;
+    }
     // CC's own narrowly-scoped rule suggestions (present on the PermissionRequest when it has them);
     // narrowed + forced to destination:session by allowAlwaysLine on an always-allow answer. Absent → whole-tool rule.
     const suggestions = input.permission_suggestions;
@@ -1656,9 +2047,18 @@ export async function runPermissionHook(
       ...base, status: "decisionPending", permissionSummary: summary, permissionRequestId: requestId,
       permissionToolName: toolName,
     };
-    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
+    // Built once: a Write's diff reads the file it overwrites and runs the bounded line diff.
+    const diffFiles = buildPermissionDiff(toolName, toolInput);
+    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput, diffFiles);
+    // NOM-166: the diff preview is fitted FIRST against the base plus the worst-case omitted count (so
+    // the full-text pointer always fits beside it), then the detail takes what is left. Base keys are
+    // never shed for it; a non-edit tool gets an empty tail and a byte-identical frame.
+    const diffTail = fitPermissionDiff(
+      { ...permissionBase, permissionDetailOmitted: Array.from(rawDetail).length },
+      diffFiles,
+    );
     let fitted = fitPermissionDetail(
-      permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput),
+      permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput), diffTail,
     );
     // Shell cards: the command outranks the model-written description. If the description crowded the
     // command out entirely (the floor guard dropped the detail), give the summary back to the bare tool
@@ -1696,7 +2096,7 @@ export async function runPermissionHook(
     // parked detail, which agrees about session and `what` and disagrees about nothing the phone could
     // see. It rejects a detail sealed under a different hold outright (see postFullText).
     const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
-    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
+    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
 
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
@@ -1944,14 +2344,15 @@ export async function runPermissionHook(
     let holdBlob = blob;
     try {
       holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(
-        permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined,
+        permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail), undefined,
         formatDecisionHoldDebug({ requestId, pid: holdPid }),
       ));
     } catch { /* the card without its breadcrumb is still the card */ }
     await (deps.writeHoldFn ?? defaultWriteHold())(
       // `holdId` is APPEND-LAST and omitted unless the caller supplied one, so the hook agents' marker
       // stays byte-for-byte what it was; see DecisionHold.holdId for who needs it and why.
-      sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...(deps.holdId ? { holdId: deps.holdId } : {}) },
+      // `requestId` (NOM-165) lets the watchdog retire the worker's card if this process is SIGKILLed.
+      sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...(deps.holdId ? { holdId: deps.holdId } : {}), requestId },
     );
     heldSessionId = sessionId;
 
