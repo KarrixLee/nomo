@@ -5001,13 +5001,16 @@ async function statusCmd(deps = {}) {
       for (const l of lanLines.slice(1))
         print(cont(l));
     }
-    if (await localApprovalsState(noHoldPath) === "on") {
+    const free = await isFreeMode(now(), deps.freeModePath);
+    if (free) {
+      print(row("Approvals", "off — free pairing, prompts stay in this terminal"));
+    } else if (await localApprovalsState(noHoldPath) === "on") {
       print(row("Approvals", "on — permission prompts are held and sent to your phone"));
     } else {
       print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));
       print(cont(audience ? `→ run ${ui.approvalsOn}` : `→ run your agent's approvals command, e.g. ${ui.approvalsOn}`));
     }
-    if (await isFreeMode(now(), deps.freeModePath))
+    if (free)
       print(row("Free mode", "on — live sessions need Nomo Pro"));
   }
   const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0, devin: 0 };
