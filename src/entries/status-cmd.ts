@@ -572,15 +572,19 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     // The local remote-approvals escape hatch. This is the whole answer to "why didn't my phone ask
     // me?", and nothing else on the machine hints at it — so it earns a permanent row, one calm line
     // when on and a named fix when off.
-    if (await localApprovalsState(noHoldPath) === "on") {
+    // A free (not Pro) pairing never holds (permission.ts skips the hold), so it outranks the switch: the
+    // approvals command could not turn holds on, and "on" would be false. It also sends only presence
+    // and the activity summary — say so, or the stale "last event sent" above reads like a fault.
+    const free = await isFreeMode(now(), deps.freeModePath);
+    if (free) {
+      print(row("Approvals", "off — free pairing, prompts stay in this terminal"));
+    } else if (await localApprovalsState(noHoldPath) === "on") {
       print(row("Approvals", "on — permission prompts are held and sent to your phone"));
     } else {
       print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));
       print(cont(audience ? `→ run ${ui.approvalsOn}` : `→ run your agent's approvals command, e.g. ${ui.approvalsOn}`));
     }
-    // A free (not Pro) pairing sends only presence and the activity summary — say so, or the stale
-    // "last event sent" above reads like a fault.
-    if (await isFreeMode(now(), deps.freeModePath)) print(row("Free mode", "on — live sessions need Nomo Pro"));
+    if (free) print(row("Free mode", "on — live sessions need Nomo Pro"));
   }
 
   // ── per-agent gathering ───────────────────────────────────────────────────────────────────────

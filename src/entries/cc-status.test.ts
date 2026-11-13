@@ -2769,6 +2769,13 @@ describe("statusCmd — hooks-not-firing warning", () => {
     expect(freeLine(await run({ freeModeAgeMs: 16 * MIN }))).toBeUndefined();
   });
 
+  test("free mode: the Approvals row says prompts stay in the terminal (holds are skipped)", async () => {
+    const approvals = (lines: string[]) => lines.find((l) => l.startsWith("Approvals"));
+    expect(approvals(await run({ freeModeAgeMs: 2 * MIN })))
+      .toBe(`${"Approvals".padEnd(14)}off — free pairing, prompts stay in this terminal`);
+    expect(approvals(await run({}))).toBe(`${"Approvals".padEnd(14)}on — permission prompts are held and sent to your phone`);
+  });
+
   test("recent codex rollout + NO stamp → codex hooks-not-firing warning with the #16430/#30835 hint", async () => {
     const lines = await run({ codexSessionAgeMs: 3 * MIN });
     expect(warnedFor(lines, "Codex")).toBe(true);
