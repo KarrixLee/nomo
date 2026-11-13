@@ -28,7 +28,7 @@ import {
 } from "./adapter";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, clearInterruptFlagAt, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
-  interruptFlagFileName, interruptFlagSetAt, LAST_SEND_PATH, lastHookPath, loadConfig, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix, SEND_FAIL_PATH,
+  interruptFlagFileName, interruptFlagSetAt, isFreeMode, LAST_SEND_PATH, lastHookPath, loadConfig, markFreeModeIfNotPro, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix, SEND_FAIL_PATH,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, sidField, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
@@ -780,11 +780,12 @@ async function reconcileProvisional(config: Config, hookPid: number): Promise<vo
       traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
       return;
     }
-    let delivered = false;
+    // Free pairing: the relay holds no row for it, so there is nothing to end — just drop the file.
+    let delivered = await isFreeMode();
     const started = Date.now();
     let status: number | undefined;
     let error: string | undefined;
-    try {
+    if (!delivered) try {
       const res = await fetch(`${config.url}/v1/cc/event`, {
         method: "POST",
         headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
@@ -832,7 +833,7 @@ async function retireLineageSession(
   reason: string,
 ): Promise<void> {
   let delivered = false;
-  try {
+  if (!await isFreeMode()) try {
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
       headers: {
@@ -1385,6 +1386,13 @@ export async function runHook(agent: AgentKind): Promise<void> {
     // REMOVABLE once openai/codex#15269 ships.
     if (agent === "codex") await reconcileProvisional(config, hookPid);
 
+    // Free pairing (2.5.0): the session stays tracked locally (presence, the watchdog's reaping) but no
+    // event leaves the computer. Nothing is owed to a relay that refuses it, so a done settles here.
+    if (await isFreeMode()) {
+      if (plan.op === "done") await markDoneDelivered(sessionId);
+      return;
+    }
+
     const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
     const postStarted = Date.now();
     let res: Response;
@@ -1417,6 +1425,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
       return;
     }
     if (!res.ok) await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
+    await markFreeModeIfNotPro(res);
     if (res.ok) {
       // Success marker for Task 2.2's `status` command: the epoch-ms of the last delivered event. A
       // delivered event also breaks any gone streak (the pairing is plainly alive again).
@@ -1438,8 +1447,9 @@ export async function runHook(agent: AgentKind): Promise<void> {
         process.stderr.write(`[nomo-cc] pairing gone server-side (HTTP ${res.status}) — removed local pairing; re-pair with \`nomo-cc pair\` to reconnect\n`);
       }
     } else {
-      // 401/403/429/5xx — ambiguous / transient. Never tear down; just clear any gone streak so a
-      // real revoke later still needs its own two consecutive gone responses.
+      // 401/403/429/5xx — ambiguous / transient (a not-Pro 403 marked free mode above). Never tear down;
+      // just clear any gone streak so a real revoke later still needs its own two consecutive gone
+      // responses.
       await resetGoneStrikes();
     }
   } catch {

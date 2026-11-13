@@ -196,6 +196,60 @@ export const GONE_STRIKE_LIMIT = 2;
  *  cycle. */
 export const NO_HOLD_PATH = `${CC_DIR}/no-hold`;
 
+// --- Free mode (2.5.0 free pairing) -----------------------------------------------------------
+//
+// A pairing is Pro or "not Pro" (free, or a lapsed subscription). The server tells us on every presence
+// reply (`tier`) and on any session route it refuses (403 `{"error":"entitlement suspended"}`). While not
+// Pro, the plugin sends NO session events, opens NO approval holds and uploads NO full text — only
+// presence and the sealed daily activity summary. The marker is a TTL'd epoch-ms stamp, refreshed by the
+// presence loop every ~60 s: if the server goes quiet it expires and the plugin fails OPEN to Pro
+// behaviour, and the first refused event re-marks it. It is never a reason to tear the pairing down —
+// only 404/410 gone strikes do that.
+
+/** Epoch-ms text: the last time the server said this pairing is not Pro. */
+export const FREE_MODE_PATH = `${CC_DIR}/free-mode`;
+/** How long one "not Pro" answer counts. The presence loop refreshes it every minute. */
+export const FREE_MODE_TTL_MS = 15 * 60_000;
+
+/** True while the free-mode marker exists and is younger than FREE_MODE_TTL_MS. Absent, unreadable or
+ *  malformed → false (Pro behaviour). Never throws. */
+export async function isFreeMode(now: number = Date.now(), path: string = FREE_MODE_PATH): Promise<boolean> {
+  return isFreeModeSync(now, path);
+}
+
+/** isFreeMode without the await, for a caller whose request must START before the caller's next one does
+ *  (postFullText: the upload must leave before the decision/event POST it accompanies). One tiny read. */
+export function isFreeModeSync(now: number = Date.now(), path: string = FREE_MODE_PATH): boolean {
+  try {
+    const at = Number(readFileSync(path, "utf8").trim());
+    return Number.isFinite(at) && at > 0 && now - at >= 0 && now - at < FREE_MODE_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+
+export async function markFreeMode(path: string = FREE_MODE_PATH, now: number = Date.now()): Promise<void> {
+  await atomicWrite(path, String(now)).catch(() => {});
+}
+
+export async function clearFreeMode(path: string = FREE_MODE_PATH): Promise<void> {
+  await unlink(path).catch(() => {});
+}
+
+/** The server's one "not Pro" signal (free and lapsed pairings answer identically). */
+export function isNotProResponse(status: number, body: string): boolean {
+  return status === 403 && body.includes("entitlement suspended");
+}
+
+/** Every relay response goes through this: a not-Pro 403 marks free mode. Reads the body only for a 403,
+ *  so it never consumes a response a caller still needs. Never throws. */
+export async function markFreeModeIfNotPro(res: Response, path: string = FREE_MODE_PATH): Promise<void> {
+  if (res.status !== 403) return;
+  try {
+    if (isNotProResponse(res.status, await res.text())) await markFreeMode(path);
+  } catch { /* unreadable body → not the signal */ }
+}
+
 /** Shared sealed-blob fit ceiling. The worker's hard limit is 3072 base64 characters; keep the
  *  existing 64-character safety margin used by permission frames. Blob producers must measure the
  *  complete plaintext shape before appending optional large text. */
@@ -360,6 +414,7 @@ export async function postFullText(
   fetchFn: typeof fetch = fetch, trace?: (event: object) => void, requestId?: string,
 ): Promise<void> {
   if (content === undefined) return;
+  if (isFreeModeSync()) return; // a free pairing uploads no plan / permission text (sync: keeps the start order)
   try {
     const blob = await encryptBlob(config.e2eKey, {
       sessionId, what, requestId, content, complete: recordFullTextIsComplete(content),
@@ -1510,7 +1565,9 @@ async function flushPendingStash(
   try {
     const blob = await encryptBlob(e2eKey, stash.blob);
     const envelope = { v: 2, sessionId: stash.sessionId, op: stash.op, prio: stash.prio, ts: now, blob };
-    for (let attempt = 0; attempt < attempts; attempt++) {
+    // A free pairing sends no session events: the session is still tracked below, just not POSTed.
+    const free = await isFreeMode();
+    for (let attempt = 0; attempt < attempts && !free; attempt++) {
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
@@ -1519,6 +1576,8 @@ async function flushPendingStash(
           signal: AbortSignal.timeout(fetchTimeoutMs),
         });
         if (res.ok) break;
+        await markFreeModeIfNotPro(res);
+        if (await isFreeMode()) break; // refused as not Pro: retrying cannot help
       } catch {
         // transient (network / timeout) — retry within the ack's budget
       }

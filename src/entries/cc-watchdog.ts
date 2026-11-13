@@ -54,13 +54,14 @@ import type { CodexAppServerSocketState, DecisionHold, PlanPickerTraceDecision }
 import {
   AgentKind, AgentKindWire, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
   startCodexAppServerDaemon,
-  forgetDevinGrants, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
+  forgetDevinGrants, GONE_STRIKE_LIMIT, isFreeMode, loadConfig, markFreeModeIfNotPro, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, sidField, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
 import { startActivityLoop } from "../core/activity";
+import { startPresenceLoop } from "../core/presence";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -1047,9 +1048,13 @@ export interface PostDetail {
  *  delivered and the caller would delete/rewrite the session file, losing the session. A 404 is
  *  `revoked` (the definitive pairing-is-gone signal, keyed on the server's own not-found response).
  *  Any network error / timeout is a transient `failed`. Best-effort: never throws across its boundary. */
-async function postEvent(
-  config: Config, body: object, opts: { timeoutMs?: number; detail?: PostDetail } = {},
+export async function postEvent(
+  config: Config, body: object, opts: { timeoutMs?: number; detail?: PostDetail; freeModePath?: string } = {},
 ): Promise<PostOutcome> {
+  // Free pairing (2.5.0): every sweep path's /cc/event comes through here, so this is the one gate. Nothing
+  // is owed to a relay that refuses session events, so the caller's bookkeeping proceeds as if delivered
+  // (records retire, debts clear) and no request leaves the computer.
+  if (await isFreeMode(Date.now(), opts.freeModePath)) return "delivered";
   const started = Date.now();
   const detail = opts.detail;
   // The LAN listener's sealed host hint rides along on the POSTs this daemon already makes — no new
@@ -1068,6 +1073,7 @@ async function postEvent(
     });
     if (detail) { detail.status = res.status; detail.ms = Date.now() - started; }
     const outcome = postOutcomeForStatus(res.status);
+    if (outcome === "failed") await markFreeModeIfNotPro(res, opts.freeModePath); // 403 is never a gone strike
     // Tell the hint publisher what became of the hint this POST carried. A hint handed to a POST that
     // failed must NOT count as published — see LanHintPublisher.settle. `revoked` settles as undelivered
     // too: the pairing is gone, so nothing was advertised to anyone.
@@ -4518,6 +4524,9 @@ async function run(): Promise<void> {
   // NOM-142 daily activity summary: scan now, then hourly, off the sweep path (chunked + yielding, so
   // the first ~2 GB backfill never stalls the 5 s poll). Self-gated on pairing; swallows every error.
   const stopActivity = startActivityLoop();
+  // 2.5.0 presence: who is coding + waiting yes/no, every 60 s, for every pairing. Its reply's tier
+  // keeps the free-mode marker fresh (or clears it the minute a purchase flips the pairing to Pro).
+  const stopPresence = startPresenceLoop();
   try {
     while (true) {
       // A claim can be stolen or removed after startup (upgrade takeover, reset, racing spawn). An
@@ -4539,7 +4548,9 @@ async function run(): Promise<void> {
       // Re-key the LAN listener from the CURRENT config (a re-pair rotates e2eKey, and K_lan derives
       // from it). Deliberately NOT awaited-on-IO: sync() only swaps a promise and returns, so the LAN
       // channel can never sit on the sweep path — the design's non-negotiable.
-      lan.sync(config);
+      // A free pairing keys the listener OFF (null config): the phone gets no LAN state feed and no LAN
+      // answer path, so nothing local can drive the island either.
+      lan.sync(config && !(await isFreeMode()) ? config : null);
       // Discovery + reconcile run BEFORE the sweep (only when paired). Backstop-reconcile first (retire
       // any provisional whose real session already reported), then discover new TUIs — so a just-
       // surfaced provisional is counted in `remaining` this same cycle, keeping the daemon alive
@@ -4615,6 +4626,7 @@ async function run(): Promise<void> {
   } finally {
     clearInterval(settleTimer);
     stopActivity();
+    stopPresence();
     shutdown(); // bridge child AND the LAN socket — a retired daemon must leave no listener behind
     activeBridgeShutdown = undefined;
     activeCodexInterrupt = undefined;

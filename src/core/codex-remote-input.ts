@@ -19,7 +19,7 @@ import {
   extrasArray, fitPermissionDetail, PERMISSION_QUESTION_LABEL_MAX,
 } from "./permission";
 import {
-  clearDecisionHold, Config, DecisionHold, localApprovalsState, PLUGIN_VERSION, readRecord, SessionRecord,
+  clearDecisionHold, Config, DecisionHold, isFreeMode, localApprovalsState, markFreeModeIfNotPro, PLUGIN_VERSION, readRecord, SessionRecord,
   sessionBranch, settleDecisionHoldRecord, sidField, writeDecisionHold,
 } from "./shared";
 import { lanRunningUnderTest } from "./lan-wire";
@@ -325,7 +325,8 @@ async function runRemoteInput(
     // The permission hook hard-gates the same flag (permission.ts's noHoldPath escape hatch); the server
     // does not compensate (its decision route reads the phone's own KV toggle, not the x-cc-approvals
     // header this value would otherwise set below).
-    if (approvals === "off") return "unsupported";
+    // A free pairing (2.5.0) never holds for the phone: same decline, the Mac picker owns it.
+    if (approvals === "off" || await isFreeMode()) return "unsupported";
     if (signal.aborted) return "resolved-elsewhere";
 
     const fetchFn = deps.fetchFn ?? fetch;
@@ -406,7 +407,10 @@ async function runRemoteInput(
       if (!signal.aborted) await markAttentionStalled();
       return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
-    if (!response.ok) return signal.aborted ? "resolved-elsewhere" : "transport-error";
+    if (!response.ok) {
+      await markFreeModeIfNotPro(response);
+      return signal.aborted ? "resolved-elsewhere" : "transport-error";
+    }
     const created = await parseJson<{ hold?: unknown }>(response);
     if (!created) {
       // A 200 we cannot parse may still have created the hold. Retire it rather than leave an orphan.

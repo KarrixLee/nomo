@@ -531,6 +531,7 @@ const baseDeps = (over: Record<string, unknown>) => ({
   randomUUID: () => "req-fixed",
   jitter: () => 0,
   noHoldPath: "/does/not/exist/no-hold",
+  freeModePath: "/does/not/exist/free-mode",
   codexRequirementsPath: "/does/not/exist/requirements.toml",
   delegate: async () => { throw new Error("delegate must not run"); },
   trace: () => {}, // noop by default — tests must not touch the real trace file or install signal handlers
@@ -538,6 +539,33 @@ const baseDeps = (over: Record<string, unknown>) => ({
 });
 
 describe("runPermissionHook — hold state machine", () => {
+  // 2.5.0 free pairing: a free pairing never holds for the phone. The prompt falls through to the
+  // agent's own terminal dialog at once (no decision line), and the delegate tracks it locally.
+  test("free mode never opens a hold", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "perm-free-"));
+    try {
+      const freeModePath = join(dir, "free-mode");
+      await writeFile(freeModePath, String(Date.now()));
+      const emitted: string[] = [];
+      let delegated = 0;
+      let read = false;
+      // hold:false so a regression fails fast (2 POSTs) instead of polling forever on the no-op sleep.
+      const { fn, calls } = scriptFetch(false, []);
+      await runPermissionHook(baseDeps({
+        freeModePath, fetchFn: fn, emit: (l: string) => emitted.push(l),
+        readInput: async () => { read = true; return INPUT; },
+        delegate: async () => { delegated += 1; },
+      }) as never);
+      expect(calls.filter((c) => c.url.includes("/v1/cc/decision"))).toEqual([]);
+      expect(calls).toEqual([]);
+      expect(emitted).toEqual([]);
+      expect(delegated).toBe(1);
+      expect(read).toBe(false); // stdin is the delegate's (runHook reads it itself)
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   // NOM-67. Cursor imports the Claude plugin and runs THIS hook with a Cursor-shaped payload. It must
   // print no decision (so Cursor falls back to its own prompt) and touch neither disk nor network. The
   // control is the very next test: the same input without the fingerprint POSTs twice.

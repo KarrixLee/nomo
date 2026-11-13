@@ -15,7 +15,7 @@
  */
 
 import {
-  atomicWrite, CCOp, CCStatus, Config, LAST_SEND_PATH, localApprovalsState, PLUGIN_VERSION,
+  atomicWrite, CCOp, CCStatus, Config, isFreeMode, LAST_SEND_PATH, localApprovalsState, markFreeModeIfNotPro, PLUGIN_VERSION,
 } from "../core/shared";
 
 /** One frame to send: already planned (op/prio/status), already carrying the display fields this
@@ -592,6 +592,9 @@ function frame(
  *  the hook does. Non-2xx is NOT triaged here (no gone-strike teardown): the pairing is shared, and the
  *  hooks + watchdog already own that lifecycle. Silence on every failure is the contract. */
 export async function postOcEvent(config: Config, envelope: Record<string, unknown>): Promise<boolean> {
+  // Free pairing (2.5.0): OpenCode, Cursor, Antigravity and Devin all post through here. Nothing is owed
+  // to a relay that refuses session events, so report it settled and send nothing.
+  if (await isFreeMode()) return true;
   try {
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
@@ -605,6 +608,7 @@ export async function postOcEvent(config: Config, envelope: Record<string, unkno
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000),
     });
+    await markFreeModeIfNotPro(res);
     if (!res.ok) return false;
     await atomicWrite(LAST_SEND_PATH, String(Date.now())).catch(() => {});
     return true;

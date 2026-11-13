@@ -16,6 +16,7 @@ import {
   stampPermissionDetailFullAt, watchdogBuildStamp,
   watchdogHolderIsLive,
   INTERRUPT_FLAG_MAX_AGE_MS, clearInterruptFlagAt, interruptFlagFileName, interruptFlagSetAt, writeInterruptFlagAt,
+  clearFreeMode, FREE_MODE_TTL_MS, isFreeMode, isNotProResponse, markFreeMode, markFreeModeIfNotPro,
 } from "./shared";
 
 describe("codexCompanionBrokerEvidence (structural companion-session proof)", () => {
@@ -1135,6 +1136,46 @@ describe("runtimeArgs", () => {
   test("node and the hook shim are left alone", () => {
     for (const rt of ["node", "/opt/homebrew/bin/node", "/Users/me/.config/cc-status/hook-shim.sh", "/bun/dir/node"]) {
       expect(runtimeArgs(rt, ["/p/x.mjs"])).toEqual(["/p/x.mjs"]);
+    }
+  });
+});
+
+describe("free mode (2.5.0 free pairing)", () => {
+  test("isNotProResponse matches only the suspended body", () => {
+    expect(isNotProResponse(403, '{"error":"entitlement suspended"}')).toBe(true);
+    expect(isNotProResponse(403, '{"error":"forbidden"}')).toBe(false);
+    expect(isNotProResponse(404, '{"error":"entitlement suspended"}')).toBe(false);
+    expect(isNotProResponse(401, "")).toBe(false);
+  });
+
+  test("free-mode marker expires after 15 minutes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "free-mode-"));
+    const path = join(dir, "free-mode");
+    try {
+      expect(await isFreeMode(1_000, path)).toBe(false); // no marker → Pro behaviour (fail open)
+      await markFreeMode(path, 1_000);
+      expect(await isFreeMode(1_000 + FREE_MODE_TTL_MS - 1, path)).toBe(true);
+      expect(await isFreeMode(1_000 + FREE_MODE_TTL_MS, path)).toBe(false);
+      await markFreeMode(path, 2_000);
+      await clearFreeMode(path);
+      expect(await isFreeMode(2_001, path)).toBe(false);
+      expect(FREE_MODE_TTL_MS).toBe(15 * 60_000);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("markFreeModeIfNotPro marks on the suspended 403 and nothing else", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "free-mode-"));
+    const path = join(dir, "free-mode");
+    try {
+      await markFreeModeIfNotPro(new Response('{"error":"forbidden"}', { status: 403 }), path);
+      await markFreeModeIfNotPro(new Response("{}", { status: 404 }), path);
+      expect(await isFreeMode(Date.now(), path)).toBe(false);
+      await markFreeModeIfNotPro(new Response('{"error":"entitlement suspended"}', { status: 403 }), path);
+      expect(await isFreeMode(Date.now(), path)).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

@@ -29,7 +29,7 @@ import { runHook, buildBlob, OpPlan } from "./hook";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, BLOB_FIT_CHARS, CC_DIR, clearDecisionHold, codexHome, Config,
   DecisionHold, flagExists, formatDecisionHoldDebug,
-  fullTextForRecord, loadConfig, NO_HOLD_PATH, postFullText,
+  fullTextForRecord, isFreeMode, loadConfig, markFreeModeIfNotPro, NO_HOLD_PATH, postFullText,
   PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord,
   settleDecisionHoldRecord, stampPermissionDetailFull,
   writeDecisionHold,
@@ -1906,6 +1906,8 @@ export interface PermissionHookDeps {
   /** Extra ms added to each poll interval so many concurrent holds don't poll in lockstep. */
   jitter?: () => number;
   noHoldPath?: string;
+  /** The free-mode marker (defaults to FREE_MODE_PATH); a fresh one takes the no-hold exit. */
+  freeModePath?: string;
   /** The no-hold fire-and-forget path (defaults to the normal attention event via runHook). */
   delegate?: () => Promise<void>;
   pollIntervalMs?: number;
@@ -1983,7 +1985,10 @@ export async function runPermissionHook(
     // locally, behave exactly as the old fire-and-forget attention event (instant terminal dialog).
     // Delegating to runHook reuses the entire needs-attention pipeline (POST, tracking, watchdog) and
     // returns silently with exit 0 — it also no-ops cleanly when unpaired, so zero network in that case.
-    if (await flagExists(noHoldPath)) {
+    // A FREE pairing (2.5.0) takes the same exit: it never holds for the phone. The prompt falls
+    // through to the agent's own dialog at once, and the delegate tracks it locally with no POST (runHook
+    // and postOcEvent both skip the relay in free mode) — nothing that could drive the Dynamic Island.
+    if (await flagExists(noHoldPath) || await isFreeMode(Date.now(), deps.freeModePath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
@@ -2255,6 +2260,8 @@ export async function runPermissionHook(
             const body = (await res.json().catch(() => ({}))) as { hold?: unknown; reason?: unknown };
             hold = body.hold === true;
             if (typeof body.reason === "string") reason = body.reason;
+          } else {
+            await markFreeModeIfNotPro(res); // not Pro → the next prompt skips the hold entirely
           }
           // The worker names the FIRST failing gate in `reason` (stale-session / toggle-off /
           // no-activity). Without it a field trace of a prompt that fell open is unfalsifiable — a

@@ -1865,6 +1865,49 @@ await child.exited;
     });
   }, 20000);
 
+  // --- 2.5.0 free pairing ----------------------------------------------------------------------
+  test("free mode skips the session event POST but still tracks the session locally", async () => {
+    await withEventServer(async ({ home, ccDir, sessionsDir, bodies }) => {
+      await writeFile(join(ccDir, "free-mode"), String(Date.now()));
+      const sid = "f1f1f1f1-1111-4222-8333-444444444444";
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "hi", cwd: "/x/api-status" });
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "Stop", cwd: "/x/api-status" });
+      expect(bodies).toEqual([]); // no /v1/cc/event (and no full-text upload) left the computer
+      const record = await readLocalRecord(sessionsDir, sid);
+      expect(record).toMatchObject({ op: "done", lastEvent: "done" });
+      expect(record?.donePending).toBeUndefined(); // nothing owed to a relay that refuses it
+      // CONTROL: an expired marker (older than 15 min) is Pro again — fail open.
+      await writeFile(join(ccDir, "free-mode"), String(Date.now() - 16 * 60_000));
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "again", cwd: "/x/api-status" });
+      expect(bodies.map((b) => b.sessionId)).toEqual([sid]);
+    });
+  }, 20000);
+
+  test("a 403 suspended reply marks free mode (and is not a gone strike)", async () => {
+    let posts = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => { posts += 1; return new Response('{"error":"entitlement suspended"}', { status: 403 }); },
+    });
+    const { home, ccDir, sessionsDir } = await setupHookHome(`http://127.0.0.1:${server.port}`);
+    try {
+      const sid = "f2f2f2f2-1111-4222-8333-444444444444";
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "hi", cwd: "/x/api-status" });
+      expect(posts).toBe(1);
+      const marker = Number(await readFile(join(ccDir, "free-mode"), "utf8"));
+      expect(Date.now() - marker).toBeLessThan(60_000);
+      expect(await readdir(ccDir)).not.toContain("gone-strikes");
+      expect(await readdir(ccDir)).toContain("config.json"); // never torn down
+      // The next event is already free: no second POST.
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "PostToolUse", tool_name: "Bash", cwd: "/x/api-status" });
+      expect(posts).toBe(1);
+      expect(await readLocalRecord(sessionsDir, sid)).not.toBeNull();
+    } finally {
+      server.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
   test("runHook claude stands down under Devin (DEVIN_PROJECT_DIR + a Devin payload)", async () => {
     await withEventServer(async ({ home, ccDir, sessionsDir, bodies }) => {
       const payload = { session_id: "brawny-shirt", prompt_id: "p1", hook_event_name: "UserPromptSubmit", prompt: "hi" };
