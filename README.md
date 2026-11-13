@@ -36,7 +36,8 @@ update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
 - **The relay is blind.** The Cloudflare Worker that forwards pushes sees routing metadata only — never a
   title, machine name, status text, command or answer. The one thing it sees in the clear is the
   once-a-minute presence ping: which agents have a turn open, and whether one is waiting for approval.
-  A free (not Pro) pairing sends only that ping and the sealed daily activity summary.
+  A free (not Pro) pairing sends only that ping and the sealed daily activity summary, except that after
+  a quiet spell its first request still goes out (end-to-end encrypted, as always) and is refused.
   [What leaves your computer](#what-leaves-your-computer)
 - **No telemetry, no credentials.** The plugin's only network peer is that relay (`https://api.nomo.gg`
   by default). It never reads your agents' API keys or logins, and has no analytics. The installer and
@@ -205,9 +206,10 @@ says a pairing is not Pro (the presence reply, or a 403 `{"error":"entitlement s
 session route), the plugin writes `~/.config/cc-status/free-mode` and, while it is fresh (15 minutes,
 refreshed by each presence reply), sends **no** session events, opens **no** approval holds (every prompt
 goes straight to the agent's own dialog), uploads **no** plan or permission text, and keys the LAN
-listener off. Sessions are still tracked on disk so presence stays accurate. If the relay goes quiet the
-marker expires and the plugin behaves as Pro again until the next refusal; a 403 is never treated as an
-unpair (only a 404/410 is).
+listener off. Sessions are still tracked on disk so presence stays accurate. After a quiet spell (15
+minutes with no presence reply) the marker has expired, so the first request is sent (end-to-end
+encrypted, as always), the relay refuses it and stores nothing, and free mode resumes. A 403 is never
+treated as an unpair (only a 404/410 is).
 
 **On the iPhone,** the Live Agents widget (Nomo Pro) reads a snapshot of decrypted titles, states and
 computer names from the app's own App Group container. It never leaves the device.
