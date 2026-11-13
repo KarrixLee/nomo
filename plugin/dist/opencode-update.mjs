@@ -282,6 +282,7 @@ async function postFullText(config, sessionId, what, content, fetchFn = fetch, t
       signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS)
     });
     trace?.({ event: "full-text", what, chars: content.length, status: res.status });
+    await markFreeModeIfNotPro(res);
   } catch (e) {
     trace?.({ event: "full-text", what, chars: content.length, status: 0, error: e?.name ?? "Error" });
   }

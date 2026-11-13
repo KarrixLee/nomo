@@ -288,6 +288,7 @@ async function postFullText(config, sessionId, what, content, fetchFn = fetch, t
       signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS)
     });
     trace?.({ event: "full-text", what, chars: content.length, status: res.status });
+    await markFreeModeIfNotPro(res);
   } catch (e) {
     trace?.({ event: "full-text", what, chars: content.length, status: 0, error: e?.name ?? "Error" });
   }
@@ -5006,6 +5007,8 @@ async function statusCmd(deps = {}) {
       print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));
       print(cont(audience ? `→ run ${ui.approvalsOn}` : `→ run your agent's approvals command, e.g. ${ui.approvalsOn}`));
     }
+    if (await isFreeMode(now(), deps.freeModePath))
+      print(row("Free mode", "on — live sessions need Nomo Pro"));
   }
   const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0, devin: 0 };
   let totalSessions = 0;
