@@ -45,7 +45,8 @@ update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
 - **Hooks can only do what you answered.** A phone Allow, Deny or answer is acted on only when it is
   sealed by your paired phone for that exact request. Every failure — unpaired, offline, timeout,
   crash — **fails open** to the agent's own prompt. Nomo can delay a decision; it never makes one for
-  you, except auto-approving its **own** status/pair commands, matched byte for byte.
+  you, except auto-approving its **own** status commands, matched byte for byte. Pairing, unpairing,
+  reset and uninstall always ask.
   [Hooks security](#hooks-security)
 - **Local files are owner-only.** Pairing keys and session records live in `~/.config/cc-status/`,
   written `0600`. Every file Nomo writes into an agent's config is listed below, and the installers
@@ -209,8 +210,10 @@ goes straight to the agent's own dialog), uploads **no** plan or permission text
 listener off. Sessions are still tracked on disk so presence stays accurate. After a quiet spell (15
 minutes with no presence reply) the marker has expired, so the first prompt's sealed requests go out (one
 event; on a permission prompt also the full text and the approval request), the relay refuses them and
-stores nothing, and free mode resumes. A 403 is never
-treated as an unpair (only a 404/410 is).
+stores nothing, and free mode resumes. The LAN listener does not come back when the marker expires: it
+stays keyed off until the relay says the pairing is Pro (a presence reply, or an accepted session
+request), which deletes the marker. A 403 is never treated as an unpair (only a 404/410 is), and neither
+is a `409` (a pairing the relay has not seen claimed yet): that request is retried later.
 
 **On the iPhone,** the Live Agents widget (Nomo Pro) reads a snapshot of decrypted titles, states and
 computer names from the app's own App Group container. It never leaves the device.
@@ -225,7 +228,7 @@ computer names from the app's own App Group container. It never leaves the devic
 | `~/.config/cc-status/sessions/<conv>.<id>.agy-inbox` (owner-only) | queued Antigravity phone replies, deleted after a day | watchdog |
 | `~/.config/cc-status/hook-shim.sh` (`0700`) | version-stable hook launcher | `run.sh`, pair |
 | `~/.config/cc-status/activity-days.json`, `machine-id` | activity summary, per-computer id | watchdog |
-| `~/.config/cc-status/free-mode` | time the relay last said this pairing is not Pro (counts for 15 minutes) | hooks, watchdog |
+| `~/.config/cc-status/free-mode` | time the relay last said this pairing is not Pro (counts for 15 minutes for sending; keeps the LAN listener off until the relay says Pro) | hooks, watchdog |
 | `~/.config/cc-status/short-command` | `1` or `0`: whether the short `nomo` command is installed, so status and reset name `nomo …` or `bunx nomo-ai …` | `bunx nomo-ai` |
 | `~/.config/cc-status/*-trace.log` (`0600`) | local diagnostics; never uploaded | hooks, watchdog |
 | `~/.codex/config.toml` | Codex `notify` backstop (your existing `notify` is chained, mode kept, one-time `config.toml.bak-nomo`); refuses an unparseable `notify` line | Codex pair |
@@ -382,11 +385,12 @@ real installs never set it, and anything that can set your agent's environment c
   `auto_approve` once, without a new card. Any other difference gets a fresh card; never after a Deny;
   the one-use ticket is a `0600` file in the sessions folder.
 - **Own commands:** so that `/nomo-status` doesn't put a card on your phone, the approval hook answers
-  `auto_approve` — on a paired computer, after the deny rules and a pending Stop — for exactly seven
+  `auto_approve` — on a paired computer, after the deny rules and a pending Stop — for exactly four
   command lines rebuilt in code from the template the installer writes the skills from (never read from
-  the skill files): status (plain and verbose), approvals status, approvals **on**, reset, pair, and the
-  pair wait. Byte-for-byte match (one trailing newline forgiven; a second line, a `cd`, `&& …` or other
-  quoting goes to the phone). Approvals **off**, unpair and the typed pairing code still ask your phone.
+  the skill files): status (plain and verbose), approvals status and approvals **on**. Byte-for-byte
+  match (one trailing newline forgiven; a second line, a `cd`, `&& …` or other quoting goes to the
+  phone). Approvals **off**, pair, the pair wait, reset, unpair and the typed pairing code still ask your
+  phone: on a paired computer, pairing again first revokes the current pairing.
 - **What it reads.** The approval hook: tool name, `CommandLine` or file path, and the model's
   `toolSummary` (sent sealed). Status events: only `conversationId`, the first `workspacePaths` entry,
   `transcriptPath` (its mtime and first line) and `modelName` — never tool arguments. From
@@ -428,15 +432,19 @@ real installs never set it, and anything that can set your agent's environment c
   approvals paused. A shell grant covers the command's name for plain commands only (`touch` covers
   `touch b.txt`, not `touchy`); anything with `&&`, `;`, `|`, `$(…)`, backticks or a redirect is covered
   only by a grant for that exact text, so `touch x && rm -rf ~` still asks. A command that runs other
-  commands or code (`bash`, `sh`, `env`, `sudo`, `xargs`, `npx`, `python3`, `node`, `bun` and similar)
-  never becomes a name grant: the grant is that exact text, so `bash scripts/test.sh` does not cover
-  `bash -c "…"`. For any other tool it covers that tool for the session.
-- **Own commands:** on a paired computer, before any card, Nomo auto-approves exactly six command lines,
-  rebuilt in code and matched byte for byte against what the skills run (the plugin's `/nomo:*` and the
-  installer's `/nomo-*` forms, with at most Devin Desktop's `workdir` beside them): status, approvals
-  status, approvals **on**, reset, pair, and the pair wait. One trailing newline is forgiven; any other
-  difference (`&& …`, `;`, `|`, a redirect, a second line, another script or path, an extra argument)
-  goes to the phone. Approvals **off**, unpair and the typed pairing code still ask your phone.
+  commands or code (`bash`, `sh`, `env`, `sudo`, `xargs`, `npx`, `python3`, `node`, `bun` and similar),
+  or can run code through its arguments or project files (`git`, `make`, `sed`, `tar`, `rsync`, `npm`,
+  `cargo`, `vim`, `xcodebuild`, `nomo` and similar), never becomes a name grant: the grant is that exact
+  text, so `bash scripts/test.sh` does not cover `bash -c "…"` and `git status` does not cover
+  `git -c core.fsmonitor=… status`. A command that pairs, unpairs, resets or uninstalls Nomo is never
+  approved by a grant. For any other tool it covers that tool for the session.
+- **Own commands:** on a paired computer, before any card, Nomo auto-approves exactly three command
+  lines, rebuilt in code and matched byte for byte against what the skills run (the plugin's `/nomo:*`
+  and the installer's `/nomo-*` forms, with at most Devin Desktop's `workdir` beside them): status,
+  approvals status and approvals **on**. One trailing newline is forgiven; any other difference (`&& …`,
+  `;`, `|`, a redirect, a second line, another script or path, an extra argument) goes to the phone.
+  Approvals **off**, pair, the pair wait, reset, unpair and the typed pairing code still ask your phone:
+  on a paired computer, pairing again first revokes the current pairing.
 - **Writes.** Devin's own config files are never written by the hooks. The installer writes only its
   entries in the `"hooks"` key and the marked `nomo-*` skills (which run only Nomo's local commands and
   never print the pairing link or QR secret); a same-named skill of yours is left alone. A
