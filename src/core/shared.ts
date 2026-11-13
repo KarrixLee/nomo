@@ -203,8 +203,10 @@ export const NO_HOLD_PATH = `${CC_DIR}/no-hold`;
 // Pro, the plugin sends NO session events, opens NO approval holds and uploads NO full text — only
 // presence and the sealed daily activity summary. The marker is a TTL'd epoch-ms stamp, refreshed by the
 // presence loop every ~60 s: if the server goes quiet it expires and the plugin fails OPEN to Pro
-// behaviour, and the first refused event re-marks it. It is never a reason to tear the pairing down —
-// only 404/410 gone strikes do that.
+// behaviour for SENDING, and the first refused event re-marks it. The LAN listener does not fail open: it
+// stays keyed off while the marker file exists at all (lanBlockedByFreeMode), and only a real "pro"
+// answer deletes it — presence `tier:"pro"`, or a 2xx on a session route (applyTierFromResponse). It is
+// never a reason to tear the pairing down — only 404/410 gone strikes do that.
 
 /** Epoch-ms text: the last time the server said this pairing is not Pro. */
 export const FREE_MODE_PATH = `${CC_DIR}/free-mode`;
@@ -228,6 +230,19 @@ export function isFreeModeSync(now: number = Date.now(), path: string = FREE_MOD
   }
 }
 
+/** The LAN gate (2026-11-14 audit M1): true while ANY free-mode marker exists — fresh, expired or
+ *  malformed. LAN traffic never reaches the server, so an aged-out "free" (worker unreachable, its
+ *  hostname blocked) must not re-key the listener; clearFreeMode on a real "pro" answer is the only way
+ *  back. A stat error other than "no such file" keeps it blocked. One stat; never throws. */
+export function lanBlockedByFreeMode(path: string = FREE_MODE_PATH): boolean {
+  try {
+    statSync(path);
+    return true;
+  } catch (e) {
+    return (e as { code?: string } | null)?.code !== "ENOENT";
+  }
+}
+
 export async function markFreeMode(path: string = FREE_MODE_PATH, now: number = Date.now()): Promise<void> {
   await atomicWrite(path, String(now)).catch(() => {});
 }
@@ -241,9 +256,13 @@ export function isNotProResponse(status: number, body: string): boolean {
   return status === 403 && body.includes("entitlement suspended");
 }
 
-/** Every relay response goes through this: a not-Pro 403 marks free mode. Reads the body only for a 403,
- *  so it never consumes a response a caller still needs. Never throws. */
-export async function markFreeModeIfNotPro(res: Response, path: string = FREE_MODE_PATH): Promise<void> {
+/** Every SESSION-route response (/cc/event, /cc/decision, plan/permission /cc/full — never the activity
+ *  upload, which free pairings may make) goes through this: a not-Pro 403 marks free mode, and a 2xx is
+ *  the server accepting a Pro-only write, so it clears the marker (which re-opens the LAN gate). Anything
+ *  else — 409 pending, 429, 5xx — says nothing about the tier. Reads the body only for a 403, so it never
+ *  consumes a response a caller still needs. Never throws. */
+export async function applyTierFromResponse(res: Response, path: string = FREE_MODE_PATH): Promise<void> {
+  if (res.ok) return clearFreeMode(path);
   if (res.status !== 403) return;
   try {
     if (isNotProResponse(res.status, await res.text())) await markFreeMode(path);
@@ -429,7 +448,7 @@ export async function postFullText(
       signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS),
     });
     trace?.({ event: "full-text", what, chars: content.length, status: res.status });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
   } catch (e) {
     trace?.({ event: "full-text", what, chars: content.length, status: 0, error: (e as { name?: string })?.name ?? "Error" });
   }
@@ -1576,8 +1595,8 @@ async function flushPendingStash(
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs),
         });
+        await applyTierFromResponse(res);
         if (res.ok) break;
-        await markFreeModeIfNotPro(res);
         if (await isFreeMode()) break; // refused as not Pro: retrying cannot help
       } catch {
         // transient (network / timeout) — retry within the ack's budget

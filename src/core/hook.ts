@@ -28,7 +28,7 @@ import {
 } from "./adapter";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, CCOp, CCStatus, clearInterruptFlagAt, codexCompanionBrokerEvidence, Config, decisionHoldFileName, ensureWatchdog, FolderIdentity, folderIdentity, formatPlanPickerDebug, fullTextForRecord, GONE_STRIKE_LIMIT,
-  interruptFlagFileName, interruptFlagSetAt, isFreeMode, LAST_SEND_PATH, lastHookPath, loadConfig, markFreeModeIfNotPro, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix, SEND_FAIL_PATH,
+  interruptFlagFileName, interruptFlagSetAt, isFreeMode, LAST_SEND_PATH, lastHookPath, loadConfig, applyTierFromResponse, loadPendingConfig, localApprovalsState, PENDING_STASH_PATH, PendingEventStash, pidAlive, pidAncestors, pidCommand, PLUGIN_VERSION, postFullText, readDecisionHoldAt, readPrefix, SEND_FAIL_PATH,
   readRecord, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, SessionOrigin, SessionRecord, SESSIONS_DIR, sessionBranch, sidField, tracePlanPickerDecision, traceSession,
 } from "./shared";
 import { repairNotifyWiring } from "./notify-wire";
@@ -1425,7 +1425,7 @@ export async function runHook(agent: AgentKind): Promise<void> {
       return;
     }
     if (!res.ok) await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
     if (res.ok) {
       // Success marker for Task 2.2's `status` command: the epoch-ms of the last delivered event. A
       // delivered event also breaks any gone streak (the pairing is plainly alive again).
@@ -1447,10 +1447,13 @@ export async function runHook(agent: AgentKind): Promise<void> {
         process.stderr.write(`[nomo-cc] pairing gone server-side (HTTP ${res.status}) — removed local pairing; re-pair with \`nomo-cc pair\` to reconnect\n`);
       }
     } else {
-      // 401/403/429/5xx — ambiguous / transient (a not-Pro 403 marked free mode above). Never tear down;
+      // 401/403/409/429/5xx — ambiguous / transient (a not-Pro 403 marked free mode above). Never tear down;
       // just clear any gone streak so a real revoke later still needs its own two consecutive gone
       // responses.
       await resetGoneStrikes();
+      // 409 = the pairing is still pending on the server (a colo serving the pre-claim record for ~60 s).
+      // The pairing is fine and the event is owed: leave the debt for the watchdog, like a lost POST.
+      if (res.status === 409 && plan.op !== "done" && plan.op !== "end") await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob as string | undefined);
     }
   } catch {
     // Silence is the contract — never surface errors into a Claude Code (or Codex) session.

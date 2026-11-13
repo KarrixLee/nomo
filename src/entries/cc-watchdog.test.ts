@@ -23,7 +23,7 @@ import {
   setCodexBridgeDown, shouldHeartbeat, shouldIdleProvisionalCheck,
   heartbeatKind, isWaitingSession, CLAUDE_AWAITING_PROMPT_REAP_MS, CLAUDE_IDLE_REAP_MAX_ATTEMPTS, POLL_MS,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, PENDING_DONE_GRACE_MS, PENDING_DONE_POST_TIMEOUT_MS, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
-  watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline, postEvent,
+  watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline, postEvent, lanConfigFor,
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, RecordEntry } from "./cc-watchdog";
 import { resolveOnRelay } from "../core/codex-remote-input";
@@ -4892,6 +4892,37 @@ describe("free mode in the watchdog", () => {
     const outcome = await postEvent(CONFIG, buildEndEnvelope("s1", Date.now(), rec()), { freeModePath });
     expect(outcome).toBe("failed"); // not "revoked": run() never counts it toward teardown
     expect(await isFreeMode(Date.now(), freeModePath)).toBe(true);
+  });
+
+  // M1: the LAN listener's key must not come back just because the marker aged out (worker unreachable,
+  // api.nomo.gg blocked). Only a real "pro" answer — presence, or a 2xx on a session route — re-keys it.
+  test("an expired free-mode marker keeps the LAN listener keyed off; a 2xx /cc/event re-keys it", async () => {
+    const freeModePath = join(dir, "free-mode");
+    expect(lanConfigFor(CONFIG, freeModePath)).toBe(CONFIG); // never free: LAN as before
+    expect(lanConfigFor(null, freeModePath)).toBeNull();
+    await writeFile(freeModePath, String(Date.now() - 16 * 60_000)); // 15-min TTL lapsed, no answer since
+    expect(await isFreeMode(Date.now(), freeModePath)).toBe(false); // events fail open (unchanged)
+    expect(lanConfigFor(CONFIG, freeModePath)).toBeNull(); // LAN does not
+    // The fail-open event is refused as not pending (409): still no "pro" fact, LAN stays off.
+    stubFetch(409, '{"error":"pairing not claimed"}');
+    await postEvent(CONFIG, buildEndEnvelope("s1", Date.now(), rec()), { freeModePath });
+    expect(lanConfigFor(CONFIG, freeModePath)).toBeNull();
+    // The server accepts a session event → the pairing is Pro → LAN re-keys.
+    stubFetch(200, "{}");
+    expect(await postEvent(CONFIG, buildEndEnvelope("s1", Date.now(), rec()), { freeModePath })).toBe("delivered");
+    expect(lanConfigFor(CONFIG, freeModePath)).toBe(CONFIG);
+  });
+
+  // 409 {"error":"pairing not claimed"}: the server refuses a still-pending pairing on session routes (the
+  // PC's colo can serve the pending record for ~60 s after a claim). Transient: retry next sweep, never a
+  // gone strike (that would unpair a brand-new computer), never free mode.
+  test("a 409 pairing-not-claimed is a transient failure: not revoked, not free mode", async () => {
+    const freeModePath = join(dir, "free-mode");
+    stubFetch(409, '{"error":"pairing not claimed"}');
+    expect(postOutcomeForStatus(409)).toBe("failed");
+    expect(await postEvent(CONFIG, buildEndEnvelope("s1", Date.now(), rec()), { freeModePath })).toBe("failed");
+    expect(urls).toEqual(["https://relay.test/v1/cc/event"]);
+    expect(await isFreeMode(Date.now(), freeModePath)).toBe(false);
   });
 
   test("activity upload still runs in free mode", async () => {

@@ -16,7 +16,7 @@ import {
   stampPermissionDetailFullAt, watchdogBuildStamp,
   watchdogHolderIsLive,
   INTERRUPT_FLAG_MAX_AGE_MS, clearInterruptFlagAt, interruptFlagFileName, interruptFlagSetAt, writeInterruptFlagAt,
-  clearFreeMode, FREE_MODE_PATH, FREE_MODE_TTL_MS, isFreeMode, isNotProResponse, markFreeMode, markFreeModeIfNotPro,
+  clearFreeMode, FREE_MODE_PATH, FREE_MODE_TTL_MS, isFreeMode, isNotProResponse, lanBlockedByFreeMode, markFreeMode, applyTierFromResponse,
 } from "./shared";
 
 describe("codexCompanionBrokerEvidence (structural companion-session proof)", () => {
@@ -1165,14 +1165,14 @@ describe("free mode (2.5.0 free pairing)", () => {
     }
   });
 
-  test("markFreeModeIfNotPro marks on the suspended 403 and nothing else", async () => {
+  test("applyTierFromResponse marks on the suspended 403 and nothing else", async () => {
     const dir = await mkdtemp(join(tmpdir(), "free-mode-"));
     const path = join(dir, "free-mode");
     try {
-      await markFreeModeIfNotPro(new Response('{"error":"forbidden"}', { status: 403 }), path);
-      await markFreeModeIfNotPro(new Response("{}", { status: 404 }), path);
+      await applyTierFromResponse(new Response('{"error":"forbidden"}', { status: 403 }), path);
+      await applyTierFromResponse(new Response("{}", { status: 404 }), path);
       expect(await isFreeMode(Date.now(), path)).toBe(false);
-      await markFreeModeIfNotPro(new Response('{"error":"entitlement suspended"}', { status: 403 }), path);
+      await applyTierFromResponse(new Response('{"error":"entitlement suspended"}', { status: 403 }), path);
       expect(await isFreeMode(Date.now(), path)).toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -1180,8 +1180,51 @@ describe("free mode (2.5.0 free pairing)", () => {
   });
 });
 
+// M1 (2026-11-14 audit): the LAN gate must not fail open when the marker ages out. Event sending keeps
+// the 15-minute fail-open; the LAN listener stays keyed off until the server actually answers "pro".
+describe("free mode: the LAN gate is sticky until the server says pro", () => {
+  test("any marker blocks LAN — fresh, expired or malformed; only a cleared marker re-opens it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "free-lan-"));
+    const path = join(dir, "free-mode");
+    try {
+      expect(lanBlockedByFreeMode(path)).toBe(false); // never told "free": LAN as before
+      await markFreeMode(path, Date.now());
+      expect(lanBlockedByFreeMode(path)).toBe(true);
+      await markFreeMode(path, Date.now() - FREE_MODE_TTL_MS - 60_000); // the worker went quiet
+      expect(await isFreeMode(Date.now(), path)).toBe(false); // events fail open…
+      expect(lanBlockedByFreeMode(path)).toBe(true); // …the LAN listener does not
+      await writeFile(path, "garbage");
+      expect(lanBlockedByFreeMode(path)).toBe(true); // unreadable/malformed is not a "pro"
+      await clearFreeMode(path); // what a presence `tier:"pro"` or a 2xx session route does
+      expect(lanBlockedByFreeMode(path)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("applyTierFromResponse: a 2xx clears the marker; 409, 5xx and other 403s leave it alone", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "free-lan-"));
+    const path = join(dir, "free-mode");
+    try {
+      await markFreeMode(path, Date.now() - FREE_MODE_TTL_MS - 60_000);
+      for (const [status, body] of [[409, '{"error":"pairing not claimed"}'], [503, ""], [403, '{"error":"forbidden"}'], [429, ""]] as const) {
+        await applyTierFromResponse(new Response(body, { status }), path);
+        expect([status, lanBlockedByFreeMode(path)]).toEqual([status, true]);
+      }
+      await applyTierFromResponse(new Response('{"ok":true}', { status: 200 }), path);
+      expect(lanBlockedByFreeMode(path)).toBe(false);
+      // A 409 never marks free mode either.
+      await applyTierFromResponse(new Response('{"error":"pairing not claimed"}', { status: 409 }), path);
+      expect(lanBlockedByFreeMode(path)).toBe(false);
+      expect(await isFreeMode(Date.now(), path)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("free mode: postFullText and test isolation", () => {
-  test("postFullText routes its response through markFreeModeIfNotPro", async () => {
+  test("postFullText routes its response through applyTierFromResponse", async () => {
     const fn = (async () => new Response('{"error":"entitlement suspended"}', { status: 403 })) as unknown as typeof fetch;
     const config = { url: "https://w.example", pairingId: "p1", pcSecret: "s1", e2eKey: new Uint8Array(32).fill(7) };
     try {

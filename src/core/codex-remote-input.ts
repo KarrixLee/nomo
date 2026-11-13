@@ -19,7 +19,7 @@ import {
   extrasArray, fitPermissionDetail, PERMISSION_QUESTION_LABEL_MAX,
 } from "./permission";
 import {
-  clearDecisionHold, Config, DecisionHold, isFreeMode, localApprovalsState, markFreeModeIfNotPro, PLUGIN_VERSION, readRecord, SessionRecord,
+  clearDecisionHold, Config, DecisionHold, isFreeMode, localApprovalsState, applyTierFromResponse, PLUGIN_VERSION, readRecord, SessionRecord,
   sessionBranch, settleDecisionHoldRecord, sidField, writeDecisionHold,
 } from "./shared";
 import { lanRunningUnderTest } from "./lan-wire";
@@ -407,8 +407,8 @@ async function runRemoteInput(
       if (!signal.aborted) await markAttentionStalled();
       return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
+    await applyTierFromResponse(response);
     if (!response.ok) {
-      await markFreeModeIfNotPro(response);
       return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
     const created = await parseJson<{ hold?: unknown }>(response);

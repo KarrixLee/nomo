@@ -54,7 +54,7 @@ import type { CodexAppServerSocketState, DecisionHold, PlanPickerTraceDecision }
 import {
   AgentKind, AgentKindWire, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
   startCodexAppServerDaemon,
-  forgetDevinGrants, GONE_STRIKE_LIMIT, isFreeMode, loadConfig, markFreeModeIfNotPro, loadPendingConfig, localApprovalsState,
+  forgetDevinGrants, GONE_STRIKE_LIMIT, isFreeMode, lanBlockedByFreeMode, loadConfig, applyTierFromResponse, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, sidField, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, writeInterruptFlagAt,
@@ -1030,6 +1030,14 @@ let activeLanListener: LanListener | undefined;
  *  a module singleton for the same reason the buffers above are: postEvent has no place to hang state. */
 const lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
 
+/** The config the LAN listener is keyed with this tick: null (keyed off) while unpaired or while any
+ *  free-mode marker exists. Unlike event sending, an EXPIRED marker still blocks (2026-11-14 audit M1):
+ *  LAN never touches the server, so "the worker went quiet" must not hand a free pairing its LAN feed
+ *  back. Only a server "pro" answer (presence, or a 2xx session route) clears the marker. */
+export function lanConfigFor(config: Config | null, freeModePath?: string): Config | null {
+  return config && !lanBlockedByFreeMode(freeModePath) ? config : null;
+}
+
 /** Default budget for every watchdog POST — the same 2 s the hooks use, because the sweep awaits its
  *  POSTs one after another and an unreachable relay must not stretch a tick by more than this per send. */
 const POST_TIMEOUT_MS = 2000;
@@ -1073,7 +1081,8 @@ export async function postEvent(
     });
     if (detail) { detail.status = res.status; detail.ms = Date.now() - started; }
     const outcome = postOutcomeForStatus(res.status);
-    if (outcome === "failed") await markFreeModeIfNotPro(res, opts.freeModePath); // 403 is never a gone strike
+    // 2xx clears free mode (and re-opens the LAN gate); a not-Pro 403 marks it and is never a gone strike.
+    await applyTierFromResponse(res, opts.freeModePath);
     // Tell the hint publisher what became of the hint this POST carried. A hint handed to a POST that
     // failed must NOT count as published — see LanHintPublisher.settle. `revoked` settles as undelivered
     // too: the pairing is gone, so nothing was advertised to anyone.
@@ -4549,8 +4558,8 @@ async function run(): Promise<void> {
       // from it). Deliberately NOT awaited-on-IO: sync() only swaps a promise and returns, so the LAN
       // channel can never sit on the sweep path — the design's non-negotiable.
       // A free pairing keys the listener OFF (null config): the phone gets no LAN state feed and no LAN
-      // answer path, so nothing local can drive the island either.
-      lan.sync(config && !(await isFreeMode()) ? config : null);
+      // answer path, so nothing local can drive the island either. Sticky — see lanConfigFor.
+      lan.sync(lanConfigFor(config));
       // Discovery + reconcile run BEFORE the sweep (only when paired). Backstop-reconcile first (retire
       // any provisional whose real session already reported), then discover new TUIs — so a just-
       // surfaced provisional is counted in `remaining` this same cycle, keeping the daemon alive

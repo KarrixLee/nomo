@@ -1908,6 +1908,34 @@ await child.exited;
     }
   }, 20000);
 
+  // 409 {"error":"pairing not claimed"}: the server refuses a still-pending pairing (a colo can serve the
+  // pending record for ~60 s after the claim). Transient like a network failure: never a gone strike (that
+  // would unpair a brand-new computer), never free mode, and the update is left for the watchdog to retry.
+  test("a 409 pairing-not-claimed reply is transient: no gone strike, no free mode, update left to retry", async () => {
+    let posts = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => { posts += 1; return new Response('{"error":"pairing not claimed"}', { status: 409 }); },
+    });
+    const { home, ccDir, sessionsDir } = await setupHookHome(`http://127.0.0.1:${server.port}`);
+    try {
+      // One strike already on the books: if a 409 counted, this hook would reach GONE_STRIKE_LIMIT and unpair.
+      await writeFile(join(ccDir, "gone-strikes"), "1");
+      const sid = "f3f3f3f3-1111-4222-8333-444444444444";
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "hi", cwd: "/x/api-status" });
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "PostToolUse", tool_name: "Bash", cwd: "/x/api-status" });
+      expect(posts).toBe(2); // not free: every event still tries
+      const files = await readdir(ccDir);
+      expect(files).toContain("config.json"); // never torn down
+      expect(files).not.toContain("gone-strikes"); // the streak is broken, not extended
+      expect(files).not.toContain("free-mode");
+      expect(await readLocalRecord(sessionsDir, sid)).toMatchObject({ updatePending: true, op: "update" });
+    } finally {
+      server.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
   test("runHook claude stands down under Devin (DEVIN_PROJECT_DIR + a Devin payload)", async () => {
     await withEventServer(async ({ home, ccDir, sessionsDir, bodies }) => {
       const payload = { session_id: "brawny-shirt", prompt_id: "p1", hook_event_name: "UserPromptSubmit", prompt: "hi" };

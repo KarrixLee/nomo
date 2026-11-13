@@ -29,7 +29,7 @@ import { runHook, buildBlob, OpPlan } from "./hook";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, BLOB_FIT_CHARS, CC_DIR, clearDecisionHold, codexHome, Config,
   DecisionHold, flagExists, formatDecisionHoldDebug,
-  fullTextForRecord, isFreeMode, loadConfig, markFreeModeIfNotPro, NO_HOLD_PATH, postFullText,
+  fullTextForRecord, isFreeMode, loadConfig, applyTierFromResponse, NO_HOLD_PATH, postFullText,
   PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord,
   settleDecisionHoldRecord, stampPermissionDetailFull,
   writeDecisionHold,
@@ -2260,9 +2260,9 @@ export async function runPermissionHook(
             const body = (await res.json().catch(() => ({}))) as { hold?: unknown; reason?: unknown };
             hold = body.hold === true;
             if (typeof body.reason === "string") reason = body.reason;
-          } else {
-            await markFreeModeIfNotPro(res); // not Pro → the next prompt skips the hold entirely
           }
+          // Not Pro → the next prompt skips the hold entirely; a 2xx clears free mode.
+          await applyTierFromResponse(res);
           // The worker names the FIRST failing gate in `reason` (stale-session / toggle-off /
           // no-activity). Without it a field trace of a prompt that fell open is unfalsifiable — a
           // re-ask killed by the staleness guard looks exactly like the user having approvals off.

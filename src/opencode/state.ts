@@ -15,7 +15,7 @@
  */
 
 import {
-  atomicWrite, CCOp, CCStatus, Config, isFreeMode, LAST_SEND_PATH, localApprovalsState, markFreeModeIfNotPro, PLUGIN_VERSION,
+  atomicWrite, CCOp, CCStatus, Config, isFreeMode, LAST_SEND_PATH, localApprovalsState, applyTierFromResponse, PLUGIN_VERSION,
 } from "../core/shared";
 
 /** One frame to send: already planned (op/prio/status), already carrying the display fields this
@@ -608,7 +608,7 @@ export async function postOcEvent(config: Config, envelope: Record<string, unkno
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000),
     });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
     if (!res.ok) return false;
     await atomicWrite(LAST_SEND_PATH, String(Date.now())).catch(() => {});
     return true;

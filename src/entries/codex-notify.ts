@@ -24,7 +24,7 @@
 import { hostname } from "node:os";
 import { cleanPromptTitle, codexAdapter } from "../core/adapter";
 import { buildEnvelope, markDoneDelivered, sessionOrigin, trackSession } from "../core/hook";
-import { atomicWrite, ensureWatchdog, folderIdentity, formatPlanPickerDebug, fullTextForRecord, isFreeMode, LAST_SEND_PATH, loadConfig, localApprovalsState, markFreeModeIfNotPro, pidCommand, PLUGIN_VERSION, readRecord, tracePlanPickerDecision } from "../core/shared";
+import { atomicWrite, ensureWatchdog, folderIdentity, formatPlanPickerDebug, fullTextForRecord, isFreeMode, LAST_SEND_PATH, loadConfig, localApprovalsState, applyTierFromResponse, pidCommand, PLUGIN_VERSION, readRecord, tracePlanPickerDecision } from "../core/shared";
 
 /** Map the notify JSON onto the runHook/planOp Stop-hook input shape. Null for any payload that isn't
  *  an agent-turn-complete carrying a non-empty thread-id (the only kind we back-stop) or isn't JSON. */
@@ -224,7 +224,7 @@ export async function runNotify(raw: string, deferMs = notifyDeferMs(), sleep: (
     // Same write-before-POST ordering as runHook, so the same ack discipline applies: trackSession above
     // stamped a done record donePending, and only a confirmed 2xx clears it. A failed backstop done is
     // then re-POSTed by the watchdog's correctPendingDone instead of silently claiming it landed.
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(now));
       if (plan.op === "done") await markDoneDelivered(sessionId);
