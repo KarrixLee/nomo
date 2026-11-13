@@ -1,0 +1,46 @@
+{
+  "_provenance": "SOURCE-DERIVED, NOT LIVE. Built from codex-rs @ rust-v0.167.0: core/src/tools/approvals.rs ApprovalAction::permission_request_payload (NetworkAccess arm -> PermissionRequestPayload::bash), core/src/tools/network_approval.rs (hook_command, format_network_target, prompt_reason), app-server PR #58350 (NetworkApprovalResolved -> outgoing.resolve_server_request -> serverRequest/resolved). A live attempt on macOS with [features.network_proxy] did not trigger the managed proxy (upstream network-approval tests are Linux-only). Angle-bracket values are placeholders.",
+  "_verified_live": false,
+  "codex_cli": "0.167.0",
+  "hook_stdin": {
+    "session_id": "<thread id>",
+    "turn_id": "<turn id>",
+    "transcript_path": "/Users/me/.codex/sessions/2026/11/09/rollout-<ts>-<thread id>.jsonl",
+    "cwd": "/Users/me/project",
+    "hook_event_name": "PermissionRequest",
+    "model": "<model>",
+    "permission_mode": "default",
+    "tool_name": "Bash",
+    "tool_input": {
+      "command": "curl -sS https://example.com",
+      "description": "network-access https://example.com:443"
+    }
+  },
+  "_hook_notes": "tool_input.command is the TRIGGERING shell command when an owning exec call exists, else the literal 'network-access <protocol>://<host>:<port>'. tool_input.description is always 'network-access <protocol>://<host>:<port>'. tool_name is 'Bash' (indistinguishable by name from a command approval; the description prefix is the only marker). If the request ends while the hook is still running, the approval future is dropped and the hook's process group gets SIGKILL (hooks/src/engine/command_runner.rs ProcessTreeGuard -> utils/pty kill_process_group). No hook output, no event to the hook.",
+  "messages": [
+    {
+      "dir": "in",
+      "method": "item/commandExecution/requestApproval",
+      "id": "<request id>",
+      "params": {
+        "threadId": "<thread id>",
+        "turnId": "<turn id>",
+        "itemId": "<call id>",
+        "approvalId": "<approval id>",
+        "command": "curl -sS https://example.com",
+        "cwd": "/Users/me/project",
+        "reason": "Network access to example.com requires approval",
+        "networkApprovalContext": { "host": "example.com", "protocol": "https" },
+        "proposedNetworkPolicyAmendments": [{ "host": "example.com", "action": "allow" }],
+        "startedAtMs": 0
+      }
+    },
+    {
+      "dir": "in",
+      "method": "serverRequest/resolved",
+      "params": { "threadId": "<thread id>", "requestId": "<request id>" },
+      "_note": "Emitted with NO client reply when Codex withdraws the prompt (request ended / execution gone / thread shutdown). The pending JSON-RPC request is also cancelled. Only happens if the terminal/app-server prompt was already open, i.e. the PermissionRequest hook had returned without a decision."
+    }
+  ],
+  "_rollout_notes": "Nothing persisted: EventMsg::NetworkApprovalResolved is listed as non-persisted in rollout/src/policy.rs (PR #58350), and exec approval requests are not persisted either. The rollout only shows the eventual tool output."
+}

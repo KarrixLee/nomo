@@ -1,12 +1,14 @@
 import { mkdir, mkdtemp, readFile, symlink, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  buildPermissionDiff, codexPromptUserRuleMatches, fitPermissionDiff, parseV4APatch,
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
   sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, claudeGrantText, grantEntry, joinGrant, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
   codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
   POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL, localAnswerProbe, answerExtrasAccepted,
+  OVERWRITE_DIFF_MAX_BYTES,
 } from "./permission";
 import {
   createPollBudget, MAX_CONSECUTIVE_MISSES, POLL_FIRST_CONTACT_TIMEOUT_MS,
@@ -56,8 +58,10 @@ describe("buildPermissionSummary", () => {
   test("WebSearch → query, truncated", () => {
     expect(buildPermissionSummary("WebSearch", { query: "how to nomo" })).toBe("how to nomo");
   });
-  test("mcp__ tool → last __-segment", () => {
-    expect(buildPermissionSummary("mcp__linear__create_issue", {})).toBe("create_issue");
+  test("mcp__ tool → '<server> · <tool words>', Claude connector prefix stripped (NOM-167)", () => {
+    expect(buildPermissionSummary("mcp__github__create_issue", {})).toBe("github · create issue");
+    expect(buildPermissionSummary("mcp__claude_ai_Google_Drive__search-files", {})).toBe("Google Drive · search files");
+    expect(buildPermissionSummary("mcp__demo__delete_note", { id: "n1" })).toBe("demo · delete note"); // Codex 0.167 fixture
   });
   test("ExitPlanMode → fixed 'Approve Claude's plan' (the plan itself rides in the detail)", () => {
     expect(buildPermissionSummary("ExitPlanMode", {})).toBe("Approve Claude's plan");
@@ -527,6 +531,7 @@ const baseDeps = (over: Record<string, unknown>) => ({
   randomUUID: () => "req-fixed",
   jitter: () => 0,
   noHoldPath: "/does/not/exist/no-hold",
+  codexRequirementsPath: "/does/not/exist/requirements.toml",
   delegate: async () => { throw new Error("delegate must not run"); },
   trace: () => {}, // noop by default — tests must not touch the real trace file or install signal handlers
   ...over,
@@ -796,6 +801,8 @@ describe("runPermissionHook — hold state machine", () => {
     expect(Object.keys(held).at(-1)).toBe("dbg");   // append-LAST, like every other blob tail
     expect(writes[0].hold.at).toBe(1000);
     expect(writes[0].hold.pid).toBe(9_001);   // the HOLDING process, so the feed can probe its liveness
+    // NOM-165: the watchdog resolves this id on the worker if the holder dies without its `finally`.
+    expect((writes[0].hold as { requestId?: string }).requestId).toBe("req-fixed");
     // Answered → retired, keyed by the same owner pid (compare-and-clear: a parallel tool's LATER hold
     // for this session must survive our exit).
     expect(clears).toEqual([{ sessionId: "sess-1", pid: 9_001 }]);
@@ -3774,5 +3781,288 @@ describe("claudeGrantText — mirrors allowAlwaysLine (structured permissionGran
     expect(out.length).toBe("cmd:".length + 80);
     expect(out.endsWith("…")).toBe(true);
     expect(joinGrant(Array.from({ length: 10 }, (_, i) => grantEntry("cmd", `${i}${"y".repeat(60)}`)))).toBe("similar");
+  });
+});
+
+// ---- NOM-166: the edit diff on the approval card -------------------------------------------------
+
+const PATCH_FIXTURE = (JSON.parse(await readFile(join(import.meta.dir, "fixtures/codex-0.167-apply-patch-permission-request.json"), "utf8")) as {
+  hook_stdin: Record<string, unknown> & { tool_input: { command: string } };
+}).hook_stdin;
+
+describe("NOM-166 diff parsing", () => {
+  test("V4A (Codex 0.167 fixture): one modified + one added file, counted", () => {
+    expect(parseV4APatch(PATCH_FIXTURE.tool_input.command)).toEqual([
+      { path: "notes.txt", kind: "modified", added: 1, removed: 1, hunks: [{ lines: [{ t: "del", s: "world" }, { t: "add", s: "there" }] }] },
+      { path: "todo.txt", kind: "added", added: 1, removed: 0, hunks: [{ lines: [{ t: "add", s: "buy milk" }] }] },
+    ]);
+  });
+
+  test("V4A delete (removed unknown), move (renamed + from), and a context header", () => {
+    const files = parseV4APatch("*** Begin Patch\n*** Delete File: old.txt\n*** Update File: a.ts\n*** Move to: b.ts\n@@ function f() {\n x\n-y\n*** End Patch");
+    expect(files[0]).toEqual({ path: "old.txt", kind: "deleted", added: 0, removed: null, hunks: [] });
+    expect(files[1]).toMatchObject({ path: "b.ts", from: "a.ts", kind: "renamed", added: 0, removed: 1 });
+    expect(files[1].hunks[0].header).toBe("function f() {");
+  });
+
+  test("apply_patch summary names the files instead of the bare tool name", () => {
+    expect(buildPermissionSummary("apply_patch", PATCH_FIXTURE.tool_input)).toBe("Edit 2 files");
+    expect(buildPermissionSummary("apply_patch", { command: "*** Begin Patch\n*** Update File: src/notes.txt\n@@\n-a\n+b\n*** End Patch" })).toBe("Edit notes.txt");
+    expect(buildPermissionSummary("apply_patch", { command: "*** Begin Patch\n*** Delete File: x.txt\n*** End Patch" })).toBe("Delete x.txt");
+    expect(buildPermissionDetail("apply_patch", PATCH_FIXTURE.tool_input)).toBe(PATCH_FIXTURE.tool_input.command);
+  });
+
+  test("CC Edit: shared lines become context, so the counts are the real change", () => {
+    const diff = buildPermissionDiff("Edit", { file_path: "/p/a.ts", old_string: "one\ntwo\nthree", new_string: "one\nTWO\nthree" })!;
+    expect(diff[0]).toEqual({
+      path: "/p/a.ts", kind: "modified", added: 1, removed: 1,
+      hunks: [{ lines: [{ t: "ctx", s: "one" }, { t: "del", s: "two" }, { t: "add", s: "TWO" }, { t: "ctx", s: "three" }] }],
+    });
+    expect(buildPermissionDetail("Edit", { file_path: "/p/a.ts", old_string: "two", new_string: "TWO" }))
+      .toBe("*** Update File: /p/a.ts\n@@\n-two\n+TWO");
+    expect(buildPermissionDiff("Edit", { file_path: "/p/a.ts" })).toBeUndefined(); // OpenCode's mapped Edit
+  });
+
+  test("Edit diff is a minimal edit script (vs an LCS table) with hunks that are real slices of each side", () => {
+    let seed = 7;
+    const rnd = (n: number) => Math.floor(((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648) * n);
+    const isSlice = (part: string[], whole: string[]) =>
+      whole.some((_, i) => part.every((p, j) => whole[i + j] === p)) || part.length === 0;
+    for (let c = 0; c < 300; c++) {
+      const a = Array.from({ length: rnd(14) }, () => "abcd"[rnd(4)]);
+      const b = Array.from({ length: rnd(14) }, () => "abcd"[rnd(4)]);
+      const lcs = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+      for (let i = a.length - 1; i >= 0; i--) for (let j = b.length - 1; j >= 0; j--)
+        lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+      const diff = buildPermissionDiff("Edit", { file_path: "/p", old_string: a.join("\n"), new_string: b.join("\n") })![0];
+      expect(diff.added + diff.removed!).toBe(a.length + b.length - 2 * lcs[0][0]);
+      for (const h of diff.hunks) {
+        expect(isSlice(h.lines.filter((l) => l.t !== "add").map((l) => l.s), a)).toBe(true);
+        expect(isSlice(h.lines.filter((l) => l.t !== "del").map((l) => l.s), b)).toBe(true);
+      }
+    }
+  });
+
+  test("CC Edit with scattered changes inside a big old_string → exact counts, one hunk per change", () => {
+    const old = Array.from({ length: 60 }, (_, i) => `row ${i}`);
+    const next = old.map((l, i) => (i === 5 || i === 30 || i === 55 ? `${l}!` : l));
+    const diff = buildPermissionDiff("Edit", { file_path: "/p/a.ts", old_string: old.join("\n"), new_string: next.join("\n") })!;
+    expect(diff[0]).toMatchObject({ added: 3, removed: 3 });
+    expect(diff[0].hunks.length).toBe(3);
+  });
+
+  test("CC MultiEdit = one hunk per edit; Write to a missing file = added", () => {
+    const multi = buildPermissionDiff("MultiEdit", { file_path: "/p/a.ts", edits: [{ old_string: "a", new_string: "b" }, { old_string: "c", new_string: "" }] })!;
+    expect(multi[0]).toMatchObject({ added: 1, removed: 2 });
+    expect(multi[0].hunks.length).toBe(2);
+    expect(buildPermissionDiff("Write", { file_path: "/does/not/exist/new.txt", content: "x\ny\n" })![0])
+      .toMatchObject({ kind: "added", added: 2, removed: 0 });
+  });
+
+  describe("CC Write over an EXISTING file diffs against the file on disk", () => {
+    let dir: string;
+    beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "nomo-write-")); });
+    afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+    const at = async (name: string, content: string | Uint8Array): Promise<string> => {
+      await writeFile(join(dir, name), content);
+      return join(dir, name);
+    };
+    const NEW13 = Array.from({ length: 13 }, (_, i) => `new ${i}`).join("\n") + "\n";
+
+    test("16 lines overwritten by 13 different lines → +13 −16, a modified file, red and green in the V4A", async () => {
+      const fp = await at("retry.ts", Array.from({ length: 16 }, (_, i) => `old ${i}`).join("\n") + "\n");
+      const files = buildPermissionDiff("Write", { file_path: fp, content: NEW13 })!;
+      expect(files[0]).toMatchObject({ path: fp, kind: "modified", added: 13, removed: 16 });
+      expect(fitPermissionDiff({}, files).diffSummary).toEqual({ files: 1, added: 13, removed: 16 });
+      const v4a = buildPermissionDetail("Write", { file_path: fp, content: NEW13 });
+      expect(v4a.startsWith(`*** Update File: ${fp}\n@@\n-old 0\n`)).toBe(true);
+      expect(v4a).toContain("\n+new 12");
+      expect(v4a.split("\n").filter((l) => l.startsWith("-")).length).toBe(16);
+    });
+
+    test("one changed line in a big file → +1 −1 with at most 3 context lines each side", async () => {
+      const old = Array.from({ length: 500 }, (_, i) => `line ${i}`);
+      const fp = await at("big.ts", old.join("\n") + "\n");
+      const files = buildPermissionDiff("Write", { file_path: fp, content: old.map((l, i) => (i === 250 ? "CHANGED" : l)).join("\n") + "\n" })!;
+      expect(files[0]).toMatchObject({ kind: "modified", added: 1, removed: 1 });
+      expect(files[0].hunks[0].lines).toEqual([
+        ...[247, 248, 249].map((i) => ({ t: "ctx" as const, s: `line ${i}` })),
+        { t: "del", s: "line 250" }, { t: "add", s: "CHANGED" },
+        ...[251, 252, 253].map((i) => ({ t: "ctx" as const, s: `line ${i}` })),
+      ]);
+    });
+
+    test("10 scattered one-line changes in 1,000 lines → exactly +10 −10 in 10 hunks, 10 @@ sections in one V4A block", async () => {
+      const old = Array.from({ length: 1000 }, (_, i) => `line ${i}`);
+      const fp = await at("scatter.ts", old.join("\n") + "\n");
+      const content = old.map((l, i) => (i % 100 === 50 ? `CHANGED ${i}` : l)).join("\n") + "\n";
+      const files = buildPermissionDiff("Write", { file_path: fp, content })!;
+      expect(files[0]).toMatchObject({ kind: "modified", added: 10, removed: 10 });
+      expect(files[0].hunks.length).toBe(10);
+      expect(files[0].hunks[3].lines).toEqual([
+        ...[347, 348, 349].map((i) => ({ t: "ctx" as const, s: `line ${i}` })),
+        { t: "del", s: "line 350" }, { t: "add", s: "CHANGED 350" },
+        ...[351, 352, 353].map((i) => ({ t: "ctx" as const, s: `line ${i}` })),
+      ]);
+      const v4a = buildPermissionDetail("Write", { file_path: fp, content });
+      expect(v4a.split("\n").filter((l) => l.startsWith("*** ")).length).toBe(1);
+      expect(v4a.split("\n").filter((l) => l === "@@").length).toBe(10);
+    });
+
+    test("changes whose context overlaps merge into one hunk; inserts and deletes count exactly", async () => {
+      const old = Array.from({ length: 40 }, (_, i) => `line ${i}`);
+      const fp = await at("merge.ts", old.join("\n") + "\n");
+      // delete line 10, insert two lines after 15 (gap of 5 ≤ 6 → one hunk), replace line 30 (own hunk)
+      const next = [...old.slice(0, 10), ...old.slice(11, 16), "ins a", "ins b", ...old.slice(16, 30), "THIRTY", ...old.slice(31)];
+      const files = buildPermissionDiff("Write", { file_path: fp, content: next.join("\n") + "\n" })!;
+      expect(files[0]).toMatchObject({ added: 3, removed: 2 });
+      expect(files[0].hunks.length).toBe(2);
+      expect(files[0].hunks[0].lines.map((l) => l.t).join(",")).toBe("ctx,ctx,ctx,del,ctx,ctx,ctx,ctx,ctx,add,add,ctx,ctx,ctx");
+    });
+
+    test("over the diff work cap (20k lines shuffled) → today's one block, fast, never hangs", async () => {
+      let seed = 42;
+      const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+      const old = Array.from({ length: 20_000 }, (_, i) => `l${i}`);
+      const shuffled = [...old];
+      for (let i = shuffled.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]]; }
+      const fp = await at("shuffled.txt", old.join("\n") + "\n");
+      const t0 = performance.now();
+      const files = buildPermissionDiff("Write", { file_path: fp, content: shuffled.join("\n") + "\n" })!;
+      expect(performance.now() - t0).toBeLessThan(400); // budget ~150 ms; slack for a loaded CI box
+      expect(files[0]).toMatchObject({ kind: "modified", added: 20_000, removed: 20_000 });
+      expect(files[0].hunks.length).toBe(1);
+    });
+
+    test("a symlink to a regular file diffs the target", async () => {
+      const target = await at("real.ts", "a\nb\n");
+      await symlink(target, join(dir, "link.ts"));
+      expect(buildPermissionDiff("Write", { file_path: join(dir, "link.ts"), content: "a\nc\n" })![0])
+        .toMatchObject({ kind: "modified", added: 1, removed: 1 });
+    });
+
+    test("symlink to /dev/zero, a FIFO, a directory → never read, no diff (plain card)", async () => {
+      await symlink("/dev/zero", join(dir, "zero"));
+      expect(Bun.spawnSync(["mkfifo", join(dir, "fifo")]).exitCode).toBe(0);
+      await mkdir(join(dir, "sub"));
+      for (const name of ["zero", "fifo", "sub"]) {
+        expect(buildPermissionDiff("Write", { file_path: join(dir, name), content: NEW13 })).toBeUndefined();
+      }
+      expect(buildPermissionDiff("Write", { file_path: "/dev/zero", content: NEW13 })).toBeUndefined();
+    }, 2000);
+
+    test("over the size cap, binary (NUL), or invalid UTF-8 → no diff (never fake all-green counts), never throws", async () => {
+      const big = await at("big.txt", "x\n".repeat(OVERWRITE_DIFF_MAX_BYTES / 2 + 1));
+      const bin = await at("a.png", new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x00, 0x0a]));
+      const latin1 = await at("l.txt", new Uint8Array([0x63, 0x61, 0x66, 0xe9, 0x0a])); // "café" in Latin-1
+      for (const fp of [big, bin, latin1]) {
+        expect(buildPermissionDiff("Write", { file_path: fp, content: NEW13 })).toBeUndefined();
+        expect(buildPermissionDetail("Write", { file_path: fp, content: NEW13 })).toBe(fp); // plain card: just the path
+      }
+    });
+  });
+
+  test("fitPermissionDiff: a huge patch keeps the summary, a truncated preview, and fits the cap", () => {
+    const big = `*** Begin Patch\n*** Update File: big.ts\n@@\n${Array.from({ length: 400 }, (_, i) => `+line ${i} ${"x".repeat(40)}`).join("\n")}\n*** Delete File: gone.ts\n*** End Patch`;
+    const frame = { status: "decisionPending", permissionSummary: "Edit 2 files", permissionDetailOmitted: big.length };
+    const tail = fitPermissionDiff(frame, parseV4APatch(big));
+    expect(tail.diffSummary).toEqual({ files: 2, added: 400, removed: 0, removedUnknown: true });
+    expect(tail.diff!.truncated).toBe(true);
+    expect(tail.diff!.files.length).toBe(1); // gone.ts sits past the cut
+    expect(tail.diff!.files[0].hunks[0].lines.length).toBeGreaterThan(5);
+    expect(sealedBlobChars(new TextEncoder().encode(JSON.stringify({ ...frame, ...tail })).length)).toBeLessThanOrEqual(BLOB_FIT_CHARS);
+    // No room at all → nothing, never an over-cap frame.
+    expect(fitPermissionDiff({ pad: "y".repeat(2300) }, parseV4APatch(big))).toEqual({});
+    expect(fitPermissionDiff(frame, undefined)).toEqual({});
+  });
+
+  const postedDecision = async (input: Record<string, unknown>, agent: "claude" | "codex") => {
+    const { fn, calls } = scriptFetch(false, []);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, readInput: async () => JSON.stringify(input) }) as never, agent);
+    const body = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
+    return { calls, body, blob: (await decryptBlob(KEY, body.blob)) as Record<string, unknown> };
+  };
+
+  test("Codex apply_patch: diffSummary + diff ride LAST in the sealed blob, after the detail", async () => {
+    const { blob } = await postedDecision({ ...PATCH_FIXTURE, transcript_path: "/tmp/t.jsonl" }, "codex");
+    expect(blob.permissionSummary).toBe("Edit 2 files");
+    expect(blob.permissionDetail).toBe(PATCH_FIXTURE.tool_input.command);
+    expect(blob.diffSummary).toEqual({ files: 2, added: 2, removed: 1 });
+    expect((blob.diff as { files: unknown[]; truncated?: true }).files.length).toBe(2);
+    expect(blob).not.toHaveProperty("diff.truncated");
+    expect(Object.keys(blob).slice(-2)).toEqual(["diffSummary", "diff"]);
+  });
+
+  test("a large CC Edit: blob under the worker cap, preview truncated, full V4A pushed to /v1/cc/full", async () => {
+    const old = Array.from({ length: 300 }, (_, i) => `old line ${i}`).join("\n");
+    const { calls, body, blob } = await postedDecision({
+      session_id: "sess-1", hook_event_name: "PermissionRequest", tool_name: "Edit", cwd: "/p", transcript_path: "/tmp/t.jsonl",
+      tool_input: { file_path: "/p/a.ts", old_string: old, new_string: "new" },
+    }, "claude");
+    expect(body.blob.length).toBeLessThanOrEqual(3072);
+    expect(blob.diffSummary).toEqual({ files: 1, added: 1, removed: 300 });
+    expect((blob.diff as { truncated?: true }).truncated).toBe(true);
+    expect(blob.permissionDetailOmitted).toBeGreaterThan(0); // the pointer: pull permission-detail
+    const full = JSON.parse(calls.find((c) => c.url.endsWith("/v1/cc/full"))!.body!);
+    expect(full.what).toBe("permission-detail");
+    const sealed = await decryptBlob(KEY, full.blob) as { content: string };
+    expect(sealed.content.startsWith("*** Update File: /p/a.ts\n@@\n-old line 0\n")).toBe(true);
+    expect(sealed.content.endsWith("-old line 299\n+new")).toBe(true);
+  });
+
+  test("a non-edit tool's blob carries no diff keys", async () => {
+    const { blob } = await postedDecision(JSON.parse(INPUT), "claude");
+    expect(blob).not.toHaveProperty("diffSummary");
+    expect(blob).not.toHaveProperty("diff");
+  });
+});
+
+// ---- NOM-165: managed prompt-user rules ----------------------------------------------------------
+
+const RULES = (JSON.parse(await readFile(join(import.meta.dir, "fixtures/codex-0.167-prompt-user-command.json"), "utf8")) as {
+  requirements_toml_example: string;
+}).requirements_toml_example;
+
+describe("NOM-165 prompt-user rules", () => {
+  const withRules = async (toml: string, run: (path: string) => Promise<void>) => {
+    const dir = await mkdtemp(join(tmpdir(), "nomo-req-"));
+    const path = join(dir, "requirements.toml");
+    await writeFile(path, toml);
+    try { await run(path); } finally { await rm(dir, { recursive: true, force: true }); }
+  };
+
+  test("matches the fixture rule (token / any_of / basename); other decisions, absent or junk files do not", async () => {
+    await withRules(RULES, async (path) => {
+      expect(await codexPromptUserRuleMatches("echo checkpoint-ok", path)).toBe(true);
+      expect(await codexPromptUserRuleMatches("cd x && /bin/echo hi", path)).toBe(true);
+      expect(await codexPromptUserRuleMatches("ls -la", path)).toBe(false);
+    });
+    await withRules('[[rules.prefix_rules]]\npattern = [\n  { token = "git" },\n  { any_of = ["push", "reset"] },\n]\ndecision = "prompt-user"\n', async (path) => {
+      expect(await codexPromptUserRuleMatches("git push origin", path)).toBe(true);
+      expect(await codexPromptUserRuleMatches("git status", path)).toBe(false);
+    });
+    await withRules(RULES.replace("prompt-user", "forbidden"), async (path) => {
+      expect(await codexPromptUserRuleMatches("echo hi", path)).toBe(false);
+    });
+    await withRules("not toml [[[", async (path) => {
+      expect(await codexPromptUserRuleMatches("echo hi", path)).toBe(false);
+    });
+    expect(await codexPromptUserRuleMatches("echo hi", "/does/not/exist.toml")).toBe(false);
+  });
+
+  test("a matching Codex command is handed straight back: no POST, no decision line", async () => {
+    await withRules(RULES, async (path) => {
+      const { fn, calls } = scriptFetch(true, [{ status: "answered" }]);
+      const emitted: string[] = [];
+      const events: Array<{ event: string; reason?: string }> = [];
+      await runPermissionHook(baseDeps({
+        readInput: async () => JSON.stringify({ ...JSON.parse(INPUT), turn_id: "t1", tool_input: { command: "echo checkpoint-ok" } }),
+        codexRequirementsPath: path, fetchFn: fn, emit: (l: string) => emitted.push(l),
+        trace: (e: { event: string }) => events.push(e),
+      }) as never, "codex");
+      expect(calls).toEqual([]);
+      expect(emitted).toEqual([]);
+      expect(events.at(-1)).toMatchObject({ event: "exit", reason: "codex-prompt-user" });
+    });
   });
 });

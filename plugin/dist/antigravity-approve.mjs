@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/core/antigravity-approval.ts
 import { createHash as createHash2 } from "node:crypto";
-import { readFileSync as readFileSync2 } from "node:fs";
+import { readFileSync as readFileSync3 } from "node:fs";
 import { mkdir as mkdir2, readdir as readdir7, readFile as readFile7, unlink as unlink6, writeFile as writeFile2 } from "node:fs/promises";
 import { dirname as dirname2, isAbsolute as isAbsolute5, resolve as resolve4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
@@ -4128,9 +4128,14 @@ async function reconcileProvisional(config, hookPid) {
     if (provisionals.length === 0)
       return;
     const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
-    if (!sentinel)
+    if (!sentinel) {
+      traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
       return;
+    }
     let delivered = false;
+    const started = Date.now();
+    let status;
+    let error;
     try {
       const res = await fetch(`${config.url}/v1/cc/event`, {
         method: "POST",
@@ -4138,8 +4143,12 @@ async function reconcileProvisional(config, hookPid) {
         body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
         signal: AbortSignal.timeout(2000)
       });
+      status = res.status;
       delivered = res.ok;
-    } catch {}
+    } catch (e) {
+      error = e?.name === "TimeoutError" ? "timeout" : "network";
+    }
+    traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered)
       await unlink3(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {}
@@ -5000,7 +5009,7 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
 
 // src/core/permission.ts
 import { readFile as readFile6, realpath, unlink as unlink5 } from "node:fs/promises";
-import { appendFileSync as appendFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, closeSync, constants as fsConstants, fstatSync, openSync, readFileSync as readFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
 import { homedir, hostname as hostname4 } from "node:os";
 import { basename as basename6, isAbsolute as isAbsolute4, relative, resolve as resolve3 } from "node:path";
 
@@ -5242,6 +5251,50 @@ function codexPassThroughReason(policy) {
   if (policy.approvalPolicy === "untrusted" || policy.approvalsReviewer === "user")
     return;
   return "codex-context-unknown";
+}
+var CODEX_REQUIREMENTS_PATH = "/etc/codex/requirements.toml";
+async function codexPromptUserRuleMatches(command, path = CODEX_REQUIREMENTS_PATH) {
+  let text;
+  try {
+    text = await readFile6(path, "utf8");
+  } catch {
+    return false;
+  }
+  try {
+    const words = command.split(/[\s'"`;&|()]+/).filter((w) => w.length > 0);
+    for (const table of text.split(/^\s*\[/m)) {
+      if (!/^\[\s*rules\.prefix_rules\s*\]\]/.test(table))
+        continue;
+      if (!/^\s*decision\s*=\s*["']prompt-user["']/m.test(table))
+        continue;
+      const at = table.search(/^\s*pattern\s*=\s*\[/m);
+      if (at < 0)
+        continue;
+      const open = table.indexOf("[", table.indexOf("=", at));
+      let depth = 0, end = -1;
+      for (let i = open;i < table.length && end < 0; i++) {
+        if (table[i] === "[")
+          depth++;
+        else if (table[i] === "]" && --depth === 0)
+          end = i;
+      }
+      if (end < 0)
+        continue;
+      const tokens = (table.slice(open + 1, end).match(/\{[^}]*\}/g) ?? []).map((element) => {
+        const quoted = (s) => [...s.matchAll(/["']([^"']*)["']/g)].map((m) => m[1]);
+        const anyOf = /any_of\s*=\s*\[([^\]]*)\]/.exec(element);
+        return anyOf ? quoted(anyOf[1]) : quoted(/token\s*=\s*(["'][^"']*["'])/.exec(element)?.[1] ?? "");
+      });
+      if (tokens.length === 0 || tokens.some((alts) => alts.length === 0))
+        continue;
+      const hit = (word, alts) => alts.includes(word) || alts.includes(basename6(word));
+      for (let i = 0;i + tokens.length <= words.length; i++) {
+        if (tokens.every((alts, j) => hit(words[i + j], alts)))
+          return true;
+      }
+    }
+  } catch {}
+  return false;
 }
 function decisionLine(agent, hookSpecificOutput) {
   return JSON.stringify(agent === "codex" ? { continue: true, hookSpecificOutput } : { hookSpecificOutput });
@@ -5525,9 +5578,18 @@ function buildPermissionSummary(toolName, toolInput) {
     }
     case "apply_patch": {
       const desc = str(toolInput.description);
-      return desc ? truncate(desc) : toolName;
+      if (desc)
+        return truncate(desc);
+      const files = parseV4APatch(str(toolInput.command) ?? "");
+      if (files.length > 1)
+        return `Edit ${files.length} files`;
+      if (files.length === 0)
+        return toolName;
+      const verb = files[0].kind === "added" ? "Add" : files[0].kind === "deleted" ? "Delete" : "Edit";
+      return truncate(`${verb} ${basename6(files[0].path)}`);
     }
     case "Edit":
+    case "MultiEdit":
     case "Write":
     case "Read":
     case "NotebookEdit": {
@@ -5561,15 +5623,335 @@ function buildPermissionSummary(toolName, toolInput) {
       return typeof q?.question === "string" ? truncate(q.question) : toolName;
     }
     default: {
-      if (/^mcp__/.test(toolName)) {
-        const seg = toolName.split("__").pop();
-        return seg && seg.length > 0 ? seg : toolName;
+      const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
+      if (mcp) {
+        const words = (s) => s.replace(/[_-]+/g, " ").trim();
+        const server = words(mcp[1].replace(/^claude_ai_/, ""));
+        const tool = words(mcp[2]);
+        return server && tool ? truncate(`${server} · ${tool}`) : toolName;
       }
       return toolName;
     }
   }
 }
-function buildPermissionDetail(toolName, toolInput) {
+function parseV4APatch(text) {
+  const files = [];
+  let file;
+  let hunk;
+  for (const line of text.split(`
+`)) {
+    const head = /^\*\*\* (Update|Add|Delete) File: (.+)$/.exec(line);
+    if (head) {
+      const kind = head[1] === "Add" ? "added" : head[1] === "Delete" ? "deleted" : "modified";
+      file = { path: head[2].trim(), kind, added: 0, removed: kind === "deleted" ? null : 0, hunks: [] };
+      files.push(file);
+      hunk = undefined;
+      continue;
+    }
+    if (!file)
+      continue;
+    const move = /^\*\*\* Move to: (.+)$/.exec(line);
+    if (move) {
+      file.from = file.path;
+      file.path = move[1].trim();
+      file.kind = "renamed";
+      continue;
+    }
+    if (line.startsWith("***"))
+      continue;
+    if (line.startsWith("@@")) {
+      const header = line.slice(2).trim();
+      hunk = { ...header ? { header } : {}, lines: [] };
+      file.hunks.push(hunk);
+      continue;
+    }
+    const t = line[0] === "+" ? "add" : line[0] === "-" ? "del" : line[0] === " " ? "ctx" : undefined;
+    if (!t)
+      continue;
+    if (!hunk) {
+      hunk = { lines: [] };
+      file.hunks.push(hunk);
+    }
+    hunk.lines.push({ t, s: line.slice(1) });
+    if (t === "add")
+      file.added += 1;
+    else if (t === "del" && file.removed !== null)
+      file.removed += 1;
+  }
+  return files;
+}
+var DIFF_CONTEXT_LINES = 3;
+var DIFF_MAX_EDITS = 2000;
+var DIFF_MAX_WORK = 4000000;
+function myers(a, b) {
+  const n = a.length, m = b.length, off = n + m + 1;
+  const v = new Int32Array(2 * off + 1);
+  const trace = [];
+  let work = 0;
+  for (let d = 0;d <= n + m; d++) {
+    if (d > DIFF_MAX_EDITS)
+      return;
+    for (let k = -d;k <= d; k += 2) {
+      let x = k === -d || k !== d && v[off + k - 1] < v[off + k + 1] ? v[off + k + 1] : v[off + k - 1] + 1;
+      let y = x - k;
+      const x0 = x;
+      while (x < n && y < m && a[x] === b[y]) {
+        x++;
+        y++;
+      }
+      work += x - x0 + 1;
+      v[off + k] = x;
+      if (x >= n && y >= m) {
+        trace.push(v.slice(off - d, off + d + 1));
+        return backtrack(trace, n, m);
+      }
+    }
+    if (work > DIFF_MAX_WORK)
+      return;
+    trace.push(v.slice(off - d, off + d + 1));
+  }
+  return;
+}
+function backtrack(trace, n, m) {
+  const ops = [];
+  let x = n, y = m;
+  for (let d = trace.length - 1;d > 0; d--) {
+    const prev = trace[d - 1];
+    const at = (k) => prev[k + d - 1];
+    const k = x - y;
+    const down = k === -d || k !== d && at(k - 1) < at(k + 1);
+    const px = at(down ? k + 1 : k - 1);
+    const mx = down ? px : px + 1;
+    const my = mx - k;
+    while (x > mx && y > my) {
+      ops.push("ctx");
+      x--;
+      y--;
+    }
+    if (down) {
+      ops.push("add");
+      y--;
+    } else {
+      ops.push("del");
+      x--;
+    }
+  }
+  while (x > 0 && y > 0) {
+    ops.push("ctx");
+    x--;
+    y--;
+  }
+  return ops.reverse();
+}
+function diffHunks(oldText, newText) {
+  const split = (s) => s.length === 0 ? [] : s.replace(/\n$/, "").split(`
+`);
+  const a = split(oldText);
+  const b = split(newText);
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre])
+    pre += 1;
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf])
+    suf += 1;
+  const am = a.slice(pre, a.length - suf), bm = b.slice(pre, b.length - suf);
+  const ids = new Map;
+  const id = (s) => {
+    let i = ids.get(s);
+    if (i === undefined)
+      ids.set(s, i = ids.size);
+    return i;
+  };
+  const ops = am.length > 0 && bm.length > 0 ? myers(Int32Array.from(am, id), Int32Array.from(bm, id)) : undefined;
+  const lines = a.slice(0, pre).map((s) => ({ t: "ctx", s }));
+  if (ops) {
+    let i = 0, j = 0;
+    let run = { del: [], add: [] };
+    const flush = () => {
+      lines.push(...run.del, ...run.add);
+      run = { del: [], add: [] };
+    };
+    for (const op of ops) {
+      if (op === "ctx") {
+        flush();
+        lines.push({ t: "ctx", s: am[i++] });
+        j++;
+      } else if (op === "del")
+        run.del.push({ t: "del", s: am[i++] });
+      else
+        run.add.push({ t: "add", s: bm[j++] });
+    }
+    flush();
+  } else {
+    for (const s of am)
+      lines.push({ t: "del", s });
+    for (const s of bm)
+      lines.push({ t: "add", s });
+  }
+  for (const s of a.slice(a.length - suf))
+    lines.push({ t: "ctx", s });
+  const hunks = [];
+  let cur;
+  let last = -1;
+  const close = () => {
+    if (cur) {
+      cur.push(...lines.slice(last + 1, last + 1 + DIFF_CONTEXT_LINES));
+      hunks.push({ lines: cur });
+    }
+  };
+  lines.forEach((l, c) => {
+    if (l.t === "ctx")
+      return;
+    if (cur && c - last - 1 <= 2 * DIFF_CONTEXT_LINES)
+      cur.push(...lines.slice(last + 1, c + 1));
+    else {
+      close();
+      cur = lines.slice(Math.max(0, c - DIFF_CONTEXT_LINES), c + 1);
+    }
+    last = c;
+  });
+  close();
+  return hunks;
+}
+var count = (hunks, t) => hunks.reduce((n, h) => n + h.lines.filter((l) => l.t === t).length, 0);
+var OVERWRITE_DIFF_MAX_BYTES = 2 << 20;
+function readOverwrittenText(path) {
+  let fd;
+  try {
+    const st = statSync3(path);
+    if (!st.isFile() || st.size > OVERWRITE_DIFF_MAX_BYTES)
+      return;
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    const fst = fstatSync(fd);
+    if (!fst.isFile() || fst.size > OVERWRITE_DIFF_MAX_BYTES)
+      return;
+    const bytes = readFileSync2(fd);
+    if (bytes.length > OVERWRITE_DIFF_MAX_BYTES || bytes.includes(0))
+      return;
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (e) {
+    const code = e.code;
+    return code === "ENOENT" || code === "ENOTDIR" ? null : undefined;
+  } finally {
+    if (fd !== undefined)
+      try {
+        closeSync(fd);
+      } catch {}
+  }
+}
+function buildPermissionDiff(toolName, toolInput) {
+  const str = (v) => typeof v === "string" ? v : undefined;
+  const path = str(toolInput.file_path);
+  const files = (hunks, kind = "modified", removedUnknown = false) => [{ path, kind, added: count(hunks, "add"), removed: removedUnknown ? null : count(hunks, "del"), hunks }];
+  switch (toolName) {
+    case "apply_patch": {
+      const parsed = parseV4APatch(str(toolInput.command) ?? "");
+      return parsed.length > 0 ? parsed : undefined;
+    }
+    case "Edit": {
+      const o = str(toolInput.old_string), n = str(toolInput.new_string);
+      return path && o !== undefined && n !== undefined ? files(diffHunks(o, n)) : undefined;
+    }
+    case "MultiEdit": {
+      const edits = Array.isArray(toolInput.edits) ? toolInput.edits : [];
+      const hunks = edits.flatMap((e) => typeof e?.old_string === "string" && typeof e.new_string === "string" ? diffHunks(e.old_string, e.new_string) : []);
+      return path && hunks.length > 0 ? files(hunks) : undefined;
+    }
+    case "Write": {
+      const content = str(toolInput.content);
+      if (!path || content === undefined)
+        return;
+      const old = readOverwrittenText(path);
+      if (old === null)
+        return files(diffHunks("", content), "added");
+      if (old === undefined)
+        return;
+      return files(diffHunks(old, content));
+    }
+    default:
+      return;
+  }
+}
+function renderV4A(files) {
+  const out = [];
+  for (const f of files) {
+    out.push(`*** ${f.kind === "added" ? "Add" : f.kind === "deleted" ? "Delete" : "Update"} File: ${f.path}`);
+    for (const h of f.hunks) {
+      if (f.kind !== "added")
+        out.push(h.header ? `@@ ${h.header}` : "@@");
+      for (const l of h.lines)
+        out.push(`${l.t === "add" ? "+" : l.t === "del" ? "-" : " "}${l.s}`);
+    }
+  }
+  return out.join(`
+`);
+}
+var DIFF_LINE_MAX = 240;
+var DIFF_PREVIEW_MAX_CHARS = 1400;
+function previewDiff(files, k) {
+  let left = k;
+  let truncated = false;
+  const out = [];
+  for (const f of files) {
+    const total = f.hunks.reduce((n, h) => n + h.lines.length, 0);
+    if (left <= 0 && (total > 0 || truncated)) {
+      truncated = true;
+      break;
+    }
+    const hunks = [];
+    for (const h of f.hunks) {
+      if (left <= 0) {
+        truncated = true;
+        break;
+      }
+      const lines = h.lines.slice(0, left).map((l) => {
+        const s = capPermissionWireText(l.s, DIFF_LINE_MAX);
+        if (s !== l.s)
+          truncated = true;
+        return { t: l.t, s };
+      });
+      if (lines.length < h.lines.length)
+        truncated = true;
+      left -= lines.length;
+      hunks.push({ ...h.header ? { header: h.header } : {}, lines });
+    }
+    out.push({ ...f, hunks });
+  }
+  return { files: out, ...truncated ? { truncated: true } : {} };
+}
+function fitPermissionDiff(frame, files, maxChars = BLOB_FIT_CHARS) {
+  if (!files || files.length === 0)
+    return {};
+  const encoder = new TextEncoder;
+  const fits = (tail) => sealedBlobChars(encoder.encode(JSON.stringify({ ...frame, ...tail })).length) <= maxChars;
+  const unknown = files.some((f) => f.removed === null);
+  const diffSummary = {
+    files: files.length,
+    added: files.reduce((n, f) => n + f.added, 0),
+    removed: files.reduce((n, f) => n + (f.removed ?? 0), 0),
+    ...unknown ? { removedUnknown: true } : {}
+  };
+  if (!fits({ diffSummary }))
+    return {};
+  const ok = (k) => {
+    const diff = previewDiff(files, k);
+    return JSON.stringify(diff).length <= DIFF_PREVIEW_MAX_CHARS && fits({ diffSummary, diff });
+  };
+  if (!ok(0))
+    return { diffSummary };
+  let lo = 0;
+  let hi = files.reduce((n, f) => n + f.hunks.reduce((m, h) => m + h.lines.length, 0), 0);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (ok(mid))
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  const diff = previewDiff(files, lo);
+  return diff.files.length > 0 ? { diffSummary, diff } : { diffSummary };
+}
+function buildPermissionDetail(toolName, toolInput, precomputedDiff) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
   switch (toolName) {
     case "Bash":
@@ -5578,12 +5960,14 @@ function buildPermissionDetail(toolName, toolInput) {
       const c = str(toolInput.command);
       return c ?? "";
     }
-    case "apply_patch": {
-      const d = str(toolInput.description);
-      return d ?? "";
-    }
+    case "apply_patch":
+      return str(toolInput.command) ?? str(toolInput.description) ?? "";
     case "Edit":
-    case "Write":
+    case "MultiEdit":
+    case "Write": {
+      const diff = precomputedDiff ?? buildPermissionDiff(toolName, toolInput);
+      return diff ? renderV4A(diff) : str(toolInput.file_path) ?? "";
+    }
     case "Read":
     case "NotebookEdit": {
       const fp = str(toolInput.file_path);
@@ -5670,12 +6054,12 @@ function buildPermissionQuestions(toolInput) {
   });
 }
 var MAX_DETAIL_CHARS = 20000;
-function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions = []) {
+function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions = [], diffTail = {}) {
   const all = Array.from(detail);
   const hardLoss = Math.max(0, all.length - MAX_DETAIL_CHARS);
   const chars = hardLoss > 0 ? all.slice(0, MAX_DETAIL_CHARS) : all;
   const encoder = new TextEncoder;
-  const measure = (d, omitted, qs) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs))).length);
+  const measure = (d, omitted, qs) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs, diffTail))).length);
   const worstCase = all.length;
   const noPreviews = questions.map(({ p: _previews, ...question }) => question);
   const bareQuestions = noPreviews.map(({ d: _descriptions, ...question }) => question);
@@ -5709,13 +6093,14 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions 
   }
   return { detail: shortest, omitted: all.length - lo, ...tail };
 }
-function permissionFrame(base, detail, omitted, questions = []) {
+function permissionFrame(base, detail, omitted, questions = [], tail = {}) {
   const { permissionGrant, ...rest } = base;
   return {
     ...rest,
     ...detail.length > 0 ? { permissionDetail: detail } : {},
     ...omitted > 0 ? { permissionDetailOmitted: omitted } : {},
     ...questions.length > 0 ? { permissionQuestions: questions } : {},
+    ...tail,
     ...typeof permissionGrant === "string" ? { permissionGrant } : {}
   };
 }
@@ -6020,6 +6405,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
     }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
+    if (agent === "codex" && typeof toolInput.command === "string" && await codexPromptUserRuleMatches(toolInput.command, deps.codexRequirementsPath)) {
+      trace({ event: "exit", reason: "codex-prompt-user" });
+      return;
+    }
     const suggestions = input.permission_suggestions;
     const grant = isAnswerTool(toolName, agent) ? undefined : deps.grant !== undefined ? deps.grant : agent === "claude" ? claudeGrantText(toolName, suggestions) : undefined;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
@@ -6039,8 +6428,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionToolName: toolName,
       ...grant !== undefined ? { permissionGrant: grant } : {}
     };
-    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
-    let fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    const diffFiles = buildPermissionDiff(toolName, toolInput);
+    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput, diffFiles);
+    const diffTail = fitPermissionDiff({ ...permissionBase, permissionDetailOmitted: Array.from(rawDetail).length }, diffFiles);
+    let fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput), diffTail);
     if (fitted.detail === "" && rawDetail !== "" && summary !== toolName && (toolName === "Bash" || toolName === "shell" || toolName === "local_shell")) {
       permissionBase.permissionSummary = toolName;
       fitted = fitPermissionDetail(permissionBase, rawDetail);
@@ -6050,7 +6441,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
     }
     const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
-    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
+    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -6193,9 +6584,9 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const holdPid = deps.holdPid ?? process.pid;
     let holdBlob = blob;
     try {
-      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined, formatDecisionHoldDebug({ requestId, pid: holdPid })));
+      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail), undefined, formatDecisionHoldDebug({ requestId, pid: holdPid })));
     } catch {}
-    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...deps.holdId ? { holdId: deps.holdId } : {} });
+    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...deps.holdId ? { holdId: deps.holdId } : {}, requestId });
     heldSessionId = sessionId;
     settleHeldRecord = async () => {
       const settledAt = (deps.now ?? Date.now)();
@@ -6383,7 +6774,7 @@ function loadAntigravityRules(transcriptPath) {
   const list = (v) => Array.isArray(v) ? v.filter((x) => typeof x === "string") : [];
   for (const dir of known ? [known] : antigravityDataDirs()) {
     try {
-      const p = JSON.parse(readFileSync2(`${dir}/settings.json`, "utf8")).permissions ?? {};
+      const p = JSON.parse(readFileSync3(`${dir}/settings.json`, "utf8")).permissions ?? {};
       out.allow.push(...list(p.allow));
       out.ask.push(...list(p.ask));
       out.deny.push(...list(p.deny));

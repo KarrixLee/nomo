@@ -102,6 +102,17 @@ describe("Claude Code hook manifest (NOM-67 coverage)", () => {
       .map(([event]) => event);
     expect(deciders).toEqual(["PermissionRequest"]);
   });
+
+  // NOM-170. Since CC 2.1.314 a hook that meets a Monitor call ONLY through Bash (matcher "Bash") is
+  // marked throughFamilyOnly and its allow is dropped (deny/ask only) — a phone Allow that does nothing.
+  // A match-all matcher meets "Monitor" by its own name, so the phone's Allow stays real. Narrowing these
+  // to a Bash-style list would silently break Monitor approvals.
+  test("PermissionRequest and PreToolUse match every tool by its own name (Monitor Allow stays real)", async () => {
+    const path = join(import.meta.dir, "../../plugin/hooks/hooks.json");
+    const manifest = JSON.parse(await readFile(path, "utf8")) as { hooks: Record<string, Array<{ matcher?: string }>> };
+    expect(manifest.hooks.PermissionRequest.map((g) => g.matcher)).toEqual([undefined]);
+    expect(manifest.hooks.PreToolUse.map((g) => g.matcher)).toEqual(["*"]);
+  });
 });
 
 describe("planOp (op mapping table)", () => {

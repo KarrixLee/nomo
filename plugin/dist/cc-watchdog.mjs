@@ -3,7 +3,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
 import { readdir as readdir9, readFile as readFile10, unlink as unlink6 } from "node:fs/promises";
-import { readFileSync as readFileSync2, statSync as statSync4, unlinkSync } from "node:fs";
+import { readFileSync as readFileSync3, statSync as statSync4, unlinkSync } from "node:fs";
 import { hostname as hostname6 } from "node:os";
 import { basename as basename8 } from "node:path";
 
@@ -4105,9 +4105,14 @@ async function reconcileProvisional(config, hookPid) {
     if (provisionals.length === 0)
       return;
     const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
-    if (!sentinel)
+    if (!sentinel) {
+      traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
       return;
+    }
     let delivered = false;
+    const started = Date.now();
+    let status;
+    let error;
     try {
       const res = await fetch(`${config.url}/v1/cc/event`, {
         method: "POST",
@@ -4115,8 +4120,12 @@ async function reconcileProvisional(config, hookPid) {
         body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
         signal: AbortSignal.timeout(2000)
       });
+      status = res.status;
       delivered = res.ok;
-    } catch {}
+    } catch (e) {
+      error = e?.name === "TimeoutError" ? "timeout" : "network";
+    }
+    traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered)
       await unlink3(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {}
@@ -7110,7 +7119,7 @@ var MAX_DEFINITIVE_POLL_FAILURES = 2;
 
 // src/core/permission.ts
 import { readFile as readFile8, realpath, unlink as unlink5 } from "node:fs/promises";
-import { appendFileSync as appendFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
+import { appendFileSync as appendFileSync2, closeSync, constants as fsConstants, fstatSync, openSync, readFileSync as readFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
 import { homedir, hostname as hostname4 } from "node:os";
 import { basename as basename7, isAbsolute as isAbsolute4, relative, resolve as resolve3 } from "node:path";
 var POST_FIRST_CONTACT_TIMEOUT_MS = 6000;
@@ -7235,6 +7244,50 @@ function codexPassThroughReason(policy) {
   if (policy.approvalPolicy === "untrusted" || policy.approvalsReviewer === "user")
     return;
   return "codex-context-unknown";
+}
+var CODEX_REQUIREMENTS_PATH = "/etc/codex/requirements.toml";
+async function codexPromptUserRuleMatches(command, path = CODEX_REQUIREMENTS_PATH) {
+  let text;
+  try {
+    text = await readFile8(path, "utf8");
+  } catch {
+    return false;
+  }
+  try {
+    const words = command.split(/[\s'"`;&|()]+/).filter((w) => w.length > 0);
+    for (const table of text.split(/^\s*\[/m)) {
+      if (!/^\[\s*rules\.prefix_rules\s*\]\]/.test(table))
+        continue;
+      if (!/^\s*decision\s*=\s*["']prompt-user["']/m.test(table))
+        continue;
+      const at = table.search(/^\s*pattern\s*=\s*\[/m);
+      if (at < 0)
+        continue;
+      const open = table.indexOf("[", table.indexOf("=", at));
+      let depth = 0, end = -1;
+      for (let i = open;i < table.length && end < 0; i++) {
+        if (table[i] === "[")
+          depth++;
+        else if (table[i] === "]" && --depth === 0)
+          end = i;
+      }
+      if (end < 0)
+        continue;
+      const tokens = (table.slice(open + 1, end).match(/\{[^}]*\}/g) ?? []).map((element) => {
+        const quoted = (s) => [...s.matchAll(/["']([^"']*)["']/g)].map((m) => m[1]);
+        const anyOf = /any_of\s*=\s*\[([^\]]*)\]/.exec(element);
+        return anyOf ? quoted(anyOf[1]) : quoted(/token\s*=\s*(["'][^"']*["'])/.exec(element)?.[1] ?? "");
+      });
+      if (tokens.length === 0 || tokens.some((alts) => alts.length === 0))
+        continue;
+      const hit = (word, alts) => alts.includes(word) || alts.includes(basename7(word));
+      for (let i = 0;i + tokens.length <= words.length; i++) {
+        if (tokens.every((alts, j) => hit(words[i + j], alts)))
+          return true;
+      }
+    }
+  } catch {}
+  return false;
 }
 function decisionLine(agent, hookSpecificOutput) {
   return JSON.stringify(agent === "codex" ? { continue: true, hookSpecificOutput } : { hookSpecificOutput });
@@ -7518,9 +7571,18 @@ function buildPermissionSummary(toolName, toolInput) {
     }
     case "apply_patch": {
       const desc = str(toolInput.description);
-      return desc ? truncate(desc) : toolName;
+      if (desc)
+        return truncate(desc);
+      const files = parseV4APatch(str(toolInput.command) ?? "");
+      if (files.length > 1)
+        return `Edit ${files.length} files`;
+      if (files.length === 0)
+        return toolName;
+      const verb = files[0].kind === "added" ? "Add" : files[0].kind === "deleted" ? "Delete" : "Edit";
+      return truncate(`${verb} ${basename7(files[0].path)}`);
     }
     case "Edit":
+    case "MultiEdit":
     case "Write":
     case "Read":
     case "NotebookEdit": {
@@ -7554,15 +7616,335 @@ function buildPermissionSummary(toolName, toolInput) {
       return typeof q?.question === "string" ? truncate(q.question) : toolName;
     }
     default: {
-      if (/^mcp__/.test(toolName)) {
-        const seg = toolName.split("__").pop();
-        return seg && seg.length > 0 ? seg : toolName;
+      const mcp = /^mcp__(.+?)__(.+)$/.exec(toolName);
+      if (mcp) {
+        const words = (s) => s.replace(/[_-]+/g, " ").trim();
+        const server = words(mcp[1].replace(/^claude_ai_/, ""));
+        const tool = words(mcp[2]);
+        return server && tool ? truncate(`${server} · ${tool}`) : toolName;
       }
       return toolName;
     }
   }
 }
-function buildPermissionDetail(toolName, toolInput) {
+function parseV4APatch(text) {
+  const files = [];
+  let file;
+  let hunk;
+  for (const line of text.split(`
+`)) {
+    const head = /^\*\*\* (Update|Add|Delete) File: (.+)$/.exec(line);
+    if (head) {
+      const kind = head[1] === "Add" ? "added" : head[1] === "Delete" ? "deleted" : "modified";
+      file = { path: head[2].trim(), kind, added: 0, removed: kind === "deleted" ? null : 0, hunks: [] };
+      files.push(file);
+      hunk = undefined;
+      continue;
+    }
+    if (!file)
+      continue;
+    const move = /^\*\*\* Move to: (.+)$/.exec(line);
+    if (move) {
+      file.from = file.path;
+      file.path = move[1].trim();
+      file.kind = "renamed";
+      continue;
+    }
+    if (line.startsWith("***"))
+      continue;
+    if (line.startsWith("@@")) {
+      const header = line.slice(2).trim();
+      hunk = { ...header ? { header } : {}, lines: [] };
+      file.hunks.push(hunk);
+      continue;
+    }
+    const t = line[0] === "+" ? "add" : line[0] === "-" ? "del" : line[0] === " " ? "ctx" : undefined;
+    if (!t)
+      continue;
+    if (!hunk) {
+      hunk = { lines: [] };
+      file.hunks.push(hunk);
+    }
+    hunk.lines.push({ t, s: line.slice(1) });
+    if (t === "add")
+      file.added += 1;
+    else if (t === "del" && file.removed !== null)
+      file.removed += 1;
+  }
+  return files;
+}
+var DIFF_CONTEXT_LINES = 3;
+var DIFF_MAX_EDITS = 2000;
+var DIFF_MAX_WORK = 4000000;
+function myers(a, b) {
+  const n = a.length, m = b.length, off = n + m + 1;
+  const v = new Int32Array(2 * off + 1);
+  const trace = [];
+  let work = 0;
+  for (let d = 0;d <= n + m; d++) {
+    if (d > DIFF_MAX_EDITS)
+      return;
+    for (let k = -d;k <= d; k += 2) {
+      let x = k === -d || k !== d && v[off + k - 1] < v[off + k + 1] ? v[off + k + 1] : v[off + k - 1] + 1;
+      let y = x - k;
+      const x0 = x;
+      while (x < n && y < m && a[x] === b[y]) {
+        x++;
+        y++;
+      }
+      work += x - x0 + 1;
+      v[off + k] = x;
+      if (x >= n && y >= m) {
+        trace.push(v.slice(off - d, off + d + 1));
+        return backtrack(trace, n, m);
+      }
+    }
+    if (work > DIFF_MAX_WORK)
+      return;
+    trace.push(v.slice(off - d, off + d + 1));
+  }
+  return;
+}
+function backtrack(trace, n, m) {
+  const ops = [];
+  let x = n, y = m;
+  for (let d = trace.length - 1;d > 0; d--) {
+    const prev = trace[d - 1];
+    const at = (k) => prev[k + d - 1];
+    const k = x - y;
+    const down = k === -d || k !== d && at(k - 1) < at(k + 1);
+    const px = at(down ? k + 1 : k - 1);
+    const mx = down ? px : px + 1;
+    const my = mx - k;
+    while (x > mx && y > my) {
+      ops.push("ctx");
+      x--;
+      y--;
+    }
+    if (down) {
+      ops.push("add");
+      y--;
+    } else {
+      ops.push("del");
+      x--;
+    }
+  }
+  while (x > 0 && y > 0) {
+    ops.push("ctx");
+    x--;
+    y--;
+  }
+  return ops.reverse();
+}
+function diffHunks(oldText, newText) {
+  const split = (s) => s.length === 0 ? [] : s.replace(/\n$/, "").split(`
+`);
+  const a = split(oldText);
+  const b = split(newText);
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre])
+    pre += 1;
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf])
+    suf += 1;
+  const am = a.slice(pre, a.length - suf), bm = b.slice(pre, b.length - suf);
+  const ids = new Map;
+  const id = (s) => {
+    let i = ids.get(s);
+    if (i === undefined)
+      ids.set(s, i = ids.size);
+    return i;
+  };
+  const ops = am.length > 0 && bm.length > 0 ? myers(Int32Array.from(am, id), Int32Array.from(bm, id)) : undefined;
+  const lines = a.slice(0, pre).map((s) => ({ t: "ctx", s }));
+  if (ops) {
+    let i = 0, j = 0;
+    let run = { del: [], add: [] };
+    const flush = () => {
+      lines.push(...run.del, ...run.add);
+      run = { del: [], add: [] };
+    };
+    for (const op of ops) {
+      if (op === "ctx") {
+        flush();
+        lines.push({ t: "ctx", s: am[i++] });
+        j++;
+      } else if (op === "del")
+        run.del.push({ t: "del", s: am[i++] });
+      else
+        run.add.push({ t: "add", s: bm[j++] });
+    }
+    flush();
+  } else {
+    for (const s of am)
+      lines.push({ t: "del", s });
+    for (const s of bm)
+      lines.push({ t: "add", s });
+  }
+  for (const s of a.slice(a.length - suf))
+    lines.push({ t: "ctx", s });
+  const hunks = [];
+  let cur;
+  let last = -1;
+  const close = () => {
+    if (cur) {
+      cur.push(...lines.slice(last + 1, last + 1 + DIFF_CONTEXT_LINES));
+      hunks.push({ lines: cur });
+    }
+  };
+  lines.forEach((l, c) => {
+    if (l.t === "ctx")
+      return;
+    if (cur && c - last - 1 <= 2 * DIFF_CONTEXT_LINES)
+      cur.push(...lines.slice(last + 1, c + 1));
+    else {
+      close();
+      cur = lines.slice(Math.max(0, c - DIFF_CONTEXT_LINES), c + 1);
+    }
+    last = c;
+  });
+  close();
+  return hunks;
+}
+var count = (hunks, t) => hunks.reduce((n, h) => n + h.lines.filter((l) => l.t === t).length, 0);
+var OVERWRITE_DIFF_MAX_BYTES = 2 << 20;
+function readOverwrittenText(path) {
+  let fd;
+  try {
+    const st = statSync3(path);
+    if (!st.isFile() || st.size > OVERWRITE_DIFF_MAX_BYTES)
+      return;
+    fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    const fst = fstatSync(fd);
+    if (!fst.isFile() || fst.size > OVERWRITE_DIFF_MAX_BYTES)
+      return;
+    const bytes = readFileSync2(fd);
+    if (bytes.length > OVERWRITE_DIFF_MAX_BYTES || bytes.includes(0))
+      return;
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch (e) {
+    const code = e.code;
+    return code === "ENOENT" || code === "ENOTDIR" ? null : undefined;
+  } finally {
+    if (fd !== undefined)
+      try {
+        closeSync(fd);
+      } catch {}
+  }
+}
+function buildPermissionDiff(toolName, toolInput) {
+  const str = (v) => typeof v === "string" ? v : undefined;
+  const path = str(toolInput.file_path);
+  const files = (hunks, kind = "modified", removedUnknown = false) => [{ path, kind, added: count(hunks, "add"), removed: removedUnknown ? null : count(hunks, "del"), hunks }];
+  switch (toolName) {
+    case "apply_patch": {
+      const parsed = parseV4APatch(str(toolInput.command) ?? "");
+      return parsed.length > 0 ? parsed : undefined;
+    }
+    case "Edit": {
+      const o = str(toolInput.old_string), n = str(toolInput.new_string);
+      return path && o !== undefined && n !== undefined ? files(diffHunks(o, n)) : undefined;
+    }
+    case "MultiEdit": {
+      const edits = Array.isArray(toolInput.edits) ? toolInput.edits : [];
+      const hunks = edits.flatMap((e) => typeof e?.old_string === "string" && typeof e.new_string === "string" ? diffHunks(e.old_string, e.new_string) : []);
+      return path && hunks.length > 0 ? files(hunks) : undefined;
+    }
+    case "Write": {
+      const content = str(toolInput.content);
+      if (!path || content === undefined)
+        return;
+      const old = readOverwrittenText(path);
+      if (old === null)
+        return files(diffHunks("", content), "added");
+      if (old === undefined)
+        return;
+      return files(diffHunks(old, content));
+    }
+    default:
+      return;
+  }
+}
+function renderV4A(files) {
+  const out = [];
+  for (const f of files) {
+    out.push(`*** ${f.kind === "added" ? "Add" : f.kind === "deleted" ? "Delete" : "Update"} File: ${f.path}`);
+    for (const h of f.hunks) {
+      if (f.kind !== "added")
+        out.push(h.header ? `@@ ${h.header}` : "@@");
+      for (const l of h.lines)
+        out.push(`${l.t === "add" ? "+" : l.t === "del" ? "-" : " "}${l.s}`);
+    }
+  }
+  return out.join(`
+`);
+}
+var DIFF_LINE_MAX = 240;
+var DIFF_PREVIEW_MAX_CHARS = 1400;
+function previewDiff(files, k) {
+  let left = k;
+  let truncated = false;
+  const out = [];
+  for (const f of files) {
+    const total = f.hunks.reduce((n, h) => n + h.lines.length, 0);
+    if (left <= 0 && (total > 0 || truncated)) {
+      truncated = true;
+      break;
+    }
+    const hunks = [];
+    for (const h of f.hunks) {
+      if (left <= 0) {
+        truncated = true;
+        break;
+      }
+      const lines = h.lines.slice(0, left).map((l) => {
+        const s = capPermissionWireText(l.s, DIFF_LINE_MAX);
+        if (s !== l.s)
+          truncated = true;
+        return { t: l.t, s };
+      });
+      if (lines.length < h.lines.length)
+        truncated = true;
+      left -= lines.length;
+      hunks.push({ ...h.header ? { header: h.header } : {}, lines });
+    }
+    out.push({ ...f, hunks });
+  }
+  return { files: out, ...truncated ? { truncated: true } : {} };
+}
+function fitPermissionDiff(frame, files, maxChars = BLOB_FIT_CHARS) {
+  if (!files || files.length === 0)
+    return {};
+  const encoder = new TextEncoder;
+  const fits = (tail) => sealedBlobChars(encoder.encode(JSON.stringify({ ...frame, ...tail })).length) <= maxChars;
+  const unknown = files.some((f) => f.removed === null);
+  const diffSummary = {
+    files: files.length,
+    added: files.reduce((n, f) => n + f.added, 0),
+    removed: files.reduce((n, f) => n + (f.removed ?? 0), 0),
+    ...unknown ? { removedUnknown: true } : {}
+  };
+  if (!fits({ diffSummary }))
+    return {};
+  const ok = (k) => {
+    const diff = previewDiff(files, k);
+    return JSON.stringify(diff).length <= DIFF_PREVIEW_MAX_CHARS && fits({ diffSummary, diff });
+  };
+  if (!ok(0))
+    return { diffSummary };
+  let lo = 0;
+  let hi = files.reduce((n, f) => n + f.hunks.reduce((m, h) => m + h.lines.length, 0), 0);
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (ok(mid))
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  const diff = previewDiff(files, lo);
+  return diff.files.length > 0 ? { diffSummary, diff } : { diffSummary };
+}
+function buildPermissionDetail(toolName, toolInput, precomputedDiff) {
   const str = (v) => typeof v === "string" && v.length > 0 ? v : undefined;
   switch (toolName) {
     case "Bash":
@@ -7571,12 +7953,14 @@ function buildPermissionDetail(toolName, toolInput) {
       const c = str(toolInput.command);
       return c ?? "";
     }
-    case "apply_patch": {
-      const d = str(toolInput.description);
-      return d ?? "";
-    }
+    case "apply_patch":
+      return str(toolInput.command) ?? str(toolInput.description) ?? "";
     case "Edit":
-    case "Write":
+    case "MultiEdit":
+    case "Write": {
+      const diff = precomputedDiff ?? buildPermissionDiff(toolName, toolInput);
+      return diff ? renderV4A(diff) : str(toolInput.file_path) ?? "";
+    }
     case "Read":
     case "NotebookEdit": {
       const fp = str(toolInput.file_path);
@@ -7663,12 +8047,12 @@ function buildPermissionQuestions(toolInput) {
   });
 }
 var MAX_DETAIL_CHARS = 20000;
-function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions = []) {
+function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions = [], diffTail = {}) {
   const all = Array.from(detail);
   const hardLoss = Math.max(0, all.length - MAX_DETAIL_CHARS);
   const chars = hardLoss > 0 ? all.slice(0, MAX_DETAIL_CHARS) : all;
   const encoder = new TextEncoder;
-  const measure = (d, omitted, qs) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs))).length);
+  const measure = (d, omitted, qs) => sealedBlobChars(encoder.encode(JSON.stringify(permissionFrame(base, d, omitted, qs, diffTail))).length);
   const worstCase = all.length;
   const noPreviews = questions.map(({ p: _previews, ...question }) => question);
   const bareQuestions = noPreviews.map(({ d: _descriptions, ...question }) => question);
@@ -7702,13 +8086,14 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions 
   }
   return { detail: shortest, omitted: all.length - lo, ...tail };
 }
-function permissionFrame(base, detail, omitted, questions = []) {
+function permissionFrame(base, detail, omitted, questions = [], tail = {}) {
   const { permissionGrant, ...rest } = base;
   return {
     ...rest,
     ...detail.length > 0 ? { permissionDetail: detail } : {},
     ...omitted > 0 ? { permissionDetailOmitted: omitted } : {},
     ...questions.length > 0 ? { permissionQuestions: questions } : {},
+    ...tail,
     ...typeof permissionGrant === "string" ? { permissionGrant } : {}
   };
 }
@@ -8013,6 +8398,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       trace({ event: "codex-reviewer", disposition: "hold", reason: "mcp-reviewer-unknown" });
     }
     const toolInput = typeof input.tool_input === "object" && input.tool_input !== null ? input.tool_input : {};
+    if (agent === "codex" && typeof toolInput.command === "string" && await codexPromptUserRuleMatches(toolInput.command, deps.codexRequirementsPath)) {
+      trace({ event: "exit", reason: "codex-prompt-user" });
+      return;
+    }
     const suggestions = input.permission_suggestions;
     const grant = isAnswerTool(toolName, agent) ? undefined : deps.grant !== undefined ? deps.grant : agent === "claude" ? claudeGrantText(toolName, suggestions) : undefined;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
@@ -8032,8 +8421,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionToolName: toolName,
       ...grant !== undefined ? { permissionGrant: grant } : {}
     };
-    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput);
-    let fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput));
+    const diffFiles = buildPermissionDiff(toolName, toolInput);
+    const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput, diffFiles);
+    const diffTail = fitPermissionDiff({ ...permissionBase, permissionDetailOmitted: Array.from(rawDetail).length }, diffFiles);
+    let fitted = fitPermissionDetail(permissionBase, rawDetail, BLOB_FIT_CHARS, buildPermissionQuestions(toolInput), diffTail);
     if (fitted.detail === "" && rawDetail !== "" && summary !== toolName && (toolName === "Bash" || toolName === "shell" || toolName === "local_shell")) {
       permissionBase.permissionSummary = toolName;
       fitted = fitPermissionDetail(permissionBase, rawDetail);
@@ -8043,7 +8434,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       await (deps.stampDetailFullFn ?? defaultStampDetailFull())(sessionId, detailFull);
     }
     const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
-    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions));
+    const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail));
     const fallbackBlob = await encryptBlob(config.e2eKey, base);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
@@ -8186,9 +8577,9 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const holdPid = deps.holdPid ?? process.pid;
     let holdBlob = blob;
     try {
-      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions), undefined, formatDecisionHoldDebug({ requestId, pid: holdPid })));
+      holdBlob = await encryptBlob(config.e2eKey, appendFittedPlanAndDebug(permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail), undefined, formatDecisionHoldDebug({ requestId, pid: holdPid })));
     } catch {}
-    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...deps.holdId ? { holdId: deps.holdId } : {} });
+    await (deps.writeHoldFn ?? defaultWriteHold())(sessionId, { blob: holdBlob, at: holdAt, pid: holdPid, ...deps.holdId ? { holdId: deps.holdId } : {}, requestId });
     heldSessionId = sessionId;
     settleHeldRecord = async () => {
       const settledAt = (deps.now ?? Date.now)();
@@ -8998,7 +9389,7 @@ class CodexRemoteInputBridge {
 
 // src/core/activity.ts
 import { createHash as createHash3, randomUUID } from "node:crypto";
-import { createReadStream, existsSync as existsSync4 } from "node:fs";
+import { createReadStream, existsSync as existsSync5 } from "node:fs";
 import { readdir as readdir8, readFile as readFile9, stat as stat6 } from "node:fs/promises";
 import { dirname as dirname2 } from "node:path";
 import * as zlib from "node:zlib";
@@ -9021,7 +9412,7 @@ async function loadMachineId(path) {
   await atomicWrite(path, mid, 384);
   return mid;
 }
-var emptyState = () => ({ lastUpload: 0, lastHash: "", lastPairing: "", rows: new Map });
+var emptyState = () => ({ lastUpload: 0, lastHash: "", lastPairing: "", lastVersion: "", rows: new Map });
 var h12 = (s) => createHash3("sha1").update(s).digest("base64").slice(0, 12);
 var pad = (n) => String(n).padStart(2, "0");
 function localDate(ts) {
@@ -9029,7 +9420,7 @@ function localDate(ts) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 function addEvent(state, ev) {
-  if (!Number.isFinite(ev.ts))
+  if (!Number.isFinite(ev.ts) || Number.isNaN(new Date(ev.ts).getTime()))
     return false;
   const d = localDate(ev.ts);
   const key = `${d}|${ev.agent}`;
@@ -9096,7 +9487,7 @@ function serializeState(state) {
     u: r.u,
     ...r.k ? { k: [...r.k], ss: [...r.ss], ko: r.ko ?? {} } : {}
   }));
-  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, days });
+  return JSON.stringify({ v: 1, lastUpload: state.lastUpload, lastHash: state.lastHash, lastPairing: state.lastPairing, lastVersion: state.lastVersion, days });
 }
 function parseState(text) {
   const st = emptyState();
@@ -9105,6 +9496,7 @@ function parseState(text) {
     st.lastUpload = Number(o.lastUpload) || 0;
     st.lastHash = typeof o.lastHash === "string" ? o.lastHash : "";
     st.lastPairing = typeof o.lastPairing === "string" ? o.lastPairing : "";
+    st.lastVersion = typeof o.lastVersion === "string" ? o.lastVersion : "";
     for (const r of o.days ?? []) {
       const bits = new Uint8Array(36);
       bits.set(Buffer.from(String(r.b ?? ""), "base64").subarray(0, 36));
@@ -9302,7 +9694,7 @@ async function listFiles(dir, match) {
   }
 }
 async function openReadOnly(path) {
-  if (!existsSync4(path))
+  if (!existsSync5(path))
     return null;
   const isBun = typeof globalThis.Bun !== "undefined";
   const spec = isBun ? "bun:sqlite" : "node:sqlite";
@@ -9369,7 +9761,7 @@ async function readCodex(home, cursor, sink, progress, seen, sinceMs, days) {
     for (const t of state.all("select id, rollout_path, created_at, tokens_used, model, source from threads where created_at >= ?", Math.floor(sinceMs / 1000))) {
       const p = String(t.rollout_path ?? "");
       const base = p.replace(/\.zst$/, "");
-      if (existsSync4(base) || hasZstd && existsSync4(`${base}.zst`))
+      if (existsSync5(base) || hasZstd && existsSync5(`${base}.zst`))
         continue;
       orphans.set(t.id, t);
       if (counted(t))
@@ -9468,13 +9860,14 @@ async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
 function payloadHash(payload) {
   return createHash3("sha1").update(JSON.stringify(payload.days)).digest("hex");
 }
-async function maybeUpload(state, config, now, fetchFn = fetch, mid) {
-  const newPairing = config.pairingId !== state.lastPairing;
-  if (state.rows.size === 0 || !newPairing && now - state.lastUpload < UPLOAD_EVERY_MS)
+async function maybeUpload(state, config, now, fetchFn = fetch, mid, force = false) {
+  const due = force || config.pairingId !== state.lastPairing;
+  const timeDue = due || state.lastVersion !== PLUGIN_VERSION || now - state.lastUpload >= UPLOAD_EVERY_MS;
+  if (state.rows.size === 0 || !timeDue)
     return false;
   const payload = buildPayload(state, now, mid);
   const hash = payloadHash(payload);
-  if (!newPairing && hash === state.lastHash && now - state.lastUpload < REFRESH_EVERY_MS)
+  if (!due && hash === state.lastHash && now - state.lastUpload < REFRESH_EVERY_MS)
     return false;
   try {
     const blob = await encryptBlob(config.e2eKey, payload);
@@ -9494,6 +9887,7 @@ async function maybeUpload(state, config, now, fetchFn = fetch, mid) {
     state.lastUpload = now;
     state.lastHash = hash;
     state.lastPairing = config.pairingId;
+    state.lastVersion = PLUGIN_VERSION;
     return true;
   } catch {
     return false;
@@ -9502,7 +9896,7 @@ async function maybeUpload(state, config, now, fetchFn = fetch, mid) {
 async function runActivityCycle(deps = {}) {
   const config = deps.config !== undefined ? deps.config : await loadConfig();
   if (!config)
-    return;
+    return "unpaired";
   const daysPath = deps.daysPath ?? ACTIVITY_DAYS_PATH;
   const cursorPath = deps.cursorPath ?? ACTIVITY_CURSOR_PATH;
   const now = deps.now ?? Date.now;
@@ -9523,9 +9917,10 @@ async function runActivityCycle(deps = {}) {
   const mid = await loadMachineId(deps.midPath ?? `${dirname2(daysPath)}/machine-id`).catch(() => {
     return;
   });
-  const sent = await maybeUpload(state, config, now(), deps.fetchFn, mid);
+  const sent = await maybeUpload(state, config, now(), deps.fetchFn, mid, deps.force);
   if (scan || sent)
     await save();
+  return sent ? "sent" : state.rows.size === 0 ? "empty" : "not-sent";
 }
 function startActivityLoop(load = loadConfig, cycle = runActivityCycle) {
   let busy = false;
@@ -10603,7 +10998,7 @@ function buildProvisionalRecord(d, machine, blob, blobAgentFields, now, pairingI
 }
 async function discoverLiveSessions(config, deps = {}) {
   const adapters = deps.adapters ?? allAdapters;
-  const post = deps.post ?? ((body) => postEvent(config, body));
+  const post = deps.post ?? ((body, detail) => postEvent(config, body, { detail }));
   const readRecords = deps.readRecords ?? readAllRecords;
   const writeRecord = deps.writeRecord ?? ((sessionId, rec) => atomicWrite(`${SESSIONS_DIR}/${sessionId}.json`, JSON.stringify(rec), 384));
   const now = deps.now ?? Date.now;
@@ -10622,8 +11017,18 @@ async function discoverLiveSessions(config, deps = {}) {
       const ts = now();
       const idle = d.idle === true;
       const blob = await buildProvisionalBlob(d, machine, adapter.blobAgentFields, config.e2eKey, Math.floor(ts / 1000));
-      const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle));
-      if (outcome !== "delivered")
+      const detail = {};
+      const outcome = await post(buildProvisionalEnvelope(d.sessionId, blob, ts, idle), detail);
+      traceFocus(deps, {
+        event: "provisional-create",
+        sessionId: d.sessionId,
+        op: idle ? "done" : "start",
+        outcome,
+        status: detail.status,
+        error: detail.error,
+        ms: detail.ms
+      });
+      if (outcome === "revoked")
         continue;
       await writeRecord(d.sessionId, buildProvisionalRecord(d, machine, blob, adapter.blobAgentFields, ts, config.pairingId, idle));
     }
@@ -10638,13 +11043,15 @@ function provisionalsCoveredByReal(entries, adapters = allAdapters) {
   return entries.filter((e) => e.rec.provisional === true && typeof e.rec.pid === "number" && realPids.has(e.rec.pid)).map((e) => e.sessionId);
 }
 async function reconcileProvisionalsSweep(config, deps = {}) {
-  const post = deps.post ?? ((body) => postEvent(config, body));
+  const post = deps.post ?? ((body, detail) => postEvent(config, body, { detail }));
   const readEntries = deps.readEntries ?? readAllRecordEntries;
   const deleteRecord = deps.deleteRecord ?? ((sessionId) => unlink6(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {}));
   const now = deps.now ?? Date.now;
   const entries = await readEntries();
   for (const sessionId of provisionalsCoveredByReal(entries, deps.adapters ?? allAdapters)) {
-    const outcome = await post(buildEndEnvelope(sessionId, now()));
+    const detail = {};
+    const outcome = await post(buildEndEnvelope(sessionId, now()), detail);
+    traceFocus(deps, { event: "provisional-end", sessionId, by: "sweep", outcome, status: detail.status, error: detail.error, ms: detail.ms });
     if (outcome === "delivered")
       await deleteRecord(sessionId);
   }
@@ -11189,6 +11596,53 @@ async function correctPendingUpdate(config, path, sessionId, record, now, deps =
     return "uncorrected";
   }
 }
+function shouldReseal(record, pairingId) {
+  return typeof record.pairingId === "string" && record.pairingId.length > 0 && record.pairingId !== pairingId && typeof record.ts === "number" && Number.isFinite(record.ts);
+}
+async function resealForPairing(config, path, sessionId, record, now, deps = {}) {
+  const post = deps.post ?? ((body, detail) => postEvent(config, body, { timeoutMs: PENDING_UPDATE_POST_TIMEOUT_MS, detail }));
+  const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
+  const reread = deps.readRecord ?? readRecordAt;
+  try {
+    if (!shouldReseal(record, config.pairingId) || !resendAllowed(now))
+      return "uncorrected";
+    if (await decisionHoldIsLive(sessionId, now, deps))
+      return "uncorrected";
+    const fresh = await reread(path);
+    if (!fresh || recordMovedSince(record, fresh) || !shouldReseal(fresh, config.pairingId))
+      return "uncorrected";
+    const envelope = await buildTitleRepairEnvelope(sessionId, fresh, typeof fresh.title === "string" ? fresh.title : "", (deps.now ?? Date.now)(), config.e2eKey, recordAgent(fresh), Math.floor(fresh.ts / 1000));
+    const detail = {};
+    const outcome = await post(envelope, detail);
+    const delivered = outcome === "delivered";
+    const backoffMs = outcome === "revoked" ? undefined : noteResend(delivered, now);
+    traceFocus(deps, {
+      event: "reseal",
+      sessionId,
+      outcome,
+      delivered,
+      op: fresh.op,
+      lastEvent: fresh.lastEvent,
+      status: detail.status,
+      error: detail.error,
+      ms: detail.ms,
+      backoffMs
+    });
+    if (outcome === "revoked")
+      return "revoked";
+    if (!delivered)
+      return "pending";
+    const after = await reread(path);
+    if (after && !recordMovedSince(fresh, after) && shouldReseal(after, config.pairingId)) {
+      try {
+        await writeRecord(path, { ...after, blob: envelope.blob, pairingId: config.pairingId, updatePending: undefined });
+      } catch {}
+    }
+    return "corrected";
+  } catch {
+    return "uncorrected";
+  }
+}
 var RETIRE_AFTER_MS = PLAN_PICKER_PENDING_MAX_MS + 15 * 60000;
 function isRetireEligible(record, now) {
   if (typeof record.retiredAt === "number" && Number.isFinite(record.retiredAt))
@@ -11461,6 +11915,9 @@ async function pruneStaleDecisionHolds(files, deps = {}) {
       if (alive)
         continue;
     }
+    if (typeof hold?.requestId === "string" && deps.resolveCard) {
+      Promise.resolve(deps.resolveCard(hold.requestId)).catch(() => {});
+    }
     try {
       await removeHold(sessionId);
       removed++;
@@ -11479,7 +11936,7 @@ async function sweep(config, deps = {}) {
     return { revoked: false, remaining: 0, delivered: false };
   }
   const now = Date.now();
-  await pruneStaleDecisionHolds(files);
+  await pruneStaleDecisionHolds(files, config ? { resolveCard: (id) => resolveOnRelay(config, id) } : {});
   let remaining = 0;
   let delivered = false;
   const pairingIsNew = config !== null && config.pairingId !== greetedPairingId;
@@ -11602,6 +12059,14 @@ async function sweep(config, deps = {}) {
         const netOwned = idleFix === "corrected" || planResolutionHandled || interruptHandled || flaggedAttention || reapedIdle || repairedTitle;
         let resent = false;
         if (!netOwned) {
+          const reseal = await resealForPairing(config, path, sessionId, record, now);
+          if (reseal === "revoked")
+            return { revoked: true };
+          if (reseal === "corrected")
+            delivered = true;
+          resent = reseal === "corrected" || reseal === "pending";
+        }
+        if (!netOwned && !resent) {
           const pendingUpdate = await correctPendingUpdate(config, path, sessionId, record, now);
           if (pendingUpdate === "revoked")
             return { revoked: true };
@@ -11638,7 +12103,11 @@ async function sweep(config, deps = {}) {
       continue;
     }
     if (verdict === "end" && config && record) {
-      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record));
+      const detail = {};
+      const outcome = await postEvent(config, buildEndEnvelope(sessionId, now, record), { detail });
+      if (record.provisional === true) {
+        traceFocus({}, { event: "provisional-end", sessionId, by: "reap", outcome, status: detail.status, error: detail.error, ms: detail.ms });
+      }
       if (outcome === "revoked")
         return { revoked: true };
       if (outcome !== "delivered") {
@@ -11853,7 +12322,7 @@ function createBridgeSupervisor(deps = {}) {
 async function claimSingleInstance() {
   const build = watchdogBuildStamp();
   try {
-    const holder = parseWatchdogPidfile(readFileSync2(WATCHDOG_PID_PATH, "utf8"));
+    const holder = parseWatchdogPidfile(readFileSync3(WATCHDOG_PID_PATH, "utf8"));
     if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && holder.version === PLUGIN_VERSION && !watchdogBuildDiffers(holder.build, build)) {
       return false;
     }
@@ -11864,7 +12333,7 @@ async function claimSingleInstance() {
 function isRightfulWatchdogOwner(deps = {}) {
   try {
     const pidPath = deps.pidPath ?? WATCHDOG_PID_PATH;
-    const holder = parseWatchdogPidfile((deps.readPidfile ?? (() => readFileSync2(pidPath, "utf8")))());
+    const holder = parseWatchdogPidfile((deps.readPidfile ?? (() => readFileSync3(pidPath, "utf8")))());
     return holder?.pid === (deps.pid ?? process.pid) && holder.version === (deps.version ?? PLUGIN_VERSION);
   } catch {
     return false;
@@ -11880,7 +12349,7 @@ function enforceWatchdogOwnership(shutdown, deps = {}) {
 }
 function releaseSingleInstance() {
   try {
-    const holder = parseWatchdogPidfile(readFileSync2(WATCHDOG_PID_PATH, "utf8"));
+    const holder = parseWatchdogPidfile(readFileSync3(WATCHDOG_PID_PATH, "utf8"));
     if (holder && holder.pid === process.pid)
       unlinkSync(WATCHDOG_PID_PATH);
   } catch {}
@@ -12125,6 +12594,7 @@ export {
   reconcileProvisionalsSweep,
   recordMovedSince,
   repairTitle,
+  resealForPairing,
   resendAllowed,
   resendBackoffMs,
   resetCommandState,
@@ -12142,6 +12612,7 @@ export {
   shouldPendingUpdateCheck,
   shouldPlanPickerVerificationCheck,
   shouldRepairTitle,
+  shouldReseal,
   shouldWaitingHeartbeat,
   tailShowsInterrupt,
   titleRepairedRecord,

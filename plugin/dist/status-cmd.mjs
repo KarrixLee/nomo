@@ -3811,9 +3811,14 @@ async function reconcileProvisional(config, hookPid) {
     if (provisionals.length === 0)
       return;
     const sentinel = findProvisionalForPid(provisionals, hookPid, pidAncestors);
-    if (!sentinel)
+    if (!sentinel) {
+      traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
       return;
+    }
     let delivered = false;
+    const started = Date.now();
+    let status;
+    let error;
     try {
       const res = await fetch(`${config.url}/v1/cc/event`, {
         method: "POST",
@@ -3821,8 +3826,12 @@ async function reconcileProvisional(config, hookPid) {
         body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
         signal: AbortSignal.timeout(2000)
       });
+      status = res.status;
       delivered = res.ok;
-    } catch {}
+    } catch (e) {
+      error = e?.name === "TimeoutError" ? "timeout" : "network";
+    }
+    traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered)
       await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {}
@@ -4624,6 +4633,21 @@ async function runDevinHook(raw, deps = {}) {
   } catch {}
 }
 
+// src/core/terminal-command.ts
+import { readFileSync as readFileSync3 } from "node:fs";
+var SHORT_COMMAND_PATH = `${CC_DIR}/short-command`;
+function terminalCommand(cmd, recordPath = SHORT_COMMAND_PATH) {
+  let rec = "";
+  try {
+    rec = readFileSync3(recordPath, "utf8").trim();
+  } catch {}
+  if (rec === "1")
+    return `nomo ${cmd}`;
+  if (rec === "0")
+    return `bunx nomo-ai ${cmd}`;
+  return `nomo ${cmd} (or bunx nomo-ai ${cmd})`;
+}
+
 // src/entries/status-cmd.ts
 var CODEX_PLUGIN_HOOK_COUNT = 10;
 var AGENT_UI = {
@@ -4653,7 +4677,7 @@ function renderOwn(r, heading, print) {
       print(cont(`→ ${p.fix}`));
   }
 }
-function renderOther(r, print) {
+function renderOther(r, print, statusCmd) {
   const ui = AGENT_UI[r.kind];
   print(subRow(ui.name, r.sessionCount > 0 ? `${r.hooks} · ${r.sessions}` : r.hooks));
   for (const p of r.problems) {
@@ -4662,7 +4686,7 @@ function renderOther(r, print) {
       print(cont(`→ ${p.fix}`));
   }
   if (r.problems.length > 0)
-    print(cont(`→ full detail: run ${ui.status} inside ${ui.name}`));
+    print(cont(`→ full detail: run ${ui.status} inside ${ui.name}, or ${statusCmd}`));
 }
 function countCodexHookEvents(raw) {
   let parsed;
@@ -4880,6 +4904,8 @@ async function statusCmd(deps = {}) {
   const codexAppServerAvailable = deps.codexAppServerAvailable ?? (() => codexAppServerSocketAvailable());
   const audience = deps.audience;
   const ui = audience === "devin" && devinViaPlugin && !devinViaHooks ? DEVIN_PLUGIN_UI : AGENT_UI[audience ?? "claude"];
+  const pairCmd = terminalCommand("pair", deps.shortCommandPath);
+  const pairHint = audience ? `${ui.pair}, or ${pairCmd} in a terminal` : `${pairCmd}, or your agent's pair command`;
   print(audience ? `Nomo ${PLUGIN_VERSION} · ${AGENT_UI[audience].name}` : `Nomo ${PLUGIN_VERSION}`);
   let raw = null;
   try {
@@ -4892,10 +4918,10 @@ async function statusCmd(deps = {}) {
     print(row("Phone", `paired · ${config.url} · pairing ${config.pairingId.slice(0, 8)}…`));
   } else if (pending) {
     print(row("Phone", "waiting for the QR scan — pairing was started but no phone has claimed it"));
-    print(cont(`→ run ${ui.pair} to finish or retry`));
+    print(cont(`→ run ${pairHint} to finish or retry`));
   } else {
     print(row("Phone", "NOT PAIRED — nothing from this computer reaches the app"));
-    print(cont(`→ run ${ui.pair}`));
+    print(cont(`→ run ${pairHint}`));
   }
   const [rtName, rtVersion] = deps.runtime ?? (process.versions.bun ? ["bun", process.versions.bun] : ["node", process.versions.node]);
   const floor = runtimeFloorWarning(rtName, rtVersion);
@@ -4931,7 +4957,7 @@ async function statusCmd(deps = {}) {
       print(row("Approvals", "on — permission prompts are held and sent to your phone"));
     } else {
       print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));
-      print(cont(`→ run ${ui.approvalsOn}`));
+      print(cont(audience ? `→ run ${ui.approvalsOn}` : `→ run your agent's approvals command, e.g. ${ui.approvalsOn}`));
     }
   }
   const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0, devin: 0 };
@@ -5177,7 +5203,7 @@ async function statusCmd(deps = {}) {
       print("");
       print("Also on this computer");
       for (const k of others)
-        renderOther(reports[k], print);
+        renderOther(reports[k], print, terminalCommand("status", deps.shortCommandPath));
     }
   } else {
     for (const k of AGENT_ORDER)

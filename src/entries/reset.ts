@@ -7,7 +7,13 @@
 //      CURRENT pairing (an end carries no blob, so it clears the phone row regardless of which key
 //      sealed the record's stale blob) and its file deleted. Records with LIVE pids are left alone.
 //   3. Deletes every Devin session's "Always allow" grants (<id>.devin-allow).
-//   4. Pairing, keys, and config.json are NOT touched — that is `unpair`'s job.
+//   4. When paired, scans the agents' history and sends the daily activity summary NOW (heatmap +
+//      streak), skipping the watchdog's 6 h upload gate for this one call. It runs after step 1, but a
+//      hook CAN start a new watchdog meanwhile, so two scans may overlap. No lock: every event is
+//      deduped by id, files are written atomically, so the worst case is one extra upload or the other
+//      writer's last save winning. A watchdog started afterwards reads the fresh lastUpload/hash and
+//      does not re-send the same rows.
+//   5. Pairing, keys, and config.json are NOT touched — that is `unpair`'s job.
 //
 // Interactive command (same output contract as unpair): sequential stdout lines, ALWAYS exit 0 —
 // "nothing to reset" is a normal, successful outcome. The watchdog restarts automatically on the
@@ -18,7 +24,9 @@
 import { execFileSync } from "node:child_process";
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { basename } from "node:path";
+import { ActivityOutcome, CycleDeps, runActivityCycle } from "../core/activity";
 import { Config, forgetAllDevinGrants, isWatchdogCommand, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
+import { terminalCommand } from "../core/terminal-command";
 
 export type ResetVerdict = "clear" | "keep";
 
@@ -49,6 +57,10 @@ export interface ResetDeps {
   /** `ps -o command= -p <pid>` — the safety check before killing the pidfile's pid. */
   commandOf?: (pid: number) => string | undefined;
   killPid?: (pid: number) => void;
+  /** The activity cycle (scan + forced upload); tests inject a stub so the real history is never read. */
+  activityCycle?: (deps: CycleDeps) => Promise<ActivityOutcome>;
+  /** The installer's short-command record (see terminalCommand); tests point it at a temp file. */
+  shortCommandPath?: string;
 }
 
 /** The `ps -o command= -p <pid>` line for a pid, or undefined when the pid is gone / ps fails. */
@@ -81,6 +93,10 @@ async function stopWatchdog(deps: ResetDeps): Promise<"killed" | "stale-pidfile"
     const cmd = commandOf(pid);
     if (cmd !== undefined && isWatchdogCommand(cmd)) {
       try { killPid(pid); killed = true; } catch { /* raced its own exit — fine */ }
+      // Let it finish exiting (its SIGTERM path takes ~250 ms) so a scan it had in flight cannot write
+      // activity-days.json under the activity step below. Bounded at ~1 s.
+      const isAlive = deps.isAlive ?? pidAlive;
+      for (let i = 0; killed && i < 20 && isAlive(pid); i++) await new Promise((r) => setTimeout(r, 50));
     }
   }
   await unlink(pidPath).catch(() => {});
@@ -146,9 +162,22 @@ export async function reset(deps: ResetDeps = {}): Promise<number> {
     print("No stale sessions to clear.");
   }
   if (kept > 0) print(`Left ${kept} live session${kept === 1 ? "" : "s"} untouched.`);
-  // Devin "Always allow" grants are forgotten too, live session or not (the next prompt just asks).
+  // 3. Devin "Always allow" grants are forgotten too, live session or not (the next prompt just asks).
   await forgetAllDevinGrants(sessionsDir);
-  print("Pairing and keys were not touched — use the unpair command if you want that.");
+
+  // 4. Activity summary, sent now. The watchdog was stopped above (step 1).
+  if (config) {
+    let outcome: ActivityOutcome | "error";
+    try {
+      outcome = await (deps.activityCycle ?? runActivityCycle)({ config, fetchFn, force: true });
+    } catch {
+      outcome = "error";
+    }
+    if (outcome === "sent") print("Sent your activity summary (heatmap and streak) to your phone.");
+    else if (outcome === "empty") print("No activity to send yet.");
+    else print("Could not send your activity summary right now — it will be sent again automatically later.");
+  }
+  print(`Pairing and keys were not touched — to disconnect this computer, run ${terminalCommand("unpair", deps.shortCommandPath)}, or your agent's unpair command.`);
   return 0;
 }
 
@@ -156,7 +185,7 @@ export async function reset(deps: ResetDeps = {}): Promise<number> {
 // for older nodes.
 if (import.meta.main) {
   if (process.argv.includes("--check")) {
-    console.log("usage: reset  — stop the watchdog and clear dead/phantom session rows (keeps the pairing; watchdog restarts on the next session)");
+    console.log("usage: reset  — stop the watchdog, clear dead/phantom session rows and send the activity summary now (keeps the pairing; watchdog restarts on the next session)");
     process.exit(0);
   }
   process.exit(await reset());
