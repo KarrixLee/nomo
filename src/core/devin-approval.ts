@@ -43,14 +43,17 @@
 // shell command grants its command NAME (word-complete, `touch` ≠ `touchy`); a command with any shell
 // operator, substitution or redirect grants only that exact text, and only a plain command can ever
 // match a name grant, so `touch a && rm -rf ~` always goes to the phone. A WRAPPER (`bash`, `env`,
-// `sudo`, `python3`… — WRAPPERS) also grants only the exact text: `bash` would cover `bash -c "…"`.
+// `sudo`, `python3`… — WRAPPERS) or a tool that runs code from its arguments (`git -c core.fsmonitor=…`,
+// `make -f`, `sed '1e …'`… — also WRAPPERS) grants only the exact text: `git` would cover `git -c …`.
 // Any other tool is granted whole. A grant only ever applies on a PAIRED computer.
 // The grant is deleted on SessionEnd and when the watchdog retires the row.
 //
 // NOMO'S OWN COMMANDS: on a paired computer, the `exec` of one of Nomo's own SAFE skill commands
-// (/nomo-status, /nomo-pair, /nomo-approvals on|status, /nomo-reset — the plugin's /nomo:* or the
-// installer's /nomo-*) is approved at once, byte for byte, so /nomo-status never puts a card on the
-// phone. Pausing approvals, unpairing and the typed pairing code still ask (Antigravity's rule).
+// (/nomo-status, /nomo-approvals on|status — the plugin's /nomo:* or the installer's /nomo-*) is approved
+// at once, byte for byte, so /nomo-status never puts a card on the phone. Pausing approvals, pairing,
+// reset, unpairing and the typed pairing code still ask (Antigravity's rule). Anything that pairs,
+// unpairs, resets or uninstalls Nomo (isNomoLifecycleCommand) is never auto-approved, by a grant either:
+// on a paired computer `pair` revokes the pairing, so a prompt-injected agent could cut the phone off.
 
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -127,17 +130,30 @@ export const DEVIN_PLUGIN_ROOT = resolve(dirname(fileURLToPath(import.meta.url))
  *  the one quoted checkout path in its place (devin-install.mjs userSkill). */
 const PLUGIN_CACHE_GLOB = '"$HOME"/.local/share/devin/cli/plugins/cache/*nomo*/*/plugin';
 
-/** [dist script, args] of the SAFE skill commands: they only read state, restore the default, or
- *  start/finish pairing — the same set as Antigravity's SAFE_SKILL_COMMANDS. NOT here (they still ask
- *  the phone): pausing approvals, unpairing, printing the typed pairing code. */
+/** [dist script, args] of the SAFE skill commands: they only read state or restore the default — the
+ *  same set as Antigravity's SAFE_SKILL_COMMANDS. NOT here (they still ask the phone): pausing approvals,
+ *  pairing and pair wait (pairing again revokes the current pairing), reset, unpairing, printing the typed
+ *  pairing code. */
 const SAFE_DEVIN_SKILL_COMMANDS: ReadonlyArray<readonly [string, string]> = [
   ["status-cmd", "devin"],
   ["cc-permission", "status"],
   ["cc-permission", "on"],
-  ["reset", ""],
-  ["pair", ""],
-  ["pair", "wait --timeout 60"],
 ];
+
+/** Does `command` pair, unpair, reset or uninstall Nomo — the CLI (`nomo pair`, `bunx nomo-ai pair`,
+ *  `nomo-ai --uninstall`), a host's plugin uninstall, the hook shim, or a skill's dist script? Such a
+ *  command is never auto-approved, by an own-command match or a grant. Deliberately broad: a false
+ *  positive only means the phone asks. Pure. */
+const NOMO_LIFECYCLE = [
+  /\bnomo(?:-ai)?(?:@[\w.-]+)?['"]?\s+(?:pair|unpair|reset|uninstall)\b/,
+  /--uninstall\b/,
+  /\buninstall\b[^;&|\n]*nomo/,
+  /hook-shim\.sh['"]?\s+(?:pair|unpair|reset)\b/,
+  /\b(?:pair|unpair|reset)\.mjs\b/,
+];
+export function isNomoLifecycleCommand(command: string): boolean {
+  return NOMO_LIFECYCLE.some((re) => re.test(command));
+}
 
 /** The exact line a Devin skill runs for `script args`, searching `loop` (the plugin-cache glob, or a
  *  quoted checkout path), then the hook-shim fallback. Mirrors plugin/devin-skills byte for byte (a
@@ -189,6 +205,13 @@ const WRAPPERS = new Set([
   "xargs", "npx", "bunx", "pnpx", "nohup", "nice", "exec", "eval", "command", "builtin", "time", "watch", ".",
   "source", "python", "node", "bun", "deno", "ruby", "perl", "php", "lua", "osascript", "find", "awk", "gawk",
   "stdbuf", "setsid", "caffeinate", "arch", "chroot", "script", "ssh",
+  // Run code from their ARGUMENTS or project files (2026-11-14 audit L3): `git -c core.fsmonitor=…`,
+  // `make -f`, GNU `sed '1e …'`, `tar --to-command=…`, `rsync -e …`, `npm exec …`, `vim -c '!…'`, build
+  // scripts, `zip -TT`, sqlite's `.shell`. Nomo's own CLI too: `nomo` must not cover `nomo approvals off`.
+  "git", "make", "gmake", "sed", "gsed", "tar", "gtar", "bsdtar", "zip", "rsync", "scp", "sftp", "npm", "pnpm",
+  "yarn", "cargo", "go", "swift", "uv", "pip", "poetry", "brew", "vim", "vi", "nvim", "view", "ex", "emacs",
+  "less", "more", "man", "ed", "xcodebuild", "gradle", "mvn", "docker", "podman", "kubectl", "gdb", "lldb",
+  "tmux", "screen", "open", "launchctl", "crontab", "sqlite", "psql", "mysql", "nomo", "nomo-ai",
 ]);
 const isWrapper = (word: string): boolean =>
   WRAPPERS.has((word.split("/").pop() ?? "").toLowerCase().replace(/(?<=[a-z])[\d.]+$/, ""));
@@ -336,11 +359,13 @@ export async function runDevinApproval(raw: string, deps: DevinApprovalDeps = {}
     // crashed session left behind must not outlive the pairing (unpair/reset also delete them).
     const paired = Boolean(await (deps.hold?.loadConfigFn ?? loadConfig)());
     // An Always-allow grant answers at once — before the pause gate and before any phone card.
+    // Pairing, unpairing, reset or uninstalling Nomo always asks: no grant, no own-command match.
+    const autoOk = paired && !(cardTool === "shell" && isNomoLifecycleCommand(commandOf(toolInput)));
     const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
-    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput))) return APPROVE;
+    if (autoOk && cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput))) return APPROVE;
     // Nomo's OWN /nomo-* commands (status, approvals on, …) never become a phone card — only
     // byte-for-byte the skill's command.
-    if (paired && isOwnExec(cardTool, toolInput, deps.pluginRoot)) return APPROVE;
+    if (autoOk && isOwnExec(cardTool, toolInput, deps.pluginRoot)) return APPROVE;
     let line: string | undefined;
     let gone = false;
     const abandoned = () => (gone ||= (deps.abandoned ?? defaultAbandoned)());

@@ -19,9 +19,11 @@ export const SKILL_COMMANDS = {
   "pair-wait": ["pair.mjs", "wait --timeout 60"],
 };
 
-/** Run without a phone card: they only read state, restore the default, or start/finish pairing. NOT
- *  here (they still ask the phone): pausing approvals, unpairing, printing the typed pairing code. */
-export const SAFE_SKILL_COMMANDS = ["status", "status-verbose", "approvals-status", "approvals-on", "reset", "pair", "pair-wait"];
+/** Run without a phone card: they only read state or restore the default. NOT here (they still ask the
+ *  phone): pausing approvals, pairing and pair wait (on a paired computer pairing again revokes the
+ *  current pairing, so an injected agent could cut the phone off), reset, unpairing, printing the typed
+ *  pairing code. */
+export const SAFE_SKILL_COMMANDS = ["status", "status-verbose", "approvals-status", "approvals-on"];
 
 /** The exact command line for `key` under plugin root `root` (which the installer has already checked
  *  for quotes, `$`, backslashes, backticks and newlines). */
