@@ -169,6 +169,36 @@ var SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+var FREE_MODE_PATH = `${CC_DIR}/free-mode`;
+var FREE_MODE_TTL_MS = 15 * 60000;
+async function isFreeMode(now = Date.now(), path = FREE_MODE_PATH) {
+  return isFreeModeSync(now, path);
+}
+function isFreeModeSync(now = Date.now(), path = FREE_MODE_PATH) {
+  try {
+    const at = Number(readFileSync(path, "utf8").trim());
+    return Number.isFinite(at) && at > 0 && now - at >= 0 && now - at < FREE_MODE_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+async function markFreeMode(path = FREE_MODE_PATH, now = Date.now()) {
+  await atomicWrite(path, String(now)).catch(() => {});
+}
+async function clearFreeMode(path = FREE_MODE_PATH) {
+  await unlink(path).catch(() => {});
+}
+function isNotProResponse(status, body) {
+  return status === 403 && body.includes("entitlement suspended");
+}
+async function markFreeModeIfNotPro(res, path = FREE_MODE_PATH) {
+  if (res.status !== 403)
+    return;
+  try {
+    if (isNotProResponse(res.status, await res.text()))
+      await markFreeMode(path);
+  } catch {}
+}
 var BLOB_FIT_CHARS = 3008;
 function sealedBlobChars(plaintextBytes) {
   return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
@@ -234,6 +264,8 @@ function recordFullTextIsComplete(value) {
 var FULL_TEXT_POST_TIMEOUT_MS = 5000;
 async function postFullText(config, sessionId, what, content, fetchFn = fetch, trace, requestId) {
   if (content === undefined)
+    return;
+  if (isFreeModeSync())
     return;
   try {
     const blob = await encryptBlob(config.e2eKey, {
@@ -647,7 +679,8 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
   try {
     const blob = await encryptBlob(e2eKey, stash.blob);
     const envelope = { v: 2, sessionId: stash.sessionId, op: stash.op, prio: stash.prio, ts: now, blob };
-    for (let attempt = 0;attempt < attempts; attempt++) {
+    const free = await isFreeMode();
+    for (let attempt = 0;attempt < attempts && !free; attempt++) {
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
@@ -656,6 +689,9 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           signal: AbortSignal.timeout(fetchTimeoutMs)
         });
         if (res.ok)
+          break;
+        await markFreeModeIfNotPro(res);
+        if (await isFreeMode())
           break;
       } catch {}
       if (attempt < attempts - 1)
@@ -3799,22 +3835,23 @@ async function reconcileProvisional(config, hookPid) {
       traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
       return;
     }
-    let delivered = false;
+    let delivered = await isFreeMode();
     const started = Date.now();
     let status;
     let error;
-    try {
-      const res = await fetch(`${config.url}/v1/cc/event`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
-        body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
-        signal: AbortSignal.timeout(2000)
-      });
-      status = res.status;
-      delivered = res.ok;
-    } catch (e) {
-      error = e?.name === "TimeoutError" ? "timeout" : "network";
-    }
+    if (!delivered)
+      try {
+        const res = await fetch(`${config.url}/v1/cc/event`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
+          body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
+          signal: AbortSignal.timeout(2000)
+        });
+        status = res.status;
+        delivered = res.ok;
+      } catch (e) {
+        error = e?.name === "TimeoutError" ? "timeout" : "network";
+      }
     traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered)
       await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
@@ -3835,21 +3872,22 @@ async function readTrackedSessions() {
 }
 async function retireLineageSession(config, sessionId, agent, input, reason) {
   let delivered = false;
-  try {
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        "x-cc-approvals": await localApprovalsState()
-      },
-      body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
-      signal: AbortSignal.timeout(2000)
-    });
-    delivered = res.ok;
-  } catch {}
+  if (!await isFreeMode())
+    try {
+      const res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          "x-cc-approvals": await localApprovalsState()
+        },
+        body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
+        signal: AbortSignal.timeout(2000)
+      });
+      delivered = res.ok;
+    } catch {}
   await unlink2(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
   traceSession({
     event: "retire",
@@ -4147,6 +4185,11 @@ async function runHook(agent) {
     ensureWatchdog();
     if (agent === "codex")
       await reconcileProvisional(config, hookPid);
+    if (await isFreeMode()) {
+      if (plan.op === "done")
+        await markDoneDelivered(sessionId);
+      return;
+    }
     const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
     const postStarted = Date.now();
     let res;
@@ -4175,6 +4218,7 @@ async function runHook(agent) {
     }
     if (!res.ok)
       await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
+    await markFreeModeIfNotPro(res);
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();

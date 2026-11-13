@@ -135,6 +135,33 @@ var SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+var FREE_MODE_PATH = `${CC_DIR}/free-mode`;
+var FREE_MODE_TTL_MS = 15 * 60000;
+async function isFreeMode(now = Date.now(), path = FREE_MODE_PATH) {
+  return isFreeModeSync(now, path);
+}
+function isFreeModeSync(now = Date.now(), path = FREE_MODE_PATH) {
+  try {
+    const at = Number(readFileSync(path, "utf8").trim());
+    return Number.isFinite(at) && at > 0 && now - at >= 0 && now - at < FREE_MODE_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+async function markFreeMode(path = FREE_MODE_PATH, now = Date.now()) {
+  await atomicWrite(path, String(now)).catch(() => {});
+}
+function isNotProResponse(status, body) {
+  return status === 403 && body.includes("entitlement suspended");
+}
+async function markFreeModeIfNotPro(res, path = FREE_MODE_PATH) {
+  if (res.status !== 403)
+    return;
+  try {
+    if (isNotProResponse(res.status, await res.text()))
+      await markFreeMode(path);
+  } catch {}
+}
 var BLOB_FIT_CHARS = 3008;
 function sealedBlobChars(plaintextBytes) {
   return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
@@ -200,6 +227,8 @@ function recordFullTextIsComplete(value) {
 var FULL_TEXT_POST_TIMEOUT_MS = 5000;
 async function postFullText(config, sessionId, what, content, fetchFn = fetch, trace, requestId) {
   if (content === undefined)
+    return;
+  if (isFreeModeSync())
     return;
   try {
     const blob = await encryptBlob(config.e2eKey, {
@@ -2964,22 +2993,23 @@ async function reconcileProvisional(config, hookPid) {
       traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
       return;
     }
-    let delivered = false;
+    let delivered = await isFreeMode();
     const started = Date.now();
     let status;
     let error;
-    try {
-      const res = await fetch(`${config.url}/v1/cc/event`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
-        body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
-        signal: AbortSignal.timeout(2000)
-      });
-      status = res.status;
-      delivered = res.ok;
-    } catch (e) {
-      error = e?.name === "TimeoutError" ? "timeout" : "network";
-    }
+    if (!delivered)
+      try {
+        const res = await fetch(`${config.url}/v1/cc/event`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
+          body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
+          signal: AbortSignal.timeout(2000)
+        });
+        status = res.status;
+        delivered = res.ok;
+      } catch (e) {
+        error = e?.name === "TimeoutError" ? "timeout" : "network";
+      }
     traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered)
       await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
@@ -3000,21 +3030,22 @@ async function readTrackedSessions() {
 }
 async function retireLineageSession(config, sessionId, agent, input, reason) {
   let delivered = false;
-  try {
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        "x-cc-approvals": await localApprovalsState()
-      },
-      body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
-      signal: AbortSignal.timeout(2000)
-    });
-    delivered = res.ok;
-  } catch {}
+  if (!await isFreeMode())
+    try {
+      const res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          "x-cc-approvals": await localApprovalsState()
+        },
+        body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
+        signal: AbortSignal.timeout(2000)
+      });
+      delivered = res.ok;
+    } catch {}
   await unlink2(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
   traceSession({
     event: "retire",
@@ -3312,6 +3343,11 @@ async function runHook(agent) {
     ensureWatchdog();
     if (agent === "codex")
       await reconcileProvisional(config, hookPid);
+    if (await isFreeMode()) {
+      if (plan.op === "done")
+        await markDoneDelivered(sessionId);
+      return;
+    }
     const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
     const postStarted = Date.now();
     let res;
@@ -3340,6 +3376,7 @@ async function runHook(agent) {
     }
     if (!res.ok)
       await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
+    await markFreeModeIfNotPro(res);
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
@@ -4643,7 +4680,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
   try {
     if (agent === "claude" && cursorHostInvocation(undefined))
       return;
-    if (await flagExists(noHoldPath)) {
+    if (await flagExists(noHoldPath) || await isFreeMode(Date.now(), deps.freeModePath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
@@ -4773,6 +4810,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             hold = body.hold === true;
             if (typeof body.reason === "string")
               reason = body.reason;
+          } else {
+            await markFreeModeIfNotPro(res);
           }
           trace({
             event: "posted",
@@ -5586,6 +5625,8 @@ function frame(sessionId, entry, op, status, now, detail, prio = 0) {
   };
 }
 async function postOcEvent(config, envelope) {
+  if (await isFreeMode())
+    return true;
   try {
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
@@ -5599,6 +5640,7 @@ async function postOcEvent(config, envelope) {
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000)
     });
+    await markFreeModeIfNotPro(res);
     if (!res.ok)
       return false;
     await atomicWrite(LAST_SEND_PATH, String(Date.now())).catch(() => {});

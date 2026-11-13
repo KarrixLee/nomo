@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir9, readFile as readFile10, unlink as unlink6 } from "node:fs/promises";
+import { readdir as readdir10, readFile as readFile11, unlink as unlink6 } from "node:fs/promises";
 import { readFileSync as readFileSync3, statSync as statSync4, unlinkSync } from "node:fs";
 import { hostname as hostname6 } from "node:os";
 import { basename as basename8 } from "node:path";
@@ -168,6 +168,36 @@ var SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+var FREE_MODE_PATH = `${CC_DIR}/free-mode`;
+var FREE_MODE_TTL_MS = 15 * 60000;
+async function isFreeMode(now = Date.now(), path = FREE_MODE_PATH) {
+  return isFreeModeSync(now, path);
+}
+function isFreeModeSync(now = Date.now(), path = FREE_MODE_PATH) {
+  try {
+    const at = Number(readFileSync(path, "utf8").trim());
+    return Number.isFinite(at) && at > 0 && now - at >= 0 && now - at < FREE_MODE_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+async function markFreeMode(path = FREE_MODE_PATH, now = Date.now()) {
+  await atomicWrite(path, String(now)).catch(() => {});
+}
+async function clearFreeMode(path = FREE_MODE_PATH) {
+  await unlink(path).catch(() => {});
+}
+function isNotProResponse(status, body) {
+  return status === 403 && body.includes("entitlement suspended");
+}
+async function markFreeModeIfNotPro(res, path = FREE_MODE_PATH) {
+  if (res.status !== 403)
+    return;
+  try {
+    if (isNotProResponse(res.status, await res.text()))
+      await markFreeMode(path);
+  } catch {}
+}
 var BLOB_FIT_CHARS = 3008;
 function sealedBlobChars(plaintextBytes) {
   return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
@@ -233,6 +263,8 @@ function recordFullTextIsComplete(value) {
 var FULL_TEXT_POST_TIMEOUT_MS = 5000;
 async function postFullText(config, sessionId, what, content, fetchFn = fetch, trace, requestId) {
   if (content === undefined)
+    return;
+  if (isFreeModeSync())
     return;
   try {
     const blob = await encryptBlob(config.e2eKey, {
@@ -646,7 +678,8 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
   try {
     const blob = await encryptBlob(e2eKey, stash.blob);
     const envelope = { v: 2, sessionId: stash.sessionId, op: stash.op, prio: stash.prio, ts: now, blob };
-    for (let attempt = 0;attempt < attempts; attempt++) {
+    const free = await isFreeMode();
+    for (let attempt = 0;attempt < attempts && !free; attempt++) {
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
@@ -655,6 +688,9 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           signal: AbortSignal.timeout(fetchTimeoutMs)
         });
         if (res.ok)
+          break;
+        await markFreeModeIfNotPro(res);
+        if (await isFreeMode())
           break;
       } catch {}
       if (attempt < attempts - 1)
@@ -4109,22 +4145,23 @@ async function reconcileProvisional(config, hookPid) {
       traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
       return;
     }
-    let delivered = false;
+    let delivered = await isFreeMode();
     const started = Date.now();
     let status;
     let error;
-    try {
-      const res = await fetch(`${config.url}/v1/cc/event`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
-        body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
-        signal: AbortSignal.timeout(2000)
-      });
-      status = res.status;
-      delivered = res.ok;
-    } catch (e) {
-      error = e?.name === "TimeoutError" ? "timeout" : "network";
-    }
+    if (!delivered)
+      try {
+        const res = await fetch(`${config.url}/v1/cc/event`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
+          body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
+          signal: AbortSignal.timeout(2000)
+        });
+        status = res.status;
+        delivered = res.ok;
+      } catch (e) {
+        error = e?.name === "TimeoutError" ? "timeout" : "network";
+      }
     traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered)
       await unlink3(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
@@ -4145,21 +4182,22 @@ async function readTrackedSessions() {
 }
 async function retireLineageSession(config, sessionId, agent, input, reason) {
   let delivered = false;
-  try {
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        "x-cc-approvals": await localApprovalsState()
-      },
-      body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
-      signal: AbortSignal.timeout(2000)
-    });
-    delivered = res.ok;
-  } catch {}
+  if (!await isFreeMode())
+    try {
+      const res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          "x-cc-approvals": await localApprovalsState()
+        },
+        body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
+        signal: AbortSignal.timeout(2000)
+      });
+      delivered = res.ok;
+    } catch {}
   await unlink3(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
   traceSession({
     event: "retire",
@@ -4457,6 +4495,11 @@ async function runHook(agent) {
     ensureWatchdog();
     if (agent === "codex")
       await reconcileProvisional(config, hookPid);
+    if (await isFreeMode()) {
+      if (plan.op === "done")
+        await markDoneDelivered(sessionId);
+      return;
+    }
     const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
     const postStarted = Date.now();
     let res;
@@ -4485,6 +4528,7 @@ async function runHook(agent) {
     }
     if (!res.ok)
       await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
+    await markFreeModeIfNotPro(res);
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
@@ -4507,6 +4551,8 @@ async function runHook(agent) {
 
 // src/opencode/state.ts
 async function postOcEvent(config, envelope) {
+  if (await isFreeMode())
+    return true;
   try {
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
@@ -4520,6 +4566,7 @@ async function postOcEvent(config, envelope) {
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000)
     });
+    await markFreeModeIfNotPro(res);
     if (!res.ok)
       return false;
     await atomicWrite(LAST_SEND_PATH, String(Date.now())).catch(() => {});
@@ -8337,7 +8384,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
   try {
     if (agent === "claude" && cursorHostInvocation(undefined))
       return;
-    if (await flagExists(noHoldPath)) {
+    if (await flagExists(noHoldPath) || await isFreeMode(Date.now(), deps.freeModePath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
@@ -8467,6 +8514,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             hold = body.hold === true;
             if (typeof body.reason === "string")
               reason = body.reason;
+          } else {
+            await markFreeModeIfNotPro(res);
           }
           trace({
             event: "posted",
@@ -8956,7 +9005,7 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
       encryptBlob(deps.config.e2eKey, fallback),
       (deps.localApprovalsStateFn ?? localApprovalsState)()
     ]);
-    if (approvals === "off")
+    if (approvals === "off" || await isFreeMode())
       return "unsupported";
     if (signal.aborted)
       return "resolved-elsewhere";
@@ -9017,8 +9066,10 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
         await markAttentionStalled();
       return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
-    if (!response.ok)
+    if (!response.ok) {
+      await markFreeModeIfNotPro(response);
       return signal.aborted ? "resolved-elsewhere" : "transport-error";
+    }
     const created = await parseJson(response);
     if (!created) {
       report(deps, new Error("Unparseable relay response to the decision hold POST"), "Relay POST");
@@ -9951,6 +10002,93 @@ function startActivityLoop(load = loadConfig, cycle = runActivityCycle) {
   kick();
   return () => timers.forEach(clearInterval);
 }
+
+// src/core/presence.ts
+import { readdir as readdir9, readFile as readFile10 } from "node:fs/promises";
+var PRESENCE_EVERY_MS = 60000;
+var MAX_CODING = 8;
+function buildPresence(records) {
+  const coding = new Set;
+  let waiting = false;
+  for (const r of records) {
+    if (r.op === "done" || r.op === "end")
+      continue;
+    if (r.lastEvent !== "working" && r.lastEvent !== "needsAttention")
+      continue;
+    coding.add(r.agent ?? "claude");
+    if (r.lastEvent === "needsAttention")
+      waiting = true;
+  }
+  return { coding: [...coding].slice(0, MAX_CODING), waiting };
+}
+async function readRecords(dir) {
+  const files = await readdir9(dir).catch(() => []);
+  const out = [];
+  for (const f of files) {
+    if (!f.endsWith(".json"))
+      continue;
+    try {
+      out.push(JSON.parse(await readFile10(`${dir}/${f}`, "utf8")));
+    } catch {}
+  }
+  return out;
+}
+async function sendPresence(config, fetchFn = fetch, paths = {}) {
+  const freeModePath = paths.freeModePath ?? FREE_MODE_PATH;
+  try {
+    const presence = buildPresence(await readRecords(paths.sessionsDir ?? SESSIONS_DIR));
+    const res = await fetchFn(`${config.url}/v1/cc/presence`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-cc-pairing": config.pairingId,
+        "x-cc-auth": config.pcSecret,
+        "x-cc-version": PLUGIN_VERSION
+      },
+      body: JSON.stringify({ coding: presence.coding, waiting: presence.waiting }),
+      signal: AbortSignal.timeout(5000)
+    });
+    const text = await res.text().catch(() => "");
+    let tier;
+    if (res.ok) {
+      try {
+        tier = JSON.parse(text).tier;
+      } catch {}
+    } else if (isNotProResponse(res.status, text)) {
+      tier = "free";
+    }
+    if (tier === "free") {
+      await markFreeMode(freeModePath);
+      return "free";
+    }
+    if (tier === "pro") {
+      await clearFreeMode(freeModePath);
+      return "pro";
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+function startPresenceLoop(load = loadConfig) {
+  let busy = false;
+  const run = async () => {
+    if (busy)
+      return;
+    busy = true;
+    try {
+      const config = await load();
+      if (config)
+        await sendPresence(config);
+    } catch {} finally {
+      busy = false;
+    }
+  };
+  const timer = setInterval(() => void run(), PRESENCE_EVERY_MS);
+  timer.unref?.();
+  run();
+  return () => clearInterval(timer);
+}
 // src/entries/cc-watchdog.ts
 var POLL_MS = 5000;
 var PAIRING_TTL_MS = 600000;
@@ -9974,7 +10112,7 @@ function resetDoneAttemptMemory() {
 }
 async function readRecordAt(path) {
   try {
-    return JSON.parse(await readFile10(path, "utf8"));
+    return JSON.parse(await readFile11(path, "utf8"));
   } catch {
     return null;
   }
@@ -10563,6 +10701,8 @@ var activeLanListener;
 var lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
 var POST_TIMEOUT_MS2 = 2000;
 async function postEvent(config, body, opts = {}) {
+  if (await isFreeMode(Date.now(), opts.freeModePath))
+    return "delivered";
   const started = Date.now();
   const detail = opts.detail;
   const lanHint = await lanHintPublisher.take(config);
@@ -10579,6 +10719,8 @@ async function postEvent(config, body, opts = {}) {
       detail.ms = Date.now() - started;
     }
     const outcome = postOutcomeForStatus(res.status);
+    if (outcome === "failed")
+      await markFreeModeIfNotPro(res, opts.freeModePath);
     if (lanHint)
       lanHintPublisher.settle(outcome === "delivered");
     if (outcome === "delivered") {
@@ -10923,13 +11065,13 @@ function machineName(config) {
 }
 async function readAllRecordEntries() {
   try {
-    const files = await readdir9(SESSIONS_DIR);
+    const files = await readdir10(SESSIONS_DIR);
     const out = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
         continue;
       try {
-        out.push({ sessionId: basename8(f, ".json"), rec: JSON.parse(await readFile10(`${SESSIONS_DIR}/${f}`, "utf8")) });
+        out.push({ sessionId: basename8(f, ".json"), rec: JSON.parse(await readFile11(`${SESSIONS_DIR}/${f}`, "utf8")) });
       } catch {}
     }
     return out;
@@ -11291,7 +11433,7 @@ async function antigravitySettleTick(config, deps = {}) {
   const dir = deps.dir ?? SESSIONS_DIR;
   let files = [];
   try {
-    files = await readdir9(dir);
+    files = await readdir10(dir);
   } catch {
     return 0;
   }
@@ -11931,7 +12073,7 @@ var waitingBeatAt;
 async function sweep(config, deps = {}) {
   let files;
   try {
-    files = await readdir9(SESSIONS_DIR);
+    files = await readdir10(SESSIONS_DIR);
   } catch {
     return { revoked: false, remaining: 0, delivered: false };
   }
@@ -11948,7 +12090,7 @@ async function sweep(config, deps = {}) {
     const sessionId = basename8(file, ".json");
     let record = null;
     try {
-      record = JSON.parse(await readFile10(path, "utf8"));
+      record = JSON.parse(await readFile11(path, "utf8"));
     } catch {
       record = null;
     }
@@ -12421,6 +12563,7 @@ async function run() {
   }, ANTIGRAVITY_SETTLE_TICK_MS);
   settleTimer.unref?.();
   const stopActivity = startActivityLoop();
+  const stopPresence = startPresenceLoop();
   try {
     while (true) {
       if (!enforceWatchdogOwnership(shutdown))
@@ -12429,7 +12572,7 @@ async function run() {
       tickConfig = config;
       await bridges.sync(config);
       setCodexBridgeDown(bridges.daemonDown);
-      lan.sync(config);
+      lan.sync(config && !await isFreeMode() ? config : null);
       if (config) {
         await reconcileProvisionalsSweep(config);
         await discoverLiveSessions(config);
@@ -12481,6 +12624,7 @@ async function run() {
   } finally {
     clearInterval(settleTimer);
     stopActivity();
+    stopPresence();
     shutdown();
     activeBridgeShutdown = undefined;
     activeCodexInterrupt = undefined;
@@ -12587,6 +12731,7 @@ export {
   pendingDoneSettleWrite,
   pendingPairingExpired,
   planPickerPendingExpired,
+  postEvent,
   postOutcomeForStatus,
   provisionalsCoveredByReal,
   pruneStaleDecisionHolds,
