@@ -27,7 +27,7 @@ import { antigravityAdapter, claudeAdapter, codexAdapter, cursorAdapter, devinAd
 import { devinInstallerActive, devinPluginInstalled, devinPluginLockPath } from "../core/devin";
 import {
   AgentKind, ANTIGRAVITY_HOOK_MARKER, antigravityConfigDir, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, CURSOR_HOOK_MARKER, cursorHome, DEVIN_HOOK_MARKER, devinConfigDir, flagExists,
-  LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
+  isFreeMode, LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
   opencodeStubPaths, opencodeStubTarget, PLUGIN_VERSION, SESSION_TRACE_PATH, SESSIONS_DIR,
   WATCHDOG_PID_PATH,
 } from "../core/shared";
@@ -97,6 +97,8 @@ export interface StatusDeps {
    *  prompts stay in the terminal and never reach the phone — the single commonest reason a user
    *  reports "my phone never asked me". Injected so a test can point it at a temp file. */
   noHoldPath?: string;
+  /** The free-mode marker (`<CC_DIR>/free-mode`); tests point it at a temp file. */
+  freeModePath?: string;
   /** The installer's short-command record (see terminalCommand); tests point it at a temp file. */
   shortCommandPath?: string;
   /** Cursor's user-level hooks.json (defaults to `<cursorHome>/hooks.json`), its transcripts dir and
@@ -576,6 +578,9 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
       print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));
       print(cont(audience ? `→ run ${ui.approvalsOn}` : `→ run your agent's approvals command, e.g. ${ui.approvalsOn}`));
     }
+    // A free (not Pro) pairing sends only presence and the activity summary — say so, or the stale
+    // "last event sent" above reads like a fault.
+    if (await isFreeMode(now(), deps.freeModePath)) print(row("Free mode", "on — live sessions need Nomo Pro"));
   }
 
   // ── per-agent gathering ───────────────────────────────────────────────────────────────────────

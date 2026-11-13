@@ -18,7 +18,7 @@ import { encryptBlob, decryptBlob } from "./crypto";
 import { createLanAnswerStore, createLanListener } from "./lan-listener";
 import type { LanAnswerStore, LanListener } from "./lan-listener";
 import type { Config } from "./shared";
-import { folderIdentity, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS, RECORD_FULL_TEXT_TRUNCATION_MARKER } from "./shared";
+import { CC_DIR, folderIdentity, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS, RECORD_FULL_TEXT_TRUNCATION_MARKER } from "./shared";
 import { startCodexRemoteInput } from "./codex-remote-input";
 
 // ---- summary builder (pure) ---------------------------------------------------------------
@@ -3265,12 +3265,14 @@ describe("runPermissionHook — LAN loopback answer poll", () => {
   });
 });
 
+// CC_DIR is the run's temp dir under the test preload; the production default ($HOME/.config/cc-status)
+// is proven by shared.test.ts's isolation test, whose no-preload control reads it.
 test("NO_HOLD_PATH sits under the cc-status config dir", () => {
-  expect(NO_HOLD_PATH.endsWith("/.config/cc-status/no-hold")).toBe(true);
+  expect(NO_HOLD_PATH).toBe(`${CC_DIR}/no-hold`);
 });
 
 test("TRACE_PATH sits under the cc-status config dir", () => {
-  expect(TRACE_PATH.endsWith("/.config/cc-status/permission-trace.log")).toBe(true);
+  expect(TRACE_PATH).toBe(`${CC_DIR}/permission-trace.log`);
 });
 
 // ---- NOM-44 phase 4: the unabridged permission detail teed onto the session record --------------

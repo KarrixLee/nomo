@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
-  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER, postFullText,
+  BLOB_FIT_CHARS, CC_DIR, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER, postFullText,
   decisionHoldFileName, interruptFlagFileName, readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt, writeInterruptFlagAt,
 } from "../core/shared";
 import {
@@ -2356,7 +2356,7 @@ await child.exited;
   }, 20000);
 
   test("SESSION_TRACE_PATH sits next to config and the permission trace", () => {
-    expect(SESSION_TRACE_PATH.endsWith("/.config/cc-status/session-trace.log")).toBe(true);
+    expect(SESSION_TRACE_PATH).toBe(`${CC_DIR}/session-trace.log`); // CC_DIR = the preload's temp dir in tests
   });
 });
 
@@ -2692,6 +2692,7 @@ describe("statusCmd — hooks-not-firing warning", () => {
     codexInstalled?: boolean;
     codexSessionAgeMs?: number; claudeSessionAgeMs?: number;
     codexStampAgeMs?: number; claudeStampAgeMs?: number;
+    freeModeAgeMs?: number;
   }): Promise<string[]> {
     const dir = await mkdtemp(join(tmpdir(), "cc-hooksniff-"));
     try {
@@ -2727,6 +2728,7 @@ describe("statusCmd — hooks-not-firing warning", () => {
       }
       if (opts.codexStampAgeMs !== undefined) await writeFile(lastHookCodexPath, String(NOW - opts.codexStampAgeMs));
       if (opts.claudeStampAgeMs !== undefined) await writeFile(lastHookClaudePath, String(NOW - opts.claudeStampAgeMs));
+      if (opts.freeModeAgeMs !== undefined) await writeFile(join(dir, "free-mode"), String(NOW - opts.freeModeAgeMs));
 
       const lines: string[] = [];
       await statusCmd({
@@ -2742,6 +2744,7 @@ describe("statusCmd — hooks-not-firing warning", () => {
         lastHookOpencodePath: join(dir, "last-hook-opencode"),
         opencodeStubPaths: [join(dir, "absent-stub.js")],
         noHoldPath: join(dir, "no-hold"),
+        freeModePath: join(dir, "free-mode"),
         codexAppServerAvailable: async () => false,
         isAlive: () => false,
         now: () => NOW,
@@ -2758,6 +2761,13 @@ describe("statusCmd — hooks-not-firing warning", () => {
     const name = agent === "Codex" ? "Codex" : "Claude Code";
     return lines.some((l) => l.includes(`! ${name} was active`) && l.includes("Nomo never heard about it"));
   };
+
+  test("free mode: a fresh marker prints the Free mode line; absent or expired prints nothing", async () => {
+    const freeLine = (lines: string[]) => lines.find((l) => l.startsWith("Free mode"));
+    expect(freeLine(await run({ freeModeAgeMs: 2 * MIN }))).toBe(`${"Free mode".padEnd(14)}on — live sessions need Nomo Pro`);
+    expect(freeLine(await run({}))).toBeUndefined();
+    expect(freeLine(await run({ freeModeAgeMs: 16 * MIN }))).toBeUndefined();
+  });
 
   test("recent codex rollout + NO stamp → codex hooks-not-firing warning with the #16430/#30835 hint", async () => {
     const lines = await run({ codexSessionAgeMs: 3 * MIN });

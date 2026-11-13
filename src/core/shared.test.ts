@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { decryptBlob } from "./crypto";
@@ -16,7 +16,7 @@ import {
   stampPermissionDetailFullAt, watchdogBuildStamp,
   watchdogHolderIsLive,
   INTERRUPT_FLAG_MAX_AGE_MS, clearInterruptFlagAt, interruptFlagFileName, interruptFlagSetAt, writeInterruptFlagAt,
-  clearFreeMode, FREE_MODE_TTL_MS, isFreeMode, isNotProResponse, markFreeMode, markFreeModeIfNotPro,
+  clearFreeMode, FREE_MODE_PATH, FREE_MODE_TTL_MS, isFreeMode, isNotProResponse, markFreeMode, markFreeModeIfNotPro,
 } from "./shared";
 
 describe("codexCompanionBrokerEvidence (structural companion-session proof)", () => {
@@ -1176,6 +1176,45 @@ describe("free mode (2.5.0 free pairing)", () => {
       expect(await isFreeMode(Date.now(), path)).toBe(true);
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("free mode: postFullText and test isolation", () => {
+  test("postFullText routes its response through markFreeModeIfNotPro", async () => {
+    const fn = (async () => new Response('{"error":"entitlement suspended"}', { status: 403 })) as unknown as typeof fetch;
+    const config = { url: "https://w.example", pairingId: "p1", pcSecret: "s1", e2eKey: new Uint8Array(32).fill(7) };
+    try {
+      expect(await isFreeMode()).toBe(false);
+      await postFullText(config, "sess-1", "plan", "the whole thing", fn);
+      expect(await isFreeMode()).toBe(true); // default path = the preload's temp CC dir
+    } finally {
+      await clearFreeMode(); // the temp CC dir is shared by the whole run: leave it clean
+    }
+  });
+
+  // The owner tests free pairings on the same Mac the suite runs on. A fresh marker in the real
+  // ~/.config/cc-status must never reach a default-path call in a test.
+  test("a marker in the real home dir doesn't affect a default-path call", async () => {
+    expect(process.env.NOMO_CC_DIR).toBeTruthy();
+    expect(FREE_MODE_PATH).toBe(`${process.env.NOMO_CC_DIR}/free-mode`);
+    expect(FREE_MODE_PATH.startsWith(join(homedir(), ".config"))).toBe(false);
+    // A stand-in "real home" holding a fresh marker (never the developer's actual home).
+    const home = await mkdtemp(join(tmpdir(), "fake-home-"));
+    try {
+      await mkdir(join(home, ".config", "cc-status"), { recursive: true });
+      await writeFile(join(home, ".config", "cc-status", "free-mode"), String(Date.now()));
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (v !== undefined && k !== "NOMO_CC_DIR") env[k] = v;
+      env.HOME = home;
+      const shared = join(import.meta.dir, "shared.ts");
+      const script = `import { isFreeMode } from ${JSON.stringify(shared)}; console.log(await isFreeMode());`;
+      const preload = join(import.meta.dir, "..", "test", "preload.ts");
+      const run = (args: string[]) => Bun.spawnSync({ cmd: ["bun", ...args, "-e", script], env }).stdout.toString().trim();
+      expect(run([])).toBe("true"); // CONTROL: without isolation the home marker is read
+      expect(run(["--preload", preload])).toBe("false");
+    } finally {
+      await rm(home, { recursive: true, force: true });
     }
   });
 });
