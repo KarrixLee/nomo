@@ -177,6 +177,14 @@ function isFreeModeSync(now = Date.now(), path = FREE_MODE_PATH) {
     return false;
   }
 }
+function lanBlockedByFreeMode(path = FREE_MODE_PATH) {
+  try {
+    statSync(path);
+    return true;
+  } catch (e) {
+    return e?.code !== "ENOENT";
+  }
+}
 async function markFreeMode(path = FREE_MODE_PATH, now = Date.now()) {
   await atomicWrite(path, String(now)).catch(() => {});
 }
@@ -186,7 +194,9 @@ async function clearFreeMode(path = FREE_MODE_PATH) {
 function isNotProResponse(status, body) {
   return status === 403 && body.includes("entitlement suspended");
 }
-async function markFreeModeIfNotPro(res, path = FREE_MODE_PATH) {
+async function applyTierFromResponse(res, path = FREE_MODE_PATH) {
+  if (res.ok)
+    return clearFreeMode(path);
   if (res.status !== 403)
     return;
   try {
@@ -282,7 +292,7 @@ async function postFullText(config, sessionId, what, content, fetchFn = fetch, t
       signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS)
     });
     trace?.({ event: "full-text", what, chars: content.length, status: res.status });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
   } catch (e) {
     trace?.({ event: "full-text", what, chars: content.length, status: 0, error: e?.name ?? "Error" });
   }
@@ -684,9 +694,9 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs)
         });
+        await applyTierFromResponse(res);
         if (res.ok)
           break;
-        await markFreeModeIfNotPro(res);
         if (await isFreeMode())
           break;
       } catch {}

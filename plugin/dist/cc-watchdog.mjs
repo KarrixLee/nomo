@@ -181,6 +181,14 @@ function isFreeModeSync(now = Date.now(), path = FREE_MODE_PATH) {
     return false;
   }
 }
+function lanBlockedByFreeMode(path = FREE_MODE_PATH) {
+  try {
+    statSync(path);
+    return true;
+  } catch (e) {
+    return e?.code !== "ENOENT";
+  }
+}
 async function markFreeMode(path = FREE_MODE_PATH, now = Date.now()) {
   await atomicWrite(path, String(now)).catch(() => {});
 }
@@ -190,7 +198,9 @@ async function clearFreeMode(path = FREE_MODE_PATH) {
 function isNotProResponse(status, body) {
   return status === 403 && body.includes("entitlement suspended");
 }
-async function markFreeModeIfNotPro(res, path = FREE_MODE_PATH) {
+async function applyTierFromResponse(res, path = FREE_MODE_PATH) {
+  if (res.ok)
+    return clearFreeMode(path);
   if (res.status !== 403)
     return;
   try {
@@ -286,7 +296,7 @@ async function postFullText(config, sessionId, what, content, fetchFn = fetch, t
       signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS)
     });
     trace?.({ event: "full-text", what, chars: content.length, status: res.status });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
   } catch (e) {
     trace?.({ event: "full-text", what, chars: content.length, status: 0, error: e?.name ?? "Error" });
   }
@@ -688,9 +698,9 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs)
         });
+        await applyTierFromResponse(res);
         if (res.ok)
           break;
-        await markFreeModeIfNotPro(res);
         if (await isFreeMode())
           break;
       } catch {}
@@ -4529,7 +4539,7 @@ async function runHook(agent) {
     }
     if (!res.ok)
       await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
@@ -4544,6 +4554,8 @@ async function runHook(agent) {
       }
     } else {
       await resetGoneStrikes();
+      if (res.status === 409 && plan.op !== "done" && plan.op !== "end")
+        await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob);
     }
   } catch {} finally {
     await fullUpload;
@@ -4567,7 +4579,7 @@ async function postOcEvent(config, envelope) {
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000)
     });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
     if (!res.ok)
       return false;
     await atomicWrite(LAST_SEND_PATH, String(Date.now())).catch(() => {});
@@ -8515,9 +8527,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             hold = body.hold === true;
             if (typeof body.reason === "string")
               reason = body.reason;
-          } else {
-            await markFreeModeIfNotPro(res);
           }
+          await applyTierFromResponse(res);
           trace({
             event: "posted",
             requestId,
@@ -9067,8 +9078,8 @@ async function runRemoteInput(request, requestId, signal, deps, onHoldCreated) {
         await markAttentionStalled();
       return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
+    await applyTierFromResponse(response);
     if (!response.ok) {
-      await markFreeModeIfNotPro(response);
       return signal.aborted ? "resolved-elsewhere" : "transport-error";
     }
     const created = await parseJson(response);
@@ -10700,6 +10711,9 @@ function watchdogEventHeaders(config, approvals) {
 }
 var activeLanListener;
 var lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
+function lanConfigFor(config, freeModePath) {
+  return config && !lanBlockedByFreeMode(freeModePath) ? config : null;
+}
 var POST_TIMEOUT_MS2 = 2000;
 async function postEvent(config, body, opts = {}) {
   if (await isFreeMode(Date.now(), opts.freeModePath))
@@ -10720,8 +10734,7 @@ async function postEvent(config, body, opts = {}) {
       detail.ms = Date.now() - started;
     }
     const outcome = postOutcomeForStatus(res.status);
-    if (outcome === "failed")
-      await markFreeModeIfNotPro(res, opts.freeModePath);
+    await applyTierFromResponse(res, opts.freeModePath);
     if (lanHint)
       lanHintPublisher.settle(outcome === "delivered");
     if (outcome === "delivered") {
@@ -12573,7 +12586,7 @@ async function run() {
       tickConfig = config;
       await bridges.sync(config);
       setCodexBridgeDown(bridges.daemonDown);
-      lan.sync(config && !await isFreeMode() ? config : null);
+      lan.sync(lanConfigFor(config));
       if (config) {
         await reconcileProvisionalsSweep(config);
         await discoverLiveSessions(config);
@@ -12724,6 +12737,7 @@ export {
   isRetireEligible,
   isRightfulWatchdogOwner,
   isWaitingSession,
+  lanConfigFor,
   lastTurnLine,
   noteDoneAttempt,
   noteResend,

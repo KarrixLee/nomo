@@ -184,6 +184,14 @@ function isFreeModeSync(now = Date.now(), path = FREE_MODE_PATH) {
     return false;
   }
 }
+function lanBlockedByFreeMode(path = FREE_MODE_PATH) {
+  try {
+    statSync(path);
+    return true;
+  } catch (e) {
+    return e?.code !== "ENOENT";
+  }
+}
 async function markFreeMode(path = FREE_MODE_PATH, now = Date.now()) {
   await atomicWrite(path, String(now)).catch(() => {});
 }
@@ -193,7 +201,9 @@ async function clearFreeMode(path = FREE_MODE_PATH) {
 function isNotProResponse(status, body) {
   return status === 403 && body.includes("entitlement suspended");
 }
-async function markFreeModeIfNotPro(res, path = FREE_MODE_PATH) {
+async function applyTierFromResponse(res, path = FREE_MODE_PATH) {
+  if (res.ok)
+    return clearFreeMode(path);
   if (res.status !== 403)
     return;
   try {
@@ -289,7 +299,7 @@ async function postFullText(config, sessionId, what, content, fetchFn = fetch, t
       signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS)
     });
     trace?.({ event: "full-text", what, chars: content.length, status: res.status });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
   } catch (e) {
     trace?.({ event: "full-text", what, chars: content.length, status: 0, error: e?.name ?? "Error" });
   }
@@ -691,9 +701,9 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs)
         });
+        await applyTierFromResponse(res);
         if (res.ok)
           break;
-        await markFreeModeIfNotPro(res);
         if (await isFreeMode())
           break;
       } catch {}
@@ -4231,7 +4241,7 @@ async function runHook(agent) {
     }
     if (!res.ok)
       await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
@@ -4246,6 +4256,8 @@ async function runHook(agent) {
       }
     } else {
       await resetGoneStrikes();
+      if (res.status === 409 && plan.op !== "done" && plan.op !== "end")
+        await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob);
     }
   } catch {} finally {
     await fullUpload;
@@ -4269,7 +4281,7 @@ async function postOcEvent(config, envelope) {
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000)
     });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
     if (!res.ok)
       return false;
     await atomicWrite(LAST_SEND_PATH, String(Date.now())).catch(() => {});
@@ -6149,9 +6161,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             hold = body.hold === true;
             if (typeof body.reason === "string")
               reason = body.reason;
-          } else {
-            await markFreeModeIfNotPro(res);
           }
+          await applyTierFromResponse(res);
           trace({
             event: "posted",
             requestId,
@@ -6467,11 +6478,18 @@ var PLUGIN_CACHE_GLOB = '"$HOME"/.local/share/devin/cli/plugins/cache/*nomo*/*/p
 var SAFE_DEVIN_SKILL_COMMANDS = [
   ["status-cmd", "devin"],
   ["cc-permission", "status"],
-  ["cc-permission", "on"],
-  ["reset", ""],
-  ["pair", ""],
-  ["pair", "wait --timeout 60"]
+  ["cc-permission", "on"]
 ];
+var NOMO_LIFECYCLE = [
+  /\bnomo(?:-ai)?(?:@[\w.-]+)?['"]?\s+(?:pair|unpair|reset|uninstall)\b/,
+  /--uninstall\b/,
+  /\buninstall\b[^;&|\n]*nomo/,
+  /hook-shim\.sh['"]?\s+(?:pair|unpair|reset)\b/,
+  /\b(?:pair|unpair|reset)\.mjs\b/
+];
+function isNomoLifecycleCommand(command) {
+  return NOMO_LIFECYCLE.some((re) => re.test(command));
+}
 function devinSkillCommand(loop, script, args, reinstall) {
   const a = args ? ` ${args}` : "";
   return `/bin/sh -c 'NOMOS="$HOME/.config/cc-status/hook-shim.sh"; for NOMOR in ${loop}; do [ -x "$NOMOR/scripts/run.sh" ] && [ -f "$NOMOR/dist/${script}.mjs" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/${script}.mjs"${a}; done; [ -x "$NOMOS" ] && exec "$NOMOS" ${script}${a}; echo "Nomo could not find its installed files - ${reinstall}"; exit 1'`;
@@ -6535,7 +6553,57 @@ var WRAPPERS = new Set([
   "arch",
   "chroot",
   "script",
-  "ssh"
+  "ssh",
+  "git",
+  "make",
+  "gmake",
+  "sed",
+  "gsed",
+  "tar",
+  "gtar",
+  "bsdtar",
+  "zip",
+  "rsync",
+  "scp",
+  "sftp",
+  "npm",
+  "pnpm",
+  "yarn",
+  "cargo",
+  "go",
+  "swift",
+  "uv",
+  "pip",
+  "poetry",
+  "brew",
+  "vim",
+  "vi",
+  "nvim",
+  "view",
+  "ex",
+  "emacs",
+  "less",
+  "more",
+  "man",
+  "ed",
+  "xcodebuild",
+  "gradle",
+  "mvn",
+  "docker",
+  "podman",
+  "kubectl",
+  "gdb",
+  "lldb",
+  "tmux",
+  "screen",
+  "open",
+  "launchctl",
+  "crontab",
+  "sqlite",
+  "psql",
+  "mysql",
+  "nomo",
+  "nomo-ai"
 ]);
 var isWrapper = (word) => WRAPPERS.has((word.split("/").pop() ?? "").toLowerCase().replace(/(?<=[a-z])[\d.]+$/, ""));
 function devinGrantFor(cardTool, toolInput) {
@@ -6640,10 +6708,11 @@ async function runDevinApproval(raw, deps = {}) {
       return "";
     const { session_id: sessionId, tool_name: cardTool, tool_input: toolInput } = JSON.parse(stdin);
     const paired = Boolean(await (deps.hold?.loadConfigFn ?? loadConfig)());
+    const autoOk = paired && !(cardTool === "shell" && isNomoLifecycleCommand(commandOf(toolInput)));
     const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
-    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
+    if (autoOk && cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
       return APPROVE;
-    if (paired && isOwnExec(cardTool, toolInput, deps.pluginRoot))
+    if (autoOk && isOwnExec(cardTool, toolInput, deps.pluginRoot))
       return APPROVE;
     let line;
     let gone = false;

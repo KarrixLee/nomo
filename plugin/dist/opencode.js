@@ -151,10 +151,15 @@ function isFreeModeSync(now = Date.now(), path = FREE_MODE_PATH) {
 async function markFreeMode(path = FREE_MODE_PATH, now = Date.now()) {
   await atomicWrite(path, String(now)).catch(() => {});
 }
+async function clearFreeMode(path = FREE_MODE_PATH) {
+  await unlink(path).catch(() => {});
+}
 function isNotProResponse(status, body) {
   return status === 403 && body.includes("entitlement suspended");
 }
-async function markFreeModeIfNotPro(res, path = FREE_MODE_PATH) {
+async function applyTierFromResponse(res, path = FREE_MODE_PATH) {
+  if (res.ok)
+    return clearFreeMode(path);
   if (res.status !== 403)
     return;
   try {
@@ -250,7 +255,7 @@ async function postFullText(config, sessionId, what, content, fetchFn = fetch, t
       signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS)
     });
     trace?.({ event: "full-text", what, chars: content.length, status: res.status });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
   } catch (e) {
     trace?.({ event: "full-text", what, chars: content.length, status: 0, error: e?.name ?? "Error" });
   }
@@ -3377,7 +3382,7 @@ async function runHook(agent) {
     }
     if (!res.ok)
       await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
@@ -3392,6 +3397,8 @@ async function runHook(agent) {
       }
     } else {
       await resetGoneStrikes();
+      if (res.status === 409 && plan.op !== "done" && plan.op !== "end")
+        await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob);
     }
   } catch {} finally {
     await fullUpload;
@@ -4811,9 +4818,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             hold = body.hold === true;
             if (typeof body.reason === "string")
               reason = body.reason;
-          } else {
-            await markFreeModeIfNotPro(res);
           }
+          await applyTierFromResponse(res);
           trace({
             event: "posted",
             requestId,
@@ -5641,7 +5647,7 @@ async function postOcEvent(config, envelope) {
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000)
     });
-    await markFreeModeIfNotPro(res);
+    await applyTierFromResponse(res);
     if (!res.ok)
       return false;
     await atomicWrite(LAST_SEND_PATH, String(Date.now())).catch(() => {});
