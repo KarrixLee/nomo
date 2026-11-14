@@ -6481,14 +6481,17 @@ var SAFE_DEVIN_SKILL_COMMANDS = [
   ["cc-permission", "on"]
 ];
 var NOMO_LIFECYCLE = [
-  /\bnomo(?:-ai)?(?:@[\w.-]+)?['"]?\s+(?:pair|unpair|reset|uninstall)\b/,
+  /\bnomo(?:-ai)?(?:@[\w.-]+)?\s+(?:pair|unpair|reset|uninstall)\b/,
   /--uninstall\b/,
-  /\buninstall\b[^;&|\n]*nomo/,
-  /hook-shim\.sh['"]?\s+(?:pair|unpair|reset)\b/,
-  /\b(?:pair|unpair|reset)\.mjs\b/
+  /\b(?:uninstall|disable|remove)\b[^;&|\n]*nomo/,
+  /hook-shim\.sh\s+(?:pair|unpair|reset)\b/,
+  /\b(?:pair|unpair|reset)\.mjs\b/,
+  /cc-status/,
+  /\/\.nomo(?:\/|\s|$)/
 ];
 function isNomoLifecycleCommand(command) {
-  return NOMO_LIFECYCLE.some((re) => re.test(command));
+  const c = command.replace(/['"\\]/g, "").toLowerCase();
+  return NOMO_LIFECYCLE.some((re) => re.test(c));
 }
 function devinSkillCommand(loop, script, args, reinstall) {
   const a = args ? ` ${args}` : "";
@@ -6506,112 +6509,31 @@ function isOwnExec(cardTool, toolInput, root) {
 }
 var PLAIN_COMMAND = /^[A-Za-z0-9_./-]+( [^;&|`$<>(){}\n]*)?$/;
 var commandOf = (toolInput) => typeof toolInput.command === "string" ? toolInput.command : "";
-var WRAPPERS = new Set([
-  "bash",
-  "sh",
-  "zsh",
-  "fish",
-  "dash",
-  "ksh",
-  "csh",
-  "tcsh",
-  "pwsh",
-  "env",
-  "sudo",
-  "doas",
-  "su",
-  "timeout",
-  "xargs",
-  "npx",
-  "bunx",
-  "pnpx",
-  "nohup",
-  "nice",
-  "exec",
-  "eval",
-  "command",
-  "builtin",
-  "time",
-  "watch",
-  ".",
-  "source",
-  "python",
-  "node",
-  "bun",
-  "deno",
-  "ruby",
-  "perl",
-  "php",
-  "lua",
-  "osascript",
-  "find",
-  "awk",
-  "gawk",
-  "stdbuf",
-  "setsid",
-  "caffeinate",
-  "arch",
-  "chroot",
-  "script",
-  "ssh",
-  "git",
-  "make",
-  "gmake",
-  "sed",
-  "gsed",
-  "tar",
-  "gtar",
-  "bsdtar",
-  "zip",
-  "rsync",
-  "scp",
-  "sftp",
-  "npm",
-  "pnpm",
-  "yarn",
-  "cargo",
-  "go",
-  "swift",
-  "uv",
-  "pip",
-  "poetry",
-  "brew",
-  "vim",
-  "vi",
-  "nvim",
-  "view",
-  "ex",
-  "emacs",
-  "less",
-  "more",
-  "man",
-  "ed",
-  "xcodebuild",
-  "gradle",
-  "mvn",
-  "docker",
-  "podman",
-  "kubectl",
-  "gdb",
-  "lldb",
-  "tmux",
-  "screen",
-  "open",
-  "launchctl",
-  "crontab",
-  "sqlite",
-  "psql",
-  "mysql",
-  "nomo",
-  "nomo-ai"
+var INERT_COMMANDS = new Set([
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "touch",
+  "mkdir",
+  "grep",
+  "echo",
+  "pwd",
+  "which",
+  "file",
+  "stat",
+  "du",
+  "cut",
+  "tr",
+  "jq"
 ]);
-var isWrapper = (word) => WRAPPERS.has((word.split("/").pop() ?? "").toLowerCase().replace(/(?<=[a-z])[\d.]+$/, ""));
 function devinGrantFor(cardTool, toolInput) {
   if (cardTool !== "shell")
     return { tool: cardTool };
   const command = commandOf(toolInput);
   const name = command.split(" ", 1)[0];
-  return PLAIN_COMMAND.test(command) && !isWrapper(name) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
+  return PLAIN_COMMAND.test(command) && INERT_COMMANDS.has(name) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
 }
 function devinGrantText(cardTool, toolInput) {
   const g = devinGrantFor(cardTool, toolInput);
@@ -6627,7 +6549,7 @@ function devinGrantMatches(grant, cardTool, toolInput) {
   const command = commandOf(toolInput);
   if (typeof grant.exact === "string")
     return command === grant.exact;
-  return typeof grant.prefix === "string" && grant.prefix.length > 0 && !isWrapper(grant.prefix) && PLAIN_COMMAND.test(command) && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
+  return typeof grant.prefix === "string" && INERT_COMMANDS.has(grant.prefix) && PLAIN_COMMAND.test(command) && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
 }
 async function readGrants(path) {
   try {
@@ -6708,11 +6630,10 @@ async function runDevinApproval(raw, deps = {}) {
       return "";
     const { session_id: sessionId, tool_name: cardTool, tool_input: toolInput } = JSON.parse(stdin);
     const paired = Boolean(await (deps.hold?.loadConfigFn ?? loadConfig)());
-    const autoOk = paired && !(cardTool === "shell" && isNomoLifecycleCommand(commandOf(toolInput)));
-    const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
-    if (autoOk && cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
+    if (paired && isOwnExec(cardTool, toolInput, deps.pluginRoot))
       return APPROVE;
-    if (autoOk && isOwnExec(cardTool, toolInput, deps.pluginRoot))
+    const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
+    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && !(cardTool === "shell" && isNomoLifecycleCommand(commandOf(toolInput))) && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
       return APPROVE;
     let line;
     let gone = false;
