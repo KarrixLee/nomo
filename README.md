@@ -45,8 +45,8 @@ update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
 - **Hooks can only do what you answered.** A phone Allow, Deny or answer is acted on only when it is
   sealed by your paired phone for that exact request. Every failure — unpaired, offline, timeout,
   crash — **fails open** to the agent's own prompt. Nomo can delay a decision; it never makes one for
-  you, except auto-approving its **own** status commands, matched byte for byte. Pairing, unpairing,
-  reset and uninstall always ask.
+  you, except auto-approving its **own** status commands, matched byte for byte. Nomo's own pair,
+  unpair, reset and uninstall commands always ask.
   [Hooks security](#hooks-security)
 - **Local files are owner-only.** Pairing keys and session records live in `~/.config/cc-status/`,
   written `0600`. Every file Nomo writes into an agent's config is listed below, and the installers
@@ -213,7 +213,8 @@ event; on a permission prompt also the full text and the approval request), the 
 stores nothing, and free mode resumes. The LAN listener does not come back when the marker expires: it
 stays keyed off until the relay says the pairing is Pro (a presence reply, or an accepted session
 request), which deletes the marker. A 403 is never treated as an unpair (only a 404/410 is), and neither
-is a `409` (a pairing the relay has not seen claimed yet): that request is retried later.
+is a `409` (a pairing the relay has not seen claimed yet): a session event is retried later, and a
+prompt's approval request falls open to the agent's own prompt, as on any other relay error.
 
 **On the iPhone,** the Live Agents widget (Nomo Pro) reads a snapshot of decrypted titles, states and
 computer names from the app's own App Group container. It never leaves the device.
@@ -429,15 +430,18 @@ real installs never set it, and anything that can set your agent's environment c
   `~/.config/cc-status/sessions/<session>.devin-allow` and forgotten when the session ends (or Nomo
   retires its quiet row), and every one is deleted by unpair, by reset, and when you pair again. While it exists, and only
   while this computer is paired, a matching request in that session is approved at once, even with
-  approvals paused. A shell grant covers the command's name for plain commands only (`touch` covers
-  `touch b.txt`, not `touchy`); anything with `&&`, `;`, `|`, `$(…)`, backticks or a redirect is covered
-  only by a grant for that exact text, so `touch x && rm -rf ~` still asks. A command that runs other
-  commands or code (`bash`, `sh`, `env`, `sudo`, `xargs`, `npx`, `python3`, `node`, `bun` and similar),
-  or can run code through its arguments or project files (`git`, `make`, `sed`, `tar`, `rsync`, `npm`,
-  `cargo`, `vim`, `xcodebuild`, `nomo` and similar), never becomes a name grant: the grant is that exact
-  text, so `bash scripts/test.sh` does not cover `bash -c "…"` and `git status` does not cover
-  `git -c core.fsmonitor=… status`. A command that pairs, unpairs, resets or uninstalls Nomo is never
-  approved by a grant. For any other tool it covers that tool for the session.
+  approvals paused. A shell grant covers the command's name only for a short list of tools whose
+  arguments cannot run code (`ls`, `cat`, `head`, `tail`, `wc`, `touch`, `mkdir`, `grep`, `echo`,
+  `pwd`, `which`, `file`, `stat`, `du`, `cut`, `tr`, `jq`), typed as the bare name and with no shell
+  operators (`touch` covers `touch b.txt`, not `touchy` or `./touch`). Every other command — shells,
+  interpreters, `git`, `make`, `rg`, build tools, agents, `cp`, `rm`, anything with `&&`, `;`, `|`,
+  `$(…)`, backticks or a redirect — is covered only by a grant for that exact text: `git status` does not
+  cover `git -c core.fsmonitor=… status`, and `touch x && rm -rf ~` still asks. An exact grant re-runs
+  that text as-is, in any folder, and does not pin what it runs (`make test` runs whatever the Makefile
+  says then). Nomo's own pair, unpair, reset, disable and uninstall commands, and commands naming its
+  state folders (`~/.config/cc-status`, `~/.nomo`), are never approved by a grant; quoting tricks are
+  normalized, but a glob can still slip past that check (it is the allowlist above that stops one becoming
+  a name grant). For any other tool it covers that tool for the session.
 - **Own commands:** on a paired computer, before any card, Nomo auto-approves exactly three command
   lines, rebuilt in code and matched byte for byte against what the skills run (the plugin's `/nomo:*`
   and the installer's `/nomo-*` forms, with at most Devin Desktop's `workdir` beside them): status,
