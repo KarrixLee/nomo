@@ -215,12 +215,25 @@ const INERT_COMMANDS = new Set([
   "cut", "tr", "jq",
 ]);
 
+/** Can a NAME grant cover this exec at all? An inert bare command, plain, with no glob (`cat
+ *  ~/.config/cc-*` reaches Nomo's state without spelling it) and no Devin Desktop `workdir` (`touch
+ *  no-hold` run inside cc-status). Review round 2. */
+function nameGrantable(name: string, toolInput: Record<string, unknown>): boolean {
+  const command = commandOf(toolInput);
+  return INERT_COMMANDS.has(name) && PLAIN_COMMAND.test(command) && !/[*?[]/.test(command) && toolInput.workdir === undefined;
+}
+
+/** A shell grant only ever covers `command` (+ `workdir`): any other key (an env, a shell) could change
+ *  what runs, so that request goes to the phone — the same key rule as isOwnExec. */
+const onlyCommandKeys = (toolInput: Record<string, unknown>): boolean =>
+  Object.keys(toolInput).every((k) => k === "command" || k === "workdir");
+
 /** The grant an Always-allow tap makes for this card tool + input. Pure. */
 export function devinGrantFor(cardTool: string, toolInput: Record<string, unknown>): DevinGrant {
   if (cardTool !== "shell") return { tool: cardTool };
   const command = commandOf(toolInput);
   const name = command.split(" ", 1)[0];
-  return PLAIN_COMMAND.test(command) && INERT_COMMANDS.has(name) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
+  return nameGrantable(name, toolInput) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
 }
 
 /** The grant above for the card's Always-allow label (`permissionGrant`, see grantEntry):
@@ -235,9 +248,10 @@ export function devinGrantText(cardTool: string, toolInput: Record<string, unkno
 export function devinGrantMatches(grant: DevinGrant, cardTool: string, toolInput: Record<string, unknown>): boolean {
   if (grant.tool !== cardTool) return false;
   if (cardTool !== "shell") return true;
+  if (!onlyCommandKeys(toolInput)) return false;
   const command = commandOf(toolInput);
   if (typeof grant.exact === "string") return command === grant.exact;
-  return typeof grant.prefix === "string" && INERT_COMMANDS.has(grant.prefix) && PLAIN_COMMAND.test(command)
+  return typeof grant.prefix === "string" && nameGrantable(grant.prefix, toolInput)
     && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
 }
 
@@ -363,7 +377,9 @@ export async function runDevinApproval(raw: string, deps: DevinApprovalDeps = {}
     // An Always-allow grant answers at once — before the pause gate and before any phone card — except
     // for anything that pairs, unpairs, resets, uninstalls or touches Nomo's state: that always asks.
     const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
-    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && !(cardTool === "shell" && isNomoLifecycleCommand(commandOf(toolInput)))
+    const lifecycle = cardTool === "shell"
+      && isNomoLifecycleCommand(`${commandOf(toolInput)} ${typeof toolInput.workdir === "string" ? toolInput.workdir : ""}`);
+    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && !lifecycle
       && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput))) return APPROVE;
     let line: string | undefined;
     let gone = false;

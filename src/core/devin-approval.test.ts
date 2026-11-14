@@ -580,4 +580,47 @@ describe("Nomo's own /nomo-* commands never become phone cards", () => {
       expect([c, out, calls.n]).toEqual([c, "", 1]);
     }
   });
+
+  // Review round 2: an allowlisted name grant must not reach Nomo's state without spelling the path —
+  // via a glob, via Devin Desktop's `workdir`, or via an extra tool_input key the match never looked at.
+  const runWith = async (input: Record<string, unknown>, grants: object[]) => {
+    const dir = freshDir();
+    await mkdir(dir, { recursive: true });
+    await writeFile(devinGrantsPath(dir, "brawny-shirt"), JSON.stringify(grants));
+    const calls = { n: 0 };
+    const out = await runDevinApproval(JSON.stringify(payload("exec", input)), {
+      env: ENV, sessionsDir: dir, pluginRoot: ROOT, hold: { loadConfigFn: async () => CONFIG },
+      run: (async () => { calls.n++; }) as never,
+    });
+    return { out, held: calls.n };
+  };
+  const NAME = [{ tool: "shell", prefix: "touch" }, { tool: "shell", prefix: "cat" }, { tool: "shell", prefix: "ls" }];
+
+  test("globs and workdir never get or honour a name grant; workdir is lifecycle-checked too", async () => {
+    for (const c of ["touch ~/.config/cc-sta?us/no-hold", "cat ~/.config/cc-*/config.json", "ls ~/.config/[c]c-status"]) {
+      expect([c, devinGrantFor("shell", { command: c })]).toEqual([c, { tool: "shell", exact: c }]);
+      expect([c, devinGrantMatches({ tool: "shell", prefix: c.split(" ")[0]! }, "shell", { command: c })]).toEqual([c, false]);
+      expect([c, await runWith({ command: c }, NAME)]).toEqual([c, { out: "", held: 1 }]);
+    }
+    const wd = { command: "touch no-hold", workdir: "~/.config/cc-status" };
+    expect(devinGrantFor("shell", wd)).toEqual({ tool: "shell", exact: "touch no-hold" });
+    expect(devinGrantMatches({ tool: "shell", prefix: "touch" }, "shell", wd)).toBe(false);
+    expect(await runWith(wd, NAME)).toEqual({ out: "", held: 1 });
+    // An exact grant for the same text does not reach into Nomo's state folder either.
+    expect(await runWith(wd, [{ tool: "shell", exact: "touch no-hold" }])).toEqual({ out: "", held: 1 });
+    expect(isNomoLifecycleCommand("touch no-hold")).toBe(false);
+    // CONTROL: an exact grant still applies with an ordinary workdir; a name grant still applies without one.
+    expect(await runWith({ command: "touch no-hold", workdir: "/w/api" }, [{ tool: "shell", exact: "touch no-hold" }])).toEqual({ out: '{"decision":"approve"}', held: 0 });
+    expect(await runWith({ command: "touch b.txt" }, NAME)).toEqual({ out: '{"decision":"approve"}', held: 0 });
+  });
+
+  test("a shell grant matches only when tool_input keys are within {command, workdir}", async () => {
+    for (const extra of [{ env: { HOME: "/tmp/evil" } }, { environment: { PATH: "/tmp" } }, { shell: "/tmp/sh" }]) {
+      const input = { command: "touch b.txt", ...extra };
+      expect(devinGrantMatches({ tool: "shell", prefix: "touch" }, "shell", input)).toBe(false);
+      expect(devinGrantMatches({ tool: "shell", exact: "touch b.txt" }, "shell", input)).toBe(false);
+      expect(await runWith(input, [...NAME, { tool: "shell", exact: "touch b.txt" }])).toEqual({ out: "", held: 1 });
+    }
+    expect(devinGrantMatches({ tool: "shell", exact: "touch b.txt" }, "shell", { command: "touch b.txt", workdir: "/w" })).toBe(true);
+  });
 });
