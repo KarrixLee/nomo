@@ -432,16 +432,19 @@ real installs never set it, and anything that can set your agent's environment c
   while this computer is paired, a matching request in that session is approved at once, even with
   approvals paused. A shell grant covers the command's name only for a short list of tools whose
   arguments cannot run code (`ls`, `cat`, `head`, `tail`, `wc`, `touch`, `mkdir`, `grep`, `echo`,
-  `pwd`, `which`, `file`, `stat`, `du`, `cut`, `tr`, `jq`), typed as the bare name and with no shell
-  operators (`touch` covers `touch b.txt`, not `touchy` or `./touch`). Every other command — shells,
-  interpreters, `git`, `make`, `rg`, build tools, agents, `cp`, `rm`, anything with `&&`, `;`, `|`,
-  `$(…)`, backticks or a redirect — is covered only by a grant for that exact text: `git status` does not
+  `pwd`, `which`, `file`, `stat`, `du`, `cut`, `tr`, `jq`), typed as the bare name, with no shell
+  operators, no glob (`*`, `?`, `[`) and no Devin Desktop `workdir` (`touch` covers `touch b.txt`, not
+  `touchy` or `./touch`). Such a grant still lets `cat`, `grep` or `jq` read any file you can read.
+  Every other command — shells, interpreters, `git`, `make`, `rg`, build tools, agents, `cp`, `rm`,
+  anything with `&&`, `;`, `|`, `$(…)`, backticks or a redirect — is covered only by a grant for that
+  exact text: `git status` does not
   cover `git -c core.fsmonitor=… status`, and `touch x && rm -rf ~` still asks. An exact grant re-runs
   that text as-is, in any folder, and does not pin what it runs (`make test` runs whatever the Makefile
-  says then). Nomo's own pair, unpair, reset, disable and uninstall commands, and commands naming its
-  state folders (`~/.config/cc-status`, `~/.nomo`), are never approved by a grant; quoting tricks are
-  normalized, but a glob can still slip past that check (it is the allowlist above that stops one becoming
-  a name grant). For any other tool it covers that tool for the session.
+  says then). A shell grant never matches a request carrying any key besides the command and `workdir`.
+  Nomo's own pair, unpair, reset, disable and uninstall commands, and commands whose text or `workdir`
+  names its state folders (`~/.config/cc-status`, `~/.nomo`), are never approved by a grant; quoting
+  tricks are normalized, but a glob can still slip past that check in an exact grant's text (a glob
+  never gets or uses a name grant). For any other tool it covers that tool for the session.
 - **Own commands:** on a paired computer, before any card, Nomo auto-approves exactly three command
   lines, rebuilt in code and matched byte for byte against what the skills run (the plugin's `/nomo:*`
   and the installer's `/nomo-*` forms, with at most Devin Desktop's `workdir` beside them): status,
