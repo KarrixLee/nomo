@@ -6528,12 +6528,17 @@ var INERT_COMMANDS = new Set([
   "tr",
   "jq"
 ]);
+function nameGrantable(name, toolInput) {
+  const command = commandOf(toolInput);
+  return INERT_COMMANDS.has(name) && PLAIN_COMMAND.test(command) && !/[*?[]/.test(command) && toolInput.workdir === undefined;
+}
+var onlyCommandKeys = (toolInput) => Object.keys(toolInput).every((k) => k === "command" || k === "workdir");
 function devinGrantFor(cardTool, toolInput) {
   if (cardTool !== "shell")
     return { tool: cardTool };
   const command = commandOf(toolInput);
   const name = command.split(" ", 1)[0];
-  return PLAIN_COMMAND.test(command) && INERT_COMMANDS.has(name) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
+  return nameGrantable(name, toolInput) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
 }
 function devinGrantText(cardTool, toolInput) {
   const g = devinGrantFor(cardTool, toolInput);
@@ -6546,10 +6551,12 @@ function devinGrantMatches(grant, cardTool, toolInput) {
     return false;
   if (cardTool !== "shell")
     return true;
+  if (!onlyCommandKeys(toolInput))
+    return false;
   const command = commandOf(toolInput);
   if (typeof grant.exact === "string")
     return command === grant.exact;
-  return typeof grant.prefix === "string" && INERT_COMMANDS.has(grant.prefix) && PLAIN_COMMAND.test(command) && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
+  return typeof grant.prefix === "string" && nameGrantable(grant.prefix, toolInput) && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
 }
 async function readGrants(path) {
   try {
@@ -6633,7 +6640,8 @@ async function runDevinApproval(raw, deps = {}) {
     if (paired && isOwnExec(cardTool, toolInput, deps.pluginRoot))
       return APPROVE;
     const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
-    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && !(cardTool === "shell" && isNomoLifecycleCommand(commandOf(toolInput))) && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
+    const lifecycle = cardTool === "shell" && isNomoLifecycleCommand(`${commandOf(toolInput)} ${typeof toolInput.workdir === "string" ? toolInput.workdir : ""}`);
+    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && !lifecycle && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
       return APPROVE;
     let line;
     let gone = false;
