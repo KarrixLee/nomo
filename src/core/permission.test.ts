@@ -512,6 +512,7 @@ function scriptFetch(
       return new Response(JSON.stringify({ ok: full === 200 }), { status: full });
     }
     if (url.endsWith("/v1/cc/decision")) return new Response(JSON.stringify({ hold: holdFor() }), { status: 200 });
+    if (url.endsWith("/v1/cc/decision/resolve")) return new Response(JSON.stringify({ ok: true, status: "superseded" }), { status: 200 });
     // GET /v1/cc/decision/<id>
     const next = gets[Math.min(g++, gets.length - 1)];
     if (next === "throw") throw new Error("network");
@@ -3537,7 +3538,44 @@ describe("runPermissionHook — answered at the Mac", () => {
     expect(patches[0]!.lastEvent).toBe("working");
     expect(patches[0]!.prio).toBe(0);
     expect(patches[0]!.attentionKind).toBeUndefined();
+    // …and the worker hears it NOW: the clean exit leaves no dead-pid marker for the watchdog prune,
+    // so without this the record sat `pending` until the silence sweep (30-90 s of stale purple).
+    const resolves = calls.filter((c) => c.url.endsWith("/v1/cc/decision/resolve"));
+    expect(resolves).toHaveLength(1);
+    expect(resolves[0]!.method).toBe("POST");
+    expect(JSON.parse(resolves[0]!.body!)).toEqual({ requestId: "req-fixed" }); // this hold's own id only
+    expect(resolves[0]!.headers?.["x-cc-pairing"]).toBe("p1");
+    expect(resolves[0]!.headers?.["x-cc-auth"]).toBe("s1");
+    expect(resolves[0]!.headers?.["x-cc-version"]).toBeTruthy();
+    expect(traced.find((e) => e.event === "exit")?.resolveSent).toBe(true);
   });
+
+  for (const failure of ["throw", "timeout"] as const) {
+    test(`a ${failure} on the resolve POST still exits local-answer and settles as WORKING`, async () => {
+      const { fn: base } = scriptFetch(true, [{ status: "pending" }]);
+      const fn = (async (url: string, init?: { signal?: AbortSignal }) => {
+        if (!url.endsWith("/v1/cc/decision/resolve")) return (base as Function)(url, init);
+        if (failure === "throw") throw new Error("network");
+        // Hangs until the hook's own 3 s AbortSignal fires — the exit must not wait any longer.
+        return new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)));
+      }) as unknown as typeof fetch;
+      const traced: Array<Record<string, unknown>> = [];
+      const patches: Array<Record<string, unknown>> = [];
+      let reads = 0;
+      const started = Date.now();
+      await runPermissionHook(baseDeps({
+        fetchFn: fn, readInput: async () => questionInput,
+        trace: (e: Record<string, unknown>) => traced.push(e),
+        settleHoldRecordFn: async (_id: string, patch: Record<string, unknown>) => { patches.push(patch); },
+        readTailFn: async () => (reads++ === 0 ? TAIL_PENDING : TAIL_ANSWERED),
+      }) as never);
+      expect(traced.find((e) => e.event === "exit")?.reason).toBe("local-answer");
+      expect(traced.some((e) => e.reason === "exception")).toBe(false);
+      expect(patches).toHaveLength(1);
+      expect(patches[0]!.lastEvent).toBe("working");
+      expect(Date.now() - started).toBeLessThan(4_500);
+    }, 10_000);
+  }
 
   test("an UNANSWERED question is untouched — the phone still gets its answer", async () => {
     // A bare allow is a deliberate RELEASE for a question (CC drops it), so the phone's real verb here
@@ -3545,12 +3583,13 @@ describe("runPermissionHook — answered at the Mac", () => {
     const answerBlob = await encryptBlob(KEY, {
       requestId: "req-fixed", decision: "answer", answers: ["Unit tests only"], ts: 5,
     });
-    const { fn } = scriptFetch(true, [{ status: "pending" }, { status: "answered", answerBlob }]);
+    const { fn, calls } = scriptFetch(true, [{ status: "pending" }, { status: "answered", answerBlob }]);
     const emitted: string[] = [];
     await runPermissionHook(baseDeps({
       fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput,
       readTailFn: async () => TAIL_PENDING,                        // still parked on the user
     }) as never);
+    expect(calls.some((c) => c.url.endsWith("/v1/cc/decision/resolve"))).toBe(false); // phone answered: worker already terminal
     expect(emitted).toHaveLength(1);
     expect(JSON.parse(emitted[0]!).hookSpecificOutput.decision.updatedInput.answers).toEqual({
       "Which testing approach should I use for the new parser?": "Unit tests only",

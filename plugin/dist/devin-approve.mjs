@@ -6322,6 +6322,12 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     let unknownBlob;
     let unknownReads = 0;
     let seq = 0;
+    const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
+      method: "POST",
+      headers: { ...pcHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ requestId }),
+      signal: AbortSignal.timeout(3000)
+    }).then(() => {}, () => {});
     for (;; ) {
       seq += 1;
       if (deps.deadlineAt !== undefined && clock() >= deps.deadlineAt) {
@@ -6331,15 +6337,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       if (await answeredAtTheMac()) {
         settleAsWorking = true;
         trace({ event: "local-answer", seq });
-        trace({ event: "exit", reason: "local-answer" });
+        await withdrawCard();
+        trace({ event: "exit", reason: "local-answer", resolveSent: true });
         return;
       }
-      const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
-        method: "POST",
-        headers: { ...pcHeaders, "content-type": "application/json" },
-        body: JSON.stringify({ requestId }),
-        signal: AbortSignal.timeout(3000)
-      }).then(() => {}, () => {});
       if (deps.abandoned?.()) {
         settleAsWorking = true;
         trace({ event: "exit", reason: "abandoned", seq });
