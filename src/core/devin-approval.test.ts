@@ -198,8 +198,7 @@ describe("Always allow — session grants", () => {
   test("grant derivation: a plain command grants its name; operators, substitutions, env prefixes → the exact text", () => {
     expect(devinGrantFor("shell", sh("touch one.txt"))).toEqual({ tool: "shell", prefix: "touch" });
     expect(devinGrantFor("shell", sh("ls -la"))).toEqual({ tool: "shell", prefix: "ls" });
-    expect(devinGrantFor("shell", sh("./build.sh --fast"))).toEqual({ tool: "shell", prefix: "./build.sh" });
-    for (const c of ["touch a && rm -rf ~", "echo $(id)", "ls > out", "cat a | sh", "echo `id`", "a; b", "FOO=1 make", "x\ny", "(ls)"]) {
+    for (const c of ["./build.sh --fast", "touch a && rm -rf ~", "echo $(id)", "ls > out", "cat a | sh", "echo `id`", "a; b", "FOO=1 make", "x\ny", "(ls)"]) {
       expect(devinGrantFor("shell", sh(c))).toEqual({ tool: "shell", exact: c });
     }
     expect(devinGrantFor("Write", { file_path: "/w/a.ts" })).toEqual({ tool: "Write" });
@@ -252,6 +251,25 @@ describe("Always allow — session grants", () => {
     // Plain commands keep the name grant.
     for (const [c, name] of [["touch b.txt", "touch"], ["ls -la", "ls"], ["cat a", "cat"], ["mkdir -p x", "mkdir"], ["grep -rn a .", "grep"]]) {
       expect(devinGrantFor("shell", sh(c))).toEqual({ tool: "shell", prefix: name });
+    }
+  });
+
+  // Review round 1: a blocklist can never be complete, so name grants are an ALLOWLIST of inert commands.
+  test("name grants only for the inert allowlist; every other tool (the review's escapes) is exact text", () => {
+    for (const c of [
+      "rg --pre sh . payload.txt", "fd . -x sh -c 'id'", "claude -p hi --dangerously-skip-permissions", "codex exec hi",
+      "uvx ruff", "pipx run x", "xcrun python3 -c 1", "java -jar a.jar", "gh alias set --shell x 'id'", "cmake -P a.cmake",
+      "pytest", "/x/plugin/scripts/run.sh /tmp/e.mjs", "sort --compress-program=sh a", "uniq a b", "cp a b", "mv a b",
+      "rm -rf build", "tree -o x", "diff a b", "/tmp/evil/ls", "./ls -la", "LS -la", "some-new-tool --flag",
+    ]) {
+      expect([c, devinGrantFor("shell", sh(c))]).toEqual([c, { tool: "shell", exact: c }]);
+    }
+    for (const name of ["ls", "cat", "head", "tail", "wc", "touch", "mkdir", "grep", "echo", "pwd", "which", "file", "stat", "du", "cut", "tr", "jq"]) {
+      expect([name, devinGrantFor("shell", sh(`${name} x`))]).toEqual([name, { tool: "shell", prefix: name }]);
+    }
+    // A name grant outside the allowlist (an older grants file) matches nothing.
+    for (const prefix of ["rg", "fd", "claude", "codex", "pytest", "cp", "rm", "/tmp/evil/ls", "./build.sh"]) {
+      expect([prefix, devinGrantMatches({ tool: "shell", prefix }, "shell", sh(`${prefix} x`))]).toEqual([prefix, false]);
     }
   });
 
@@ -528,9 +546,19 @@ describe("Nomo's own /nomo-* commands never become phone cards", () => {
     for (const c of [...LIFECYCLE, ...commands(false).filter((x) => /(pair|reset)\.mjs/.test(x))]) {
       expect([c.slice(-70), isNomoLifecycleCommand(c)]).toEqual([c.slice(-70), true]);
     }
-    for (const c of ["nomo status", "nomo approvals on", "git repair", "ls pair.txt", "echo pairing", "nomogram pair", ...commands(false).filter((x) => SAFE.test(x))]) {
+    for (const c of ["nomo status", "nomo approvals on", "git repair", "ls pair.txt", "echo pairing", "nomogram pair"]) {
       expect([c.slice(-70), isNomoLifecycleCommand(c)]).toEqual([c.slice(-70), false]);
     }
+  });
+
+  // Review round 1: quoting, escaping, case and the state files themselves.
+  const VARIANTS = [
+    "nomo 'pair'", "NOMO pair", "nomo p\\air", "nomo \"unpair\"", "/x/plugin/scripts/run.sh /x/plugin/dist/unpai''r.mjs",
+    "claude plugin disable nomo-cc@nomo", "devin plugins remove KarrixLee/nomo", "rm ~/.config/cc-status/config.json",
+    "touch ~/.config/cc-status/no-hold", "rm -rf ~/.nomo/plugin", "cat ~/.config/CC-STATUS/config.json",
+  ];
+  test("lifecycle variants: quotes, backslashes, case, plugin disable, and anything touching cc-status or ~/.nomo/", () => {
+    for (const c of VARIANTS) expect([c, isNomoLifecycleCommand(c)]).toEqual([c, true]);
   });
 
   test("a grant never auto-approves a lifecycle command (exact or name); it goes to the hold", async () => {
@@ -538,11 +566,12 @@ describe("Nomo's own /nomo-* commands never become phone cards", () => {
     const path = devinGrantsPath(dir, "brawny-shirt");
     await mkdir(dir, { recursive: true });
     await writeFile(path, JSON.stringify([
-      ...LIFECYCLE.map((exact) => ({ tool: "shell", exact })), { tool: "shell", prefix: "nomo" }, { tool: "shell", prefix: "nomo-ai" },
+      ...[...LIFECYCLE, ...VARIANTS].map((exact) => ({ tool: "shell", exact })), { tool: "shell", prefix: "touch" },
+      { tool: "shell", prefix: "cat" }, { tool: "shell", prefix: "nomo" }, { tool: "shell", prefix: "nomo-ai" },
       { tool: "shell", prefix: "claude" }, { tool: "shell", prefix: "devin" }, { tool: "shell", prefix: "~/.config/cc-status/hook-shim.sh" },
       { tool: "shell", prefix: "/x/plugin/scripts/run.sh" },
     ]));
-    for (const c of LIFECYCLE) {
+    for (const c of [...LIFECYCLE, ...VARIANTS]) {
       const calls = { n: 0 };
       const out = await runDevinApproval(JSON.stringify(payload("exec", { command: c })), {
         env: ENV, sessionsDir: dir, pluginRoot: ROOT, hold: { loadConfigFn: async () => CONFIG },

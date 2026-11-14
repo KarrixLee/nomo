@@ -42,9 +42,10 @@
 // grant, like a Claude Code session rule). Scope mirrors Devin's own "(this session)" option: a plain
 // shell command grants its command NAME (word-complete, `touch` ≠ `touchy`); a command with any shell
 // operator, substitution or redirect grants only that exact text, and only a plain command can ever
-// match a name grant, so `touch a && rm -rf ~` always goes to the phone. A WRAPPER (`bash`, `env`,
-// `sudo`, `python3`… — WRAPPERS) or a tool that runs code from its arguments (`git -c core.fsmonitor=…`,
-// `make -f`, `sed '1e …'`… — also WRAPPERS) grants only the exact text: `git` would cover `git -c …`.
+// match a name grant, so `touch a && rm -rf ~` always goes to the phone. Only an inert tool
+// (INERT_COMMANDS: ls, cat, grep, touch…) can get a name grant; every other command grants only its exact
+// text, because a shell, an interpreter or a tool that runs code from its arguments (`git -c …`) would
+// otherwise cover any command.
 // Any other tool is granted whole. A grant only ever applies on a PAIRED computer.
 // The grant is deleted on SessionEnd and when the watchdog retires the row.
 //
@@ -52,8 +53,9 @@
 // (/nomo-status, /nomo-approvals on|status — the plugin's /nomo:* or the installer's /nomo-*) is approved
 // at once, byte for byte, so /nomo-status never puts a card on the phone. Pausing approvals, pairing,
 // reset, unpairing and the typed pairing code still ask (Antigravity's rule). Anything that pairs,
-// unpairs, resets or uninstalls Nomo (isNomoLifecycleCommand) is never auto-approved, by a grant either:
-// on a paired computer `pair` revokes the pairing, so a prompt-injected agent could cut the phone off.
+// unpairs, resets, uninstalls or touches Nomo's state (isNomoLifecycleCommand) is never approved by a
+// grant either: on a paired computer `pair` revokes the pairing, so a prompt-injected agent could cut
+// the phone off.
 
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -140,19 +142,25 @@ const SAFE_DEVIN_SKILL_COMMANDS: ReadonlyArray<readonly [string, string]> = [
   ["cc-permission", "on"],
 ];
 
-/** Does `command` pair, unpair, reset or uninstall Nomo — the CLI (`nomo pair`, `bunx nomo-ai pair`,
- *  `nomo-ai --uninstall`), a host's plugin uninstall, the hook shim, or a skill's dist script? Such a
- *  command is never auto-approved, by an own-command match or a grant. Deliberately broad: a false
- *  positive only means the phone asks. Pure. */
+/** Does `command` pair, unpair, reset, disable or uninstall Nomo, or touch its state — the CLI
+ *  (`nomo pair`, `bunx nomo-ai pair`, `nomo-ai --uninstall`), a host's plugin disable/uninstall, the
+ *  hook shim, a skill's dist script, or any path under `cc-status` (pairing keys, the no-hold flag) or
+ *  `~/.nomo/`? Such a command is never approved by a grant. Matched after dropping quotes and
+ *  backslashes and lowercasing (`nomo 'pair'`, `NOMO p\air`). Deliberately broad: a false positive only
+ *  means the phone asks. ponytail: a regex, not a shell — globs (`nomo pa?r`) still slip; the grant
+ *  allowlist (INERT_COMMANDS) is what keeps those from ever being name grants. Pure. */
 const NOMO_LIFECYCLE = [
-  /\bnomo(?:-ai)?(?:@[\w.-]+)?['"]?\s+(?:pair|unpair|reset|uninstall)\b/,
+  /\bnomo(?:-ai)?(?:@[\w.-]+)?\s+(?:pair|unpair|reset|uninstall)\b/,
   /--uninstall\b/,
-  /\buninstall\b[^;&|\n]*nomo/,
-  /hook-shim\.sh['"]?\s+(?:pair|unpair|reset)\b/,
+  /\b(?:uninstall|disable|remove)\b[^;&|\n]*nomo/,
+  /hook-shim\.sh\s+(?:pair|unpair|reset)\b/,
   /\b(?:pair|unpair|reset)\.mjs\b/,
+  /cc-status/,
+  /\/\.nomo(?:\/|\s|$)/,
 ];
 export function isNomoLifecycleCommand(command: string): boolean {
-  return NOMO_LIFECYCLE.some((re) => re.test(command));
+  const c = command.replace(/['"\\]/g, "").toLowerCase();
+  return NOMO_LIFECYCLE.some((re) => re.test(c));
 }
 
 /** The exact line a Devin skill runs for `script args`, searching `loop` (the plugin-cache glob, or a
@@ -195,33 +203,24 @@ const PLAIN_COMMAND = /^[A-Za-z0-9_./-]+( [^;&|`$<>(){}\n]*)?$/;
 const commandOf = (toolInput: Record<string, unknown>): string =>
   typeof toolInput.command === "string" ? toolInput.command : "";
 
-/** Commands that run ANOTHER command or code given in their arguments (`bash -c …`, `env rm …`,
- *  `python3 -e …`): a name grant on one would cover every command, so they only ever get an exact grant.
- *  Looked up by basename, lowercased (macOS paths are case-insensitive), version digits dropped
- *  (`python3.12` → `python`). ponytail: a list, not a parser — a wrapper missing here still grants its
- *  name; add it here. */
-const WRAPPERS = new Set([
-  "bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "pwsh", "env", "sudo", "doas", "su", "timeout",
-  "xargs", "npx", "bunx", "pnpx", "nohup", "nice", "exec", "eval", "command", "builtin", "time", "watch", ".",
-  "source", "python", "node", "bun", "deno", "ruby", "perl", "php", "lua", "osascript", "find", "awk", "gawk",
-  "stdbuf", "setsid", "caffeinate", "arch", "chroot", "script", "ssh",
-  // Run code from their ARGUMENTS or project files (2026-11-14 audit L3): `git -c core.fsmonitor=…`,
-  // `make -f`, GNU `sed '1e …'`, `tar --to-command=…`, `rsync -e …`, `npm exec …`, `vim -c '!…'`, build
-  // scripts, `zip -TT`, sqlite's `.shell`. Nomo's own CLI too: `nomo` must not cover `nomo approvals off`.
-  "git", "make", "gmake", "sed", "gsed", "tar", "gtar", "bsdtar", "zip", "rsync", "scp", "sftp", "npm", "pnpm",
-  "yarn", "cargo", "go", "swift", "uv", "pip", "poetry", "brew", "vim", "vi", "nvim", "view", "ex", "emacs",
-  "less", "more", "man", "ed", "xcodebuild", "gradle", "mvn", "docker", "podman", "kubectl", "gdb", "lldb",
-  "tmux", "screen", "open", "launchctl", "crontab", "sqlite", "psql", "mysql", "nomo", "nomo-ai",
+/** The ONLY commands a name grant can cover: inert tools whose arguments cannot run code, and only as
+ *  the bare word (`/tmp/evil/ls` or `./ls` is another program). Everything else — shells, interpreters,
+ *  and every tool that can run code through an argument or a project file (`git -c core.fsmonitor=…`,
+ *  `rg --pre`, `fd -x`, `make`, `sort --compress-program`, build tools, agents) — gets an exact-text
+ *  grant. An allowlist because a blocklist of code-running tools can never be complete (2026-11-14 audit
+ *  L3, review round 1). Left out on purpose: cp/mv/uniq/tree (can overwrite a dotfile or a git hook),
+ *  rm (destructive), sort (--compress-program), diff (platform flags vary). */
+const INERT_COMMANDS = new Set([
+  "ls", "cat", "head", "tail", "wc", "touch", "mkdir", "grep", "echo", "pwd", "which", "file", "stat", "du",
+  "cut", "tr", "jq",
 ]);
-const isWrapper = (word: string): boolean =>
-  WRAPPERS.has((word.split("/").pop() ?? "").toLowerCase().replace(/(?<=[a-z])[\d.]+$/, ""));
 
 /** The grant an Always-allow tap makes for this card tool + input. Pure. */
 export function devinGrantFor(cardTool: string, toolInput: Record<string, unknown>): DevinGrant {
   if (cardTool !== "shell") return { tool: cardTool };
   const command = commandOf(toolInput);
   const name = command.split(" ", 1)[0];
-  return PLAIN_COMMAND.test(command) && !isWrapper(name) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
+  return PLAIN_COMMAND.test(command) && INERT_COMMANDS.has(name) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
 }
 
 /** The grant above for the card's Always-allow label (`permissionGrant`, see grantEntry):
@@ -238,7 +237,7 @@ export function devinGrantMatches(grant: DevinGrant, cardTool: string, toolInput
   if (cardTool !== "shell") return true;
   const command = commandOf(toolInput);
   if (typeof grant.exact === "string") return command === grant.exact;
-  return typeof grant.prefix === "string" && grant.prefix.length > 0 && !isWrapper(grant.prefix) && PLAIN_COMMAND.test(command)
+  return typeof grant.prefix === "string" && INERT_COMMANDS.has(grant.prefix) && PLAIN_COMMAND.test(command)
     && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
 }
 
@@ -358,14 +357,14 @@ export async function runDevinApproval(raw: string, deps: DevinApprovalDeps = {}
     // Nothing below auto-approves on an unpaired computer: Devin's own prompt decides. A grants file a
     // crashed session left behind must not outlive the pairing (unpair/reset also delete them).
     const paired = Boolean(await (deps.hold?.loadConfigFn ?? loadConfig)());
-    // An Always-allow grant answers at once — before the pause gate and before any phone card.
-    // Pairing, unpairing, reset or uninstalling Nomo always asks: no grant, no own-command match.
-    const autoOk = paired && !(cardTool === "shell" && isNomoLifecycleCommand(commandOf(toolInput)));
+    // Nomo's OWN safe /nomo-* commands (status, approvals on|status) never become a phone card — only
+    // byte-for-byte the skill's command, and none of them pairs, unpairs or resets (SAFE_DEVIN_SKILL_COMMANDS).
+    if (paired && isOwnExec(cardTool, toolInput, deps.pluginRoot)) return APPROVE;
+    // An Always-allow grant answers at once — before the pause gate and before any phone card — except
+    // for anything that pairs, unpairs, resets, uninstalls or touches Nomo's state: that always asks.
     const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
-    if (autoOk && cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput))) return APPROVE;
-    // Nomo's OWN /nomo-* commands (status, approvals on, …) never become a phone card — only
-    // byte-for-byte the skill's command.
-    if (autoOk && isOwnExec(cardTool, toolInput, deps.pluginRoot)) return APPROVE;
+    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && !(cardTool === "shell" && isNomoLifecycleCommand(commandOf(toolInput)))
+      && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput))) return APPROVE;
     let line: string | undefined;
     let gone = false;
     const abandoned = () => (gone ||= (deps.abandoned ?? defaultAbandoned)());
