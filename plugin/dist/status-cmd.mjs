@@ -4976,6 +4976,12 @@ async function statusCmd(deps = {}) {
   print("");
   if (config) {
     print(row("Phone", `paired · ${config.url} · pairing ${config.pairingId.slice(0, 8)}…`));
+    if (await isFreeMode(now(), deps.freeModePath)) {
+      print(row("Plan", "Nomo Free — your streak, coding time and live status sync."));
+      print(cont("Live sessions, the Dynamic Island and approvals come with Nomo Pro."));
+    } else if (!lanBlockedByFreeMode(deps.freeModePath) && await flagExists(lastSendPath)) {
+      print(row("Plan", "Nomo Pro"));
+    }
   } else if (pending) {
     print(row("Phone", "waiting for the QR scan — pairing was started but no phone has claimed it"));
     print(cont(`→ run ${pairHint} to finish or retry`));
@@ -5022,8 +5028,6 @@ async function statusCmd(deps = {}) {
       print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));
       print(cont(audience ? `→ run ${ui.approvalsOn}` : `→ run your agent's approvals command, e.g. ${ui.approvalsOn}`));
     }
-    if (free)
-      print(row("Free mode", "on — live sessions need Nomo Pro"));
   }
   const perAgent = { claude: 0, codex: 0, opencode: 0, cursor: 0, antigravity: 0, devin: 0 };
   let totalSessions = 0;

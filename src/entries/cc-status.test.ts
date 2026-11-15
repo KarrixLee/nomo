@@ -2721,6 +2721,7 @@ describe("statusCmd — hooks-not-firing warning", () => {
     codexSessionAgeMs?: number; claudeSessionAgeMs?: number;
     codexStampAgeMs?: number; claudeStampAgeMs?: number;
     freeModeAgeMs?: number;
+    lastSendAgeMs?: number;
   }): Promise<string[]> {
     const dir = await mkdtemp(join(tmpdir(), "cc-hooksniff-"));
     try {
@@ -2757,6 +2758,7 @@ describe("statusCmd — hooks-not-firing warning", () => {
       if (opts.codexStampAgeMs !== undefined) await writeFile(lastHookCodexPath, String(NOW - opts.codexStampAgeMs));
       if (opts.claudeStampAgeMs !== undefined) await writeFile(lastHookClaudePath, String(NOW - opts.claudeStampAgeMs));
       if (opts.freeModeAgeMs !== undefined) await writeFile(join(dir, "free-mode"), String(NOW - opts.freeModeAgeMs));
+      if (opts.lastSendAgeMs !== undefined) await writeFile(join(dir, "last-send"), String(NOW - opts.lastSendAgeMs));
 
       const lines: string[] = [];
       await statusCmd({
@@ -2790,11 +2792,25 @@ describe("statusCmd — hooks-not-firing warning", () => {
     return lines.some((l) => l.includes(`! ${name} was active`) && l.includes("Nomo never heard about it"));
   };
 
-  test("free mode: a fresh marker prints the Free mode line; absent or expired prints nothing", async () => {
-    const freeLine = (lines: string[]) => lines.find((l) => l.startsWith("Free mode"));
-    expect(freeLine(await run({ freeModeAgeMs: 2 * MIN }))).toBe(`${"Free mode".padEnd(14)}on — live sessions need Nomo Pro`);
-    expect(freeLine(await run({}))).toBeUndefined();
-    expect(freeLine(await run({ freeModeAgeMs: 16 * MIN }))).toBeUndefined();
+  test("plan: a fresh free-mode marker prints Nomo Free and what Pro adds", async () => {
+    const lines = await run({ freeModeAgeMs: 2 * MIN, lastSendAgeMs: 60 * MIN });
+    const i = lines.findIndex((l) => l.startsWith("Plan"));
+    expect(lines[i]).toBe(`${"Plan".padEnd(14)}Nomo Free — your streak, coding time and live status sync.`);
+    expect(lines[i + 1]).toBe(`${" ".repeat(14)}Live sessions, the Dynamic Island and approvals come with Nomo Pro.`);
+    expect(lines.some((l) => l.startsWith("Free mode"))).toBe(false);
+  });
+
+  test("plan: no marker + a delivered event (the server's last answer was Pro) prints Nomo Pro", async () => {
+    const plan = (await run({ lastSendAgeMs: 5 * MIN })).filter((l) => l.startsWith("Plan"));
+    expect(plan).toEqual([`${"Plan".padEnd(14)}Nomo Pro`]);
+  });
+
+  test("plan: unknown prints no row — just paired (no signal), or an expired marker (absence is not proof of Pro)", async () => {
+    const plan = (lines: string[]) => lines.find((l) => l.startsWith("Plan"));
+    expect(plan(await run({}))).toBeUndefined();
+    expect(plan(await run({ freeModeAgeMs: 16 * MIN }))).toBeUndefined();
+    expect(plan(await run({ freeModeAgeMs: 16 * MIN, lastSendAgeMs: 5 * MIN }))).toBeUndefined();
+    expect(plan(await run({ paired: false, lastSendAgeMs: 5 * MIN }))).toBeUndefined();
   });
 
   test("free mode: the Approvals row says prompts stay in the terminal (holds are skipped)", async () => {

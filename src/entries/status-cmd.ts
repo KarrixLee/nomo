@@ -27,7 +27,7 @@ import { antigravityAdapter, claudeAdapter, codexAdapter, cursorAdapter, devinAd
 import { devinInstallerActive, devinPluginInstalled, devinPluginLockPath } from "../core/devin";
 import {
   AgentKind, ANTIGRAVITY_HOOK_MARKER, antigravityConfigDir, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, CURSOR_HOOK_MARKER, cursorHome, DEVIN_HOOK_MARKER, devinConfigDir, flagExists,
-  isFreeMode, LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
+  isFreeMode, LAST_SEND_PATH, lanBlockedByFreeMode, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
   opencodeStubPaths, opencodeStubTarget, PLUGIN_VERSION, SESSION_TRACE_PATH, SESSIONS_DIR,
   WATCHDOG_PID_PATH,
 } from "../core/shared";
@@ -522,6 +522,16 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   print("");
   if (config) {
     print(row("Phone", `paired · ${config.url} · pairing ${config.pairingId.slice(0, 8)}…`));
+    // The plan, as the server last said it — never a guess. A fresh free-mode marker = Free. Only a real
+    // Pro answer deletes the marker, and last-send is written only on a 2xx from the Pro-only /cc/event,
+    // so no marker + a last-send = the last answer was Pro. Anything else (just paired, or the marker
+    // aged out while the server was quiet) is not known yet: no row beats a wrong one.
+    if (await isFreeMode(now(), deps.freeModePath)) {
+      print(row("Plan", "Nomo Free — your streak, coding time and live status sync."));
+      print(cont("Live sessions, the Dynamic Island and approvals come with Nomo Pro."));
+    } else if (!lanBlockedByFreeMode(deps.freeModePath) && await flagExists(lastSendPath)) {
+      print(row("Plan", "Nomo Pro"));
+    }
   } else if (pending) {
     // Mid-pairing: the QR was printed but no phone has claimed yet — not broken, just unfinished.
     print(row("Phone", "waiting for the QR scan — pairing was started but no phone has claimed it"));
@@ -584,7 +594,6 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
       print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));
       print(cont(audience ? `→ run ${ui.approvalsOn}` : `→ run your agent's approvals command, e.g. ${ui.approvalsOn}`));
     }
-    if (free) print(row("Free mode", "on — live sessions need Nomo Pro"));
   }
 
   // ── per-agent gathering ───────────────────────────────────────────────────────────────────────
