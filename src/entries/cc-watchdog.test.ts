@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import { createLanAnswerStore } from "../core/lan-listener";
 import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
-import { GONE_STRIKE_LIMIT, isFreeMode, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
+import { GONE_STRIKE_LIMIT, isFreeMode, markFreeMode, readGoneStrikes, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import { addEvent, emptyState, maybeUpload } from "../core/activity";
 import {
   acceptLanAnswer, acceptLanCommand, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
@@ -15,7 +15,7 @@ import {
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
   CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid, resolveCodexTuiOwner,
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
-  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPendingUpdate, resealForPairing, shouldReseal, noteResend, resendAllowed, resendBackoffMs, resetResendBackoff, RESEND_BACKOFF_MAX_MS, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
+  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPendingUpdate, resealForPairing, shouldReseal, noteResend, resendAllowed, resendBackoffMs, resetResendBackoff, RESEND_BACKOFF_MAX_MS, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown, settleGoneStrikes,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS, pruneStaleDecisionHolds,
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS, RETIRE_AFTER_MS,
@@ -1737,6 +1737,42 @@ describe("watchdog gone-strike gate (shared 2-strike teardown, not single-strike
       await resetGoneStrikes(path);                              // a delivered POST cleared it
       expect(await exists(path)).toBe(false);
       expect(await goneStrikeShouldTeardown(path)).toBe(false); // strike 1 again — NOT 2
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("settleGoneStrikes: a presence/event gone strikes; a free pairing's fake 'delivered' never resets the streak", async () => {
+    const { path, cleanup } = await tmpStrikes();
+    const freeModePath = join(path, "..", "free-mode");
+    try {
+      // Revoked free pairing: presence 404s, the sweep's short-circuited posts report "delivered".
+      await markFreeMode(freeModePath);
+      expect(await settleGoneStrikes(true, false, { goneStrikesPath: path, freeModePath })).toBe("retry"); // strike 1
+      expect(await settleGoneStrikes(false, true, { goneStrikesPath: path, freeModePath })).toBe("ok");   // free → no reset
+      expect(await readGoneStrikes(path)).toBe(1);
+      expect(await settleGoneStrikes(true, false, { goneStrikesPath: path, freeModePath })).toBe("teardown"); // strike 2
+      // Pro: a real delivered sweep still breaks the streak (one transient 404 can't accumulate).
+      await resetGoneStrikes(path);
+      await rm(freeModePath, { force: true });
+      expect(await settleGoneStrikes(true, false, { goneStrikesPath: path, freeModePath })).toBe("retry");
+      expect(await settleGoneStrikes(false, true, { goneStrikesPath: path, freeModePath })).toBe("ok");
+      expect(await exists(path)).toBe(false);
+      expect(await settleGoneStrikes(true, false, { goneStrikesPath: path, freeModePath })).toBe("retry"); // 1 again, not 2
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("teardown drops the free-mode marker with the config (status stops saying Nomo Free)", async () => {
+    const { path, cleanup } = await tmpStrikes();
+    const dir = join(path, "..");
+    try {
+      await writeFile(join(dir, "config.json"), "{}");
+      await markFreeMode(join(dir, "free-mode"));
+      await removeRevokedConfig(join(dir, "config.json"), join(dir, "last-send"), path);
+      expect(await exists(join(dir, "config.json"))).toBe(false);
+      expect(await exists(join(dir, "free-mode"))).toBe(false);
     } finally {
       await cleanup();
     }

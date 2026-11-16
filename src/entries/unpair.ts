@@ -10,7 +10,7 @@
 
 import { readFile, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { CC_DIR, forgetAllDevinGrants, LAST_SEND_PATH, PAIR_HTML_PATH, parseConfig, parsePendingConfig } from "../core/shared";
+import { CC_DIR, clearFreeMode, forgetAllDevinGrants, freeModePathBeside, LAST_SEND_PATH, PAIR_HTML_PATH, parseConfig, parsePendingConfig } from "../core/shared";
 
 export interface UnpairDeps {
   fetchFn?: typeof fetch;
@@ -99,6 +99,7 @@ export async function unpair(deps: UnpairDeps = {}): Promise<number> {
 
   await unlink(configPath).catch(() => {});
   await unlink(lastSendPath).catch(() => {});
+  await clearFreeMode(freeModePathBeside(configPath)); // the tier belonged to this pairing, not the next
   await unlink(htmlPath).catch(() => {}); // tear down the transient pairing page (best-effort)
   print("Unpaired ✓");
   return 0;

@@ -35,7 +35,8 @@ update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
   ephemeral **ECDH P-256** exchange) and never passes through a server. [Encryption](#encryption)
 - **The relay is blind.** The Cloudflare Worker that forwards pushes sees routing metadata only — never a
   title, machine name, status text, command or answer. The one thing it sees in the clear is the
-  once-a-minute presence ping: which agents have a turn open, and whether one is waiting for approval.
+  presence ping (once a minute, and when it changes): which agents have a turn open, and whether one is
+  waiting for approval.
   A free (not Pro) pairing sends only that ping and the sealed daily activity summary, except that after
   a quiet spell the first prompt's requests still go out (end-to-end encrypted, as always) and are refused.
   [What leaves your computer](#what-leaves-your-computer)
@@ -162,7 +163,7 @@ valid. The page is deleted when pairing completes.
 
 | Destination | When | What |
 |---|---|---|
-| Relay Worker (`https://api.nomo.gg`, or `NOMO_WORKER_URL` at pair time) | every session event; approval holds; pairing; unpair; the activity summary; presence about once a minute while an agent session is open | `/v1/cc/event`, `/v1/cc/decision*`, `/v1/cc/full`, `/v1/cc/pair/*`, `/v1/cc/presence` |
+| Relay Worker (`https://api.nomo.gg`, or `NOMO_WORKER_URL` at pair time) | every session event; approval holds; pairing; unpair; the activity summary; presence about once a minute while an agent session is open, plus one when it changes (at most every ~27 s) | `/v1/cc/event`, `/v1/cc/decision*`, `/v1/cc/full`, `/v1/cc/pair/*`, `/v1/cc/presence` |
 | Your iPhone, on the same network (only if LAN is turned on in the app) | commands and answers | `POST /v1/lan`, sealed under `K_lan` |
 | `github.com/KarrixLee/nomo` via `git` | `bunx nomo-ai` (OpenCode, Cursor, Antigravity, Devin legs) and `/nomo-update` | clone / fetch / pull of this repo |
 | The npm registry, via your package manager | `bunx nomo-ai`, for the short `nomo` command (skip with `--no-global`) | `bun add -g nomo-ai` or `npm install -g nomo-ai` |
@@ -196,7 +197,7 @@ computer twice — a UUID made once and kept in `~/.config/cc-status/machine-id`
 derived from serial, MAC, hostname or user name; delete the file for a new one.
 
 **Presence — two fields, every pairing.** About once a minute while the watchdog runs (an agent session
-is open), the plugin POSTs `/v1/cc/presence` with exactly `{ "coding": [agent ids], "waiting": true|false }`:
+is open), and as soon as the answer changes (never more than once per ~27 s), the plugin POSTs `/v1/cc/presence` with exactly `{ "coding": [agent ids], "waiting": true|false }`:
 which agents (`claude`, `codex`, …) have a turn open, and whether any session is waiting for an
 approval. No session id, title, folder, command or text. It is not sealed (the relay keeps it about 3
 minutes so the phone can show "Claude is coding"), and the reply tells the plugin whether the pairing is
@@ -204,7 +205,8 @@ Pro.
 
 **Free pairing (not Pro) — only presence and the activity summary leave the computer.** When the relay
 says a pairing is not Pro (the presence reply, or a 403 `{"error":"entitlement suspended"}` on any
-session route), the plugin writes `~/.config/cc-status/free-mode` and, while it is fresh (15 minutes,
+session route — or, from a relay that says so, the claim itself at pairing time), the plugin writes
+`~/.config/cc-status/free-mode` (removed on unpair, re-pair and a revoke teardown) and, while it is fresh (15 minutes,
 refreshed by each presence reply), sends **no** session events, opens **no** approval holds (every prompt
 goes straight to the agent's own dialog), uploads **no** plan or permission text, and keys the LAN
 listener off. Sessions are still tracked on disk so presence stays accurate. After a quiet spell (15

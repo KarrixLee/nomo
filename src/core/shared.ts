@@ -202,7 +202,8 @@ export const NO_HOLD_PATH = `${CC_DIR}/no-hold`;
 // reply (`tier`) and on any session route it refuses (403 `{"error":"entitlement suspended"}`). While not
 // Pro, the plugin sends NO session events, opens NO approval holds and uploads NO full text — only
 // presence and the sealed daily activity summary. The marker is a TTL'd epoch-ms stamp, refreshed by the
-// presence loop every ~60 s: if the server goes quiet it expires and the plugin fails OPEN to Pro
+// presence loop every ~60 s (set or cleared from the claim at pairing; unpair, re-pair and a revoke
+// teardown remove it): if the server goes quiet it expires and the plugin fails OPEN to Pro
 // behaviour for SENDING, and the first refused event re-marks it. The LAN listener does not fail open: it
 // stays keyed off while the marker file exists at all (lanBlockedByFreeMode), and only a real "pro"
 // answer deletes it — presence `tier:"pro"`, or a 2xx on a session route (applyTierFromResponse). It is
@@ -241,6 +242,12 @@ export function lanBlockedByFreeMode(path: string = FREE_MODE_PATH): boolean {
   } catch (e) {
     return (e as { code?: string } | null)?.code !== "ENOENT";
   }
+}
+
+/** The free-mode marker beside a given config.json (FREE_MODE_PATH for the live config). Pair/unpair
+ *  paths resolve it from their (injectable) config path, like the sessions dir. */
+export function freeModePathBeside(configPath: string): string {
+  return join(dirname(configPath), "free-mode");
 }
 
 export async function markFreeMode(path: string = FREE_MODE_PATH, now: number = Date.now()): Promise<void> {
@@ -1680,7 +1687,7 @@ export async function completePendingPairing(
   if (res.status === 404) return { state: "gone" };
   if (!res.ok) return { state: "rejected", httpStatus: res.status };
 
-  const body = (await res.json()) as { state?: string; phoneNonce?: string; deviceNameEnc?: string; path?: string; phoneEphPub?: string };
+  const body = (await res.json()) as { state?: string; phoneNonce?: string; deviceNameEnc?: string; path?: string; phoneEphPub?: string; suspended?: boolean };
   // A claimed record whose phoneNonce was stripped means it was ALREADY acked by a concurrent
   // completer (the watchdog / a prior wait) — the server keeps state:"claimed" but drops the nonce +
   // name blob after ack. We can't derive the key from it, so this is NOT "pending" (which would spin
@@ -1716,6 +1723,14 @@ export async function completePendingPairing(
   } catch {
     return { state: "tampered" }; // wrong key / malformed phone key → tampered; do NOT persist a bogus key
   }
+
+  // The new pairing's tier, set BEFORE its config exists so no hook ever runs it on the previous
+  // pairing's marker. `suspended: true` (a free claim) → free from the first hook: no events, no holds,
+  // LAN keyed off. Anything else — Pro, or a server that doesn't send the flag — clears it (fail open,
+  // like an absent marker); presence or the first refused event re-marks within a minute.
+  const freeModePath = freeModePathBeside(configPath);
+  if (body.suspended === true) await markFreeMode(freeModePath);
+  else await clearFreeMode(freeModePath);
 
   // Belt-and-suspenders: lock down any pre-existing file ahead of the atomicWrite (which already
   // writes the replacement at 0600 regardless).
@@ -2369,7 +2384,7 @@ export async function atomicWrite(path: string, data: string, mode?: number): Pr
 
 /** Best-effort teardown of the local pairing after the server has DEFINITIVELY revoked it (a
  *  /cc/event POST 404'd or 410'd — see requirePCAuth / dormant GC). Drops config.json, the last-send
- *  marker, AND the gone-strike counter, mirroring `unpair`, so /status stops reporting "paired" the
+ *  marker, the gone-strike counter AND the free-mode marker, mirroring `unpair`, so /status stops reporting "paired" the
  *  moment the phone forgets this machine. Shared by the hook (its 2-strike gone path) and the watchdog
  *  (its revoke sweep) so the teardown stays identical. Paths are injectable so tests can point at a
  *  temp HOME; the defaults are the live locations. Tolerates already-gone files (ENOENT). */
@@ -2377,10 +2392,12 @@ export async function removeRevokedConfig(
   configPath = `${CC_DIR}/config.json`,
   lastSendPath = LAST_SEND_PATH,
   goneStrikesPath = GONE_STRIKES_PATH,
+  freeModePath = freeModePathBeside(configPath),
 ): Promise<void> {
   await unlink(configPath).catch(() => {});
   await unlink(lastSendPath).catch(() => {});
   await unlink(goneStrikesPath).catch(() => {});
+  await clearFreeMode(freeModePath); // the tier belonged to the gone pairing
 }
 
 // --- Shared consecutive-gone strike counter -------------------------------------------------

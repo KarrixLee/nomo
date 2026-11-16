@@ -189,6 +189,9 @@ function lanBlockedByFreeMode(path = FREE_MODE_PATH) {
     return e?.code !== "ENOENT";
   }
 }
+function freeModePathBeside(configPath) {
+  return join(dirname(configPath), "free-mode");
+}
 async function markFreeMode(path = FREE_MODE_PATH, now = Date.now()) {
   await atomicWrite(path, String(now)).catch(() => {});
 }
@@ -772,6 +775,11 @@ async function completePendingPairing(pending, configPath, opts = {}) {
   } catch {
     return { state: "tampered" };
   }
+  const freeModePath = freeModePathBeside(configPath);
+  if (body.suspended === true)
+    await markFreeMode(freeModePath);
+  else
+    await clearFreeMode(freeModePath);
   try {
     await chmod(configPath, CONFIG_MODE);
   } catch {}
@@ -1057,10 +1065,11 @@ async function atomicWrite(path, data, mode) {
   await writeFile(tmp, data, mode !== undefined ? { mode } : undefined);
   await rename(tmp, path);
 }
-async function removeRevokedConfig(configPath = `${CC_DIR}/config.json`, lastSendPath = LAST_SEND_PATH, goneStrikesPath = GONE_STRIKES_PATH) {
+async function removeRevokedConfig(configPath = `${CC_DIR}/config.json`, lastSendPath = LAST_SEND_PATH, goneStrikesPath = GONE_STRIKES_PATH, freeModePath = freeModePathBeside(configPath)) {
   await unlink(configPath).catch(() => {});
   await unlink(lastSendPath).catch(() => {});
   await unlink(goneStrikesPath).catch(() => {});
+  await clearFreeMode(freeModePath);
 }
 async function readGoneStrikes(goneStrikesPath = GONE_STRIKES_PATH) {
   try {
@@ -10019,6 +10028,8 @@ function startActivityLoop(load = loadConfig, cycle = runActivityCycle) {
 // src/core/presence.ts
 import { readdir as readdir9, readFile as readFile10 } from "node:fs/promises";
 var PRESENCE_EVERY_MS = 60000;
+var PRESENCE_CHECK_MS = 5000;
+var PRESENCE_MIN_GAP_MS = 27000;
 var MAX_CODING = 8;
 function buildPresence(records) {
   const coding = new Set;
@@ -10046,10 +10057,21 @@ async function readRecords(dir) {
   }
   return out;
 }
-async function sendPresence(config, fetchFn = fetch, paths = {}) {
+function isGoneResponse(status, text) {
+  if (status === 410)
+    return true;
+  if (status !== 404)
+    return false;
+  try {
+    return JSON.parse(text).error === "not found";
+  } catch {
+    return false;
+  }
+}
+async function sendPresence(config, fetchFn = fetch, paths = {}, presence) {
   const freeModePath = paths.freeModePath ?? FREE_MODE_PATH;
   try {
-    const presence = buildPresence(await readRecords(paths.sessionsDir ?? SESSIONS_DIR));
+    const p = presence ?? buildPresence(await readRecords(paths.sessionsDir ?? SESSIONS_DIR));
     const res = await fetchFn(`${config.url}/v1/cc/presence`, {
       method: "POST",
       headers: {
@@ -10058,7 +10080,7 @@ async function sendPresence(config, fetchFn = fetch, paths = {}) {
         "x-cc-auth": config.pcSecret,
         "x-cc-version": PLUGIN_VERSION
       },
-      body: JSON.stringify({ coding: presence.coding, waiting: presence.waiting }),
+      body: JSON.stringify({ coding: p.coding, waiting: p.waiting }),
       signal: AbortSignal.timeout(5000)
     });
     const text = await res.text().catch(() => "");
@@ -10069,6 +10091,8 @@ async function sendPresence(config, fetchFn = fetch, paths = {}) {
       } catch {}
     } else if (isNotProResponse(res.status, text)) {
       tier = "free";
+    } else if (isGoneResponse(res.status, text)) {
+      return "gone";
     }
     if (tier === "free") {
       await markFreeMode(freeModePath);
@@ -10083,24 +10107,59 @@ async function sendPresence(config, fetchFn = fetch, paths = {}) {
     return null;
   }
 }
-function startPresenceLoop(load = loadConfig) {
-  let busy = false;
-  const run = async () => {
+function presenceDue(key, sentKey, lastAttemptAt, now) {
+  return now - lastAttemptAt >= (key === sentKey ? PRESENCE_EVERY_MS : PRESENCE_MIN_GAP_MS);
+}
+var EMPTY_KEY = JSON.stringify({ coding: [], waiting: false });
+function startPresenceLoop(deps = {}) {
+  const load = deps.load ?? loadConfig;
+  const read = deps.read ?? (() => readRecords(SESSIONS_DIR));
+  const send = deps.send ?? ((config, p) => sendPresence(config, fetch, {}, p));
+  const now = deps.now ?? Date.now;
+  let sentKey = null;
+  let lastAttemptAt = -Infinity;
+  let busy = null;
+  const attempt = async (config, p, key) => {
+    lastAttemptAt = now();
+    const result = await send(config, p);
+    if (result === "pro" || result === "free")
+      sentKey = key;
+    else if (result === "gone")
+      sentKey = null;
+    await deps.onResult?.(result);
+  };
+  const tick = () => {
     if (busy)
       return;
-    busy = true;
+    busy = (async () => {
+      const p = buildPresence(await read());
+      const key = JSON.stringify(p);
+      if (!presenceDue(key, sentKey, lastAttemptAt, now()))
+        return;
+      const config = await load();
+      if (config)
+        await attempt(config, p, key);
+    })().catch(() => {}).finally(() => {
+      busy = null;
+    });
+  };
+  const unschedule = deps.schedule?.(tick) ?? (() => {
+    const timer = setInterval(tick, PRESENCE_CHECK_MS);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  })();
+  tick();
+  return async (clear = false) => {
+    unschedule();
+    await busy;
+    if (!clear || sentKey === null || sentKey === EMPTY_KEY)
+      return;
     try {
       const config = await load();
       if (config)
-        await sendPresence(config);
-    } catch {} finally {
-      busy = false;
-    }
+        await attempt(config, { coding: [], waiting: false }, EMPTY_KEY);
+    } catch {}
   };
-  const timer = setInterval(() => void run(), PRESENCE_EVERY_MS);
-  timer.unref?.();
-  run();
-  return () => clearInterval(timer);
 }
 // src/entries/cc-watchdog.ts
 var POLL_MS = 5000;
@@ -12294,6 +12353,13 @@ async function sweep(config, deps = {}) {
 async function goneStrikeShouldTeardown(goneStrikesPath) {
   return await recordGoneStrike(goneStrikesPath) >= GONE_STRIKE_LIMIT;
 }
+async function settleGoneStrikes(gone, delivered, paths = {}) {
+  if (gone)
+    return await goneStrikeShouldTeardown(paths.goneStrikesPath) ? "teardown" : "retry";
+  if (delivered && !await isFreeMode(Date.now(), paths.freeModePath))
+    await resetGoneStrikes(paths.goneStrikesPath);
+  return "ok";
+}
 var activeBridgeShutdown;
 var activeCodexInterrupt;
 var activeLanShutdown;
@@ -12578,7 +12644,16 @@ async function run() {
   }, ANTIGRAVITY_SETTLE_TICK_MS);
   settleTimer.unref?.();
   const stopActivity = startActivityLoop();
-  const stopPresence = startPresenceLoop();
+  let presenceGone = false;
+  const stopPresence = startPresenceLoop({
+    onResult: async (r) => {
+      if (r === "gone")
+        presenceGone = true;
+      else if (r !== null)
+        await resetGoneStrikes();
+    }
+  });
+  let idleExit = false;
   try {
     while (true) {
       if (!enforceWatchdogOwnership(shutdown))
@@ -12597,16 +12672,16 @@ async function run() {
       });
       if (config)
         await enqueueDrainCommands(config);
-      if (result.revoked) {
-        if (await goneStrikeShouldTeardown()) {
-          await removeRevokedConfig();
-          return;
-        }
+      const strikes = await settleGoneStrikes(result.revoked || presenceGone, !result.revoked && result.delivered);
+      presenceGone = false;
+      if (strikes === "teardown") {
+        await removeRevokedConfig();
+        return;
+      }
+      if (strikes === "retry" || result.revoked) {
         await new Promise((r) => setTimeout(r, POLL_MS));
         continue;
       }
-      if (result.delivered)
-        await resetGoneStrikes();
       const remaining = result.remaining;
       if (!config) {
         const pending = await loadPendingConfig();
@@ -12631,21 +12706,26 @@ async function run() {
       if (remaining > 0)
         lastActiveMs = nowMs;
       if (remaining === 0) {
-        if (!config || nowMs - lastActiveMs >= IDLE_GRACE_MS)
+        if (!config)
           return;
+        if (nowMs - lastActiveMs >= IDLE_GRACE_MS) {
+          idleExit = true;
+          return;
+        }
       }
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
     clearInterval(settleTimer);
     stopActivity();
-    stopPresence();
+    const presenceStopped = stopPresence(idleExit);
     shutdown();
     activeBridgeShutdown = undefined;
     activeCodexInterrupt = undefined;
     activeLanShutdown = undefined;
     activeLanListener = undefined;
     releaseSingleInstance();
+    await presenceStopped;
   }
 }
 if (__require.main == __require.module) {
@@ -12764,6 +12844,7 @@ export {
   resolveCodexTuiOwner,
   retireDoneStale,
   setCodexBridgeDown,
+  settleGoneStrikes,
   shouldGreetHeartbeat,
   shouldHeartbeat,
   shouldIdleProvisionalCheck,

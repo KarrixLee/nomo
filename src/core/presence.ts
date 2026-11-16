@@ -1,10 +1,11 @@
 // presence — the tiny "who is coding, is anyone waiting" ping (2.5.0 free pairing).
 //
 // Sent for EVERY pairing, Pro or free (status lines never depend on the tier being exactly right), from the
-// watchdog every 60 s while it runs. The body is exactly `{ coding, waiting }`: the agent ids that have a
-// turn open and one yes/no for "an agent is waiting for approval". No session ids, titles, folders,
-// commands or timing beyond the request itself. The reply carries the pairing's tier, which is how the
-// plugin learns a free → Pro flip (live sessions resume within a minute) or Pro → free.
+// watchdog while it runs: at once when the state changes (an agent starts or stops coding, a prompt starts
+// or stops waiting), else every 60 s as a heartbeat. The body is exactly `{ coding, waiting }`: the agent
+// ids that have a turn open and one yes/no for "an agent is waiting for approval". No session ids, titles,
+// folders, commands or timing beyond the request itself. The reply carries the pairing's tier, which is
+// how the plugin learns a free → Pro flip (live sessions resume within a minute) or Pro → free.
 
 import { readdir, readFile } from "node:fs/promises";
 import {
@@ -12,7 +13,15 @@ import {
   PLUGIN_VERSION, SessionRecord, SESSIONS_DIR,
 } from "./shared";
 
+/** Heartbeat while nothing changes (the server forgets a presence 180 s after the last one). */
 export const PRESENCE_EVERY_MS = 60_000;
+/** How often the loop re-reads the local session records. Local only: no request unless the state changed
+ *  or the heartbeat is due. */
+export const PRESENCE_CHECK_MS = 5_000;
+/** Minimum gap between two presence POSTs, change or not. The server refuses (429) a POST within 25 s of
+ *  the last one it stored (server/src/presence.ts PRESENCE_MIN_INTERVAL_MS); +2 s covers latency skew.
+ *  Also what keeps state flapping from turning into a POST burst (workers.dev bans those silently). */
+export const PRESENCE_MIN_GAP_MS = 27_000;
 /** The server accepts at most 8 distinct agent ids. */
 const MAX_CODING = 8;
 
@@ -42,23 +51,35 @@ async function readRecords(dir: string): Promise<SessionRecord[]> {
   return out;
 }
 
-/** POST one presence ping and apply the tier it reports to the free-mode marker. Returns the tier, or null
- *  when the answer says nothing about it (429, 5xx, an older server's 404, offline) — the marker is then
- *  left alone to age out. Never throws, and never counts toward teardown. */
+export type PresenceResult = "pro" | "free" | "gone" | null;
+
+/** The pairing-gone answer: 410, or 404 with requirePCAuth's own `{"error":"not found"}` body — never a
+ *  bare route 404 from a server that predates /v1/cc/presence. */
+function isGoneResponse(status: number, text: string): boolean {
+  if (status === 410) return true;
+  if (status !== 404) return false;
+  try { return (JSON.parse(text) as { error?: unknown }).error === "not found"; } catch { return false; }
+}
+
+/** POST one presence ping and apply the tier it reports to the free-mode marker. Returns the tier, "gone"
+ *  when the server says the pairing no longer exists (the caller feeds that to the shared gone-strike
+ *  teardown), or null when the answer says nothing (409, 429, 5xx, an older server's route 404, offline)
+ *  — the marker is then left alone to age out. Never throws. `presence` defaults to the records on disk. */
 export async function sendPresence(
   config: Config, fetchFn: typeof fetch = fetch,
   paths: { sessionsDir?: string; freeModePath?: string } = {},
-): Promise<"pro" | "free" | null> {
+  presence?: Presence,
+): Promise<PresenceResult> {
   const freeModePath = paths.freeModePath ?? FREE_MODE_PATH;
   try {
-    const presence = buildPresence(await readRecords(paths.sessionsDir ?? SESSIONS_DIR));
+    const p = presence ?? buildPresence(await readRecords(paths.sessionsDir ?? SESSIONS_DIR));
     const res = await fetchFn(`${config.url}/v1/cc/presence`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION,
       },
-      body: JSON.stringify({ coding: presence.coding, waiting: presence.waiting }),
+      body: JSON.stringify({ coding: p.coding, waiting: p.waiting }),
       signal: AbortSignal.timeout(5000),
     });
     const text = await res.text().catch(() => "");
@@ -67,6 +88,8 @@ export async function sendPresence(
       try { tier = (JSON.parse(text) as { tier?: unknown }).tier; } catch { /* not JSON */ }
     } else if (isNotProResponse(res.status, text)) {
       tier = "free";
+    } else if (isGoneResponse(res.status, text)) {
+      return "gone";
     }
     if (tier === "free") { await markFreeMode(freeModePath); return "free"; }
     if (tier === "pro") { await clearFreeMode(freeModePath); return "pro"; }
@@ -76,20 +99,68 @@ export async function sendPresence(
   }
 }
 
-/** Watchdog hook: ping now, then every PRESENCE_EVERY_MS; overlapping runs are skipped and an unpaired
- *  computer sends nothing. Returns the stopper. */
-export function startPresenceLoop(load = loadConfig): () => void {
-  let busy = false;
-  const run = async () => {
+/** Pure. POST now? A changed state goes out on the first check at least PRESENCE_MIN_GAP_MS after the
+ *  last attempt; an unchanged one that the server accepted is refreshed every PRESENCE_EVERY_MS.
+ *  `sentKey` is the last state the server ACCEPTED (null after a gone/unknown answer, so it retries). */
+export function presenceDue(key: string, sentKey: string | null, lastAttemptAt: number, now: number): boolean {
+  return now - lastAttemptAt >= (key === sentKey ? PRESENCE_EVERY_MS : PRESENCE_MIN_GAP_MS);
+}
+
+const EMPTY_KEY = JSON.stringify({ coding: [], waiting: false });
+
+export interface PresenceLoopDeps {
+  load?: () => Promise<Config | null>;
+  read?: () => Promise<SessionRecord[]>;
+  send?: (config: Config, presence: Presence) => Promise<PresenceResult>;
+  /** Every answer, for the watchdog's gone-strike bookkeeping. */
+  onResult?: (result: PresenceResult) => void | Promise<void>;
+  now?: () => number;
+  /** Manual ticks for tests; the default is a PRESENCE_CHECK_MS interval. */
+  schedule?: (tick: () => void) => () => void;
+}
+
+/** Watchdog hook: check the local state every PRESENCE_CHECK_MS and POST per presenceDue. Overlapping
+ *  ticks are skipped; an unpaired computer sends nothing. Returns the stopper: `stop(true)` (the watchdog
+ *  retiring idle) also posts one last empty presence if the server still holds a non-empty one, so the
+ *  phone stops saying "Claude is coding" now instead of at the server's 180 s expiry. */
+export function startPresenceLoop(deps: PresenceLoopDeps = {}): (clear?: boolean) => Promise<void> {
+  const load = deps.load ?? loadConfig;
+  const read = deps.read ?? (() => readRecords(SESSIONS_DIR));
+  const send = deps.send ?? ((config: Config, p: Presence) => sendPresence(config, fetch, {}, p));
+  const now = deps.now ?? Date.now;
+  let sentKey: string | null = null;
+  let lastAttemptAt = -Infinity;
+  let busy: Promise<void> | null = null;
+  const attempt = async (config: Config, p: Presence, key: string) => {
+    lastAttemptAt = now();
+    const result = await send(config, p);
+    if (result === "pro" || result === "free") sentKey = key;
+    else if (result === "gone") sentKey = null; // retry at the gap: a real revoke reaches its 2nd strike fast
+    await deps.onResult?.(result);
+  };
+  const tick = () => {
     if (busy) return;
-    busy = true;
+    busy = (async () => {
+      const p = buildPresence(await read());
+      const key = JSON.stringify(p);
+      if (!presenceDue(key, sentKey, lastAttemptAt, now())) return;
+      const config = await load();
+      if (config) await attempt(config, p, key);
+    })().catch(() => { /* best-effort */ }).finally(() => { busy = null; });
+  };
+  const unschedule = deps.schedule?.(tick) ?? (() => {
+    const timer = setInterval(tick, PRESENCE_CHECK_MS);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    return () => clearInterval(timer);
+  })();
+  tick();
+  return async (clear = false) => {
+    unschedule();
+    await busy;
+    if (!clear || sentKey === null || sentKey === EMPTY_KEY) return;
     try {
       const config = await load();
-      if (config) await sendPresence(config);
-    } catch { /* best-effort */ } finally { busy = false; }
+      if (config) await attempt(config, { coding: [], waiting: false }, EMPTY_KEY);
+    } catch { /* best-effort */ }
   };
-  const timer = setInterval(() => void run(), PRESENCE_EVERY_MS);
-  (timer as unknown as { unref?: () => void }).unref?.();
-  void run();
-  return () => clearInterval(timer);
 }

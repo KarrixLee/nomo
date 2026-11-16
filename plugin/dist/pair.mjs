@@ -186,6 +186,9 @@ function lanBlockedByFreeMode(path = FREE_MODE_PATH) {
     return e?.code !== "ENOENT";
   }
 }
+function freeModePathBeside(configPath) {
+  return join(dirname(configPath), "free-mode");
+}
 async function markFreeMode(path = FREE_MODE_PATH, now = Date.now()) {
   await atomicWrite(path, String(now)).catch(() => {});
 }
@@ -769,6 +772,11 @@ async function completePendingPairing(pending, configPath, opts = {}) {
   } catch {
     return { state: "tampered" };
   }
+  const freeModePath = freeModePathBeside(configPath);
+  if (body.suspended === true)
+    await markFreeMode(freeModePath);
+  else
+    await clearFreeMode(freeModePath);
   try {
     await chmod(configPath, CONFIG_MODE);
   } catch {}
@@ -1054,10 +1062,11 @@ async function atomicWrite(path, data, mode) {
   await writeFile(tmp, data, mode !== undefined ? { mode } : undefined);
   await rename(tmp, path);
 }
-async function removeRevokedConfig(configPath = `${CC_DIR}/config.json`, lastSendPath = LAST_SEND_PATH, goneStrikesPath = GONE_STRIKES_PATH) {
+async function removeRevokedConfig(configPath = `${CC_DIR}/config.json`, lastSendPath = LAST_SEND_PATH, goneStrikesPath = GONE_STRIKES_PATH, freeModePath = freeModePathBeside(configPath)) {
   await unlink(configPath).catch(() => {});
   await unlink(lastSendPath).catch(() => {});
   await unlink(goneStrikesPath).catch(() => {});
+  await clearFreeMode(freeModePath);
 }
 async function readGoneStrikes(goneStrikesPath = GONE_STRIKES_PATH) {
   try {
@@ -4245,6 +4254,7 @@ async function pairStart(deps = {}) {
     codeString = formatCodeString(channel, words);
   }
   await revokeExisting(fetchFn, configPath, print);
+  await clearFreeMode(freeModePathBeside(configPath));
   await atomicWrite(configPath, JSON.stringify({
     url: workerUrl,
     pairingId,

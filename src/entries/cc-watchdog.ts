@@ -3997,6 +3997,22 @@ export async function goneStrikeShouldTeardown(goneStrikesPath?: string): Promis
   return (await recordGoneStrike(goneStrikesPath)) >= GONE_STRIKE_LIMIT;
 }
 
+/** One watchdog cycle's verdict on the shared gone streak. `gone`: a /cc/event POST or a presence ping
+ *  answered 404/410 → a strike via goneStrikeShouldTeardown ("teardown" at the limit, else "retry"). Do
+ *  NOT tear down on the first one — a single gone can be a transient/racing delete (worker redeploy, KV
+ *  eventual consistency); a genuine revoke 404s every request, so the streak reaches GONE_STRIKE_LIMIT
+ *  within a couple of cycles. Otherwise a delivered sweep proves the pairing alive and clears any stray
+ *  strike — EXCEPT for a free pairing, whose "delivered" is postEvent's local short-circuit, not a 2xx:
+ *  resetting on it would wipe every strike presence records, and a revoked free pairing would never
+ *  tear down. Paths injectable for tests. */
+export async function settleGoneStrikes(
+  gone: boolean, delivered: boolean, paths: { goneStrikesPath?: string; freeModePath?: string } = {},
+): Promise<"teardown" | "retry" | "ok"> {
+  if (gone) return (await goneStrikeShouldTeardown(paths.goneStrikesPath)) ? "teardown" : "retry";
+  if (delivered && !(await isFreeMode(Date.now(), paths.freeModePath))) await resetGoneStrikes(paths.goneStrikesPath);
+  return "ok";
+}
+
 // --- Codex remote-input bridge supervision (presence-gated, deadline-decoupled) ----------------
 //
 // The bridge attaches to the SHARED codex app-server through `codex app-server proxy`, and a real
@@ -4533,9 +4549,19 @@ async function run(): Promise<void> {
   // NOM-142 daily activity summary: scan now, then hourly, off the sweep path (chunked + yielding, so
   // the first ~2 GB backfill never stalls the 5 s poll). Self-gated on pairing; swallows every error.
   const stopActivity = startActivityLoop();
-  // 2.5.0 presence: who is coding + waiting yes/no, every 60 s, for every pairing. Its reply's tier
-  // keeps the free-mode marker fresh (or clears it the minute a purchase flips the pairing to Pro).
-  const stopPresence = startPresenceLoop();
+  // 2.5.0 presence: who is coding + waiting yes/no, for every pairing — at once on a change, else every
+  // 60 s. Its reply's tier keeps the free-mode marker fresh (or clears it the minute a purchase flips the
+  // pairing to Pro). Its answer also feeds the gone-strike streak: a free pairing sends no events, so
+  // presence is the only request that can learn the phone revoked it (a 404/410 counts as a strike, any
+  // tier answer proves the pairing alive).
+  let presenceGone = false;
+  const stopPresence = startPresenceLoop({
+    onResult: async (r) => {
+      if (r === "gone") presenceGone = true;
+      else if (r !== null) await resetGoneStrikes();
+    },
+  });
+  let idleExit = false;
   try {
     while (true) {
       // A claim can be stolen or removed after startup (upgrade takeover, reset, racing spawn). An
@@ -4575,26 +4601,21 @@ async function run(): Promise<void> {
       // Drained once per tick, off the POST path, so a slow osascript can never delay a status event.
       // Best-effort by construction — drainCommands swallows everything and returns a count.
       if (config) await enqueueDrainCommands(config);
-      if (result.revoked) {
-        // A /cc/event POST came back gone (404/410) this sweep. Do NOT tear down on the first one — a
-        // single gone can be a transient/racing delete (worker redeploy, KV eventual-consistency), and
-        // nuking a healthy pairing's credential config on one blip is exactly what the hook's 2-strike
-        // guard prevents. Count it against the SAME shared streak and only tear down at the limit; the
-        // hook's own successful POSTs (or a later watchdog delivery) reset it. A genuine revoke 404s
-        // every POST, so the streak reaches GONE_STRIKE_LIMIT within a couple of cycles either way.
-        if (await goneStrikeShouldTeardown()) {
-          // Confirmed gone: tear the stale config down so /status stops claiming "paired", then quit —
-          // the next hook (if any) starts a fresh, unpaired-inert cycle.
-          await removeRevokedConfig();
-          return;
-        }
+      // A /cc/event POST or a presence ping came back gone (404/410) this sweep → one strike against the
+      // shared streak; teardown only at the limit (see settleGoneStrikes).
+      const strikes = await settleGoneStrikes(result.revoked || presenceGone, !result.revoked && result.delivered);
+      presenceGone = false;
+      if (strikes === "teardown") {
+        // Confirmed gone: tear the stale config down so /status stops claiming "paired", then quit —
+        // the next hook (if any) starts a fresh, unpaired-inert cycle.
+        await removeRevokedConfig();
+        return;
+      }
+      if (strikes === "retry" || result.revoked) { // (a revoked sweep is always a strike; this narrows its type)
         // First strike → treat as transient: retry next cycle instead of tearing down.
         await new Promise((r) => setTimeout(r, POLL_MS));
         continue;
       }
-      // A delivered POST this sweep proves the pairing is alive → clear any stray gone-strike so two
-      // transient blips separated by a success can never accumulate to a false teardown.
-      if (result.delivered) await resetGoneStrikes();
       const remaining = result.remaining;
       if (!config) {
         // Unpaired OR mid-pairing. Opportunistically complete a pending pairing (self-heal), then keep
@@ -4628,20 +4649,24 @@ async function run(): Promise<void> {
         // No sessions this sweep. Unpaired (or mid-pairing with no pending) → nothing to discover, so
         // retire immediately as before; the hook re-spawns us. Paired → linger through the idle grace so
         // discovery can surface the next freshly-opened Codex TUI, then retire once truly idle.
-        if (!config || nowMs - lastActiveMs >= IDLE_GRACE_MS) return;
+        if (!config) return;
+        if (nowMs - lastActiveMs >= IDLE_GRACE_MS) { idleExit = true; return; }
       }
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
     clearInterval(settleTimer);
     stopActivity();
-    stopPresence();
+    const presenceStopped = stopPresence(idleExit);
     shutdown(); // bridge child AND the LAN socket — a retired daemon must leave no listener behind
     activeBridgeShutdown = undefined;
     activeCodexInterrupt = undefined;
     activeLanShutdown = undefined;
     activeLanListener = undefined;
     releaseSingleInstance(); // auto-quit on empty: drop our pidfile so the next hook re-spawns
+    // Retiring idle: one last presence clears a server copy that still says "coding" (only if it does).
+    // After the pidfile release so a successor is never blocked on it; bounded by its 5 s timeout.
+    await presenceStopped;
   }
 }
 
