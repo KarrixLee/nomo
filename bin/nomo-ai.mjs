@@ -77,7 +77,7 @@ const row = (/** @type {string} */ c, /** @type {string} */ what) => `  ${`${CMD
 
 const USAGE = `${INVOKED} ${VERSION} — install (or update) the Nomo plugin for your coding agents.
 
-${row("", "detect agents, confirm, install")}
+${row("", "detect agents (ticked), press Enter, install, then pair")}
 ${CMD === "nomo" ? "" : `  ${"npx nomo-ai".padEnd(CMD.length + 12)} same, without bun\n`}
 Commands (from any folder; they run your installed Nomo, shared by every agent here):
 ${row(" pair", "pair this computer with your phone (opens the QR page, then waits")}
@@ -91,7 +91,7 @@ An agent that already has Nomo shows an update instead of an install. OpenCode's
 done for you — it has no marketplace, so its checkout is its version. Claude Code and
 Codex own their own updates, so their command is printed for you to run.
 
-Agents (naming any one of these skips the prompt):
+Agents (naming any one of these skips the picker):
   --claude                Claude Code
   --codex                 OpenAI Codex
   --opencode              OpenCode
@@ -101,7 +101,8 @@ Agents (naming any one of these skips the prompt):
   --all                   all of them (Cursor/Antigravity/Devin only if on this machine)
 
 Options:
-  -y, --yes               no prompt; install every agent detected on this machine
+  -y, --yes               no prompts; install every agent detected on this machine
+                          (never pairs — run \`${CMD} pair\` after)
       --uninstall         same as the \`uninstall\` command
   -n, --dry-run           print the commands that would run, run nothing
       --no-global         do not install the short \`nomo\` command (installed by default
@@ -113,8 +114,10 @@ Options:
   -h, --help              this
   -v, --version           print the version
 
-Installing never pairs your phone — that stays a deliberate step: \`${CMD} pair\`,
-or from inside the agent (/nomo-cc:pair, $nomo-pair, /nomo-pair).
+In a terminal, the install ends with one question: "Pair your phone now? [Y/n]" (Enter
+is yes; skipped when this computer is already paired). It never pairs without that
+answer — --yes, --dry-run, CI and piped runs never ask and never pair. Pair any time
+with \`${CMD} pair\`, or from inside the agent (/nomo-cc:pair, $nomo-pair, /nomo-pair).
 ${CMD === "nomo" ? "" : "\nShort form: the installer also adds the `nomo` command, so `nomo pair`, `nomo status`, …\nwork too. Never `bunx nomo` / `npx nomo`: that package is not ours.\n"}
 Uninstall (removes only what Nomo wrote; your phone stays paired for your other agents):
   ${CMD} uninstall --cursor        Nomo's entries in ~/.cursor/hooks.json + /nomo-* skills
@@ -436,10 +439,15 @@ const AGENTS = [
     plan: () =>
       STATUS.get("claude")?.lines ??
       [`claude plugin marketplace add ${REPO}`, `claude plugin install nomo-cc@nomo -y`],
+    // `next` is what is left AFTER the install, as whole sentences for the numbered "What's left" list.
+    // No pairing step in any of them: one pairing covers every agent, so it is one shared step (or the
+    // Pair-now question) instead of one per agent.
     next: () =>
       STATUS.get("claude")?.installed
-        ? [`run \`${CLAUDE_UPDATE}\`, then restart Claude Code`]
-        : ["restart Claude Code so the hooks load", "run /nomo-cc:pair"],
+        ? [`Run \`${CLAUDE_UPDATE}\`, then restart Claude Code.`]
+        : ["Restart Claude Code so Nomo's hooks load."],
+    // The in-agent pair command — only printed when no installed copy can run `nomo pair` (see summary()).
+    pair: "/nomo-cc:pair in Claude Code",
     manualUninstall: "claude plugin uninstall nomo-cc@nomo",
     detect: () => onPath("claude") || existsSync(join(homedir(), ".claude")),
     installed: () => hostHasNomo(join(homedir(), ".claude", "plugins", "cache"), "nomo-cc"),
@@ -472,13 +480,15 @@ const AGENTS = [
     plan: () =>
       STATUS.get("codex")?.lines ?? [`codex plugin marketplace add ${REPO}`, `codex plugin add nomo@nomo`],
     // The /hooks step is Codex's own safety gate and nothing here can pre-approve it. Skipping it
-    // leaves the plugin installed and silently doing nothing, so it leads the list.
+    // leaves the plugin installed and silently doing nothing, so it is spelled out. No count: the
+    // number of hooks changes between releases (status-cmd's CODEX_PLUGIN_HOOK_COUNT).
     next: () =>
       STATUS.get("codex")?.installed
         ? STATUS.get("codex").lines.some((l) => l.startsWith("  "))
-          ? ["run the command above, then restart Codex"]
-          : ["nothing to run here — this row printed no command on purpose"]
-        : ["run /hooks in Codex and trust the seven Nomo entries", "run $nomo-pair"],
+          ? ["Run the Codex command above, then restart Codex."]
+          : [] // read live from a local marketplace — nothing to run, so nothing to list
+        : ["Restart Codex, then type /hooks in it and trust the Nomo entries (Nomo stays off until you do)."],
+    pair: "$nomo-pair in Codex",
     manualUninstall: "codex plugin remove nomo@nomo",
     detect: () => onPath("codex") || existsSync(join(homedir(), ".codex")),
     installed: () => hostHasNomo(join(homedir(), ".codex", "plugins", "cache"), "nomo"),
@@ -507,10 +517,10 @@ const AGENTS = [
         `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
         `${CHECKOUT}/plugin/scripts/opencode-install.sh`,
       ],
-    next: () =>
-      STATUS.get("opencode")?.installed
-        ? ["restart OpenCode (plugins load once at server start; no hot reload)"]
-        : ["restart OpenCode (plugins load once at server start; no hot reload)", "run /nomo-pair"],
+    // Plugins load once at server start, and so does the pairing: this is the one agent where pairing
+    // has to come BEFORE the restart, which is why the pair step leads the "What's left" list.
+    next: () => ["Restart OpenCode (it loads Nomo only when it starts)."],
+    pair: "/nomo-pair in OpenCode",
     manualUninstall: "delete ~/.config/opencode/plugins/nomo.js and ~/.config/opencode/commands/nomo-*.md",
     detect: () =>
       onPath("opencode") ||
@@ -563,10 +573,8 @@ const AGENTS = [
             `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
             `node ${CURSOR_SCRIPT}`,
           ],
-    next: () =>
-      STATUS.get("cursor")?.installed
-        ? ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json"]
-        : ["restart Cursor (and any open cursor-agent) so it re-reads hooks.json", "run /nomo-pair"],
+    next: () => ["Restart Cursor (and any open cursor-agent) so it re-reads hooks.json."],
+    pair: "/nomo-pair in Cursor",
     uninstallScript: CURSOR_SCRIPT,
     detect: () => onPath("cursor-agent") || onPath("cursor") || existsSync(cursorDir()),
     // The one agent whose installer NEEDS the host's own directory to exist (it merges into a file
@@ -617,10 +625,8 @@ const AGENTS = [
             `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
             `node ${ANTIGRAVITY_SCRIPT}`,
           ],
-    next: () =>
-      STATUS.get("antigravity")?.installed
-        ? ["restart Antigravity (and any open agy)", "type /nomo-status to check"]
-        : ["restart Antigravity (and any open agy)", "type /nomo-pair"],
+    next: () => ["Restart Antigravity (and any open agy)."],
+    pair: "/nomo-pair in Antigravity",
     uninstallScript: ANTIGRAVITY_SCRIPT,
     detect: () => onPath("agy") || existsSync(antigravityDir()),
     skipUndetectedUnderAll: true,
@@ -663,15 +669,9 @@ const AGENTS = [
               `git clone --depth 1 ${REF ? `--branch ${REF} ` : ""}${CLONE_URL} ${CHECKOUT}`,
               `node ${DEVIN_SCRIPT}`,
             ],
-    next: () =>
-      STATUS.get("devin")?.installed === "plugin"
-        ? ["already paired from another agent? nothing to do — otherwise type /nomo:pair in devin"]
-        : STATUS.get("devin")?.installed
-          ? ["restart devin (and Devin Desktop)"]
-          : [
-              "restart devin (and Devin Desktop)",
-              "already paired from another agent? nothing to do — otherwise type /nomo-pair in devin",
-            ],
+    next: () => (STATUS.get("devin")?.installed === "plugin" ? [] : ["Restart devin (and Devin Desktop)."]),
+    // The native Devin plugin's skills are /nomo:*, and its copy is not one installedEntry can find.
+    get pair() { return STATUS.get("devin")?.installed === "plugin" ? "/nomo:pair in devin" : "/nomo-pair in devin"; },
     uninstallScript: DEVIN_SCRIPT,
     detect: () => onPath("devin") || existsSync(devinDir()),
     skipUndetectedUnderAll: true,
@@ -867,19 +867,17 @@ function frame(selected, detected, cursor) {
   AGENTS.forEach((a, i) => {
     const on = selected.has(a.id);
     const here = i === cursor;
-    // Nothing is ticked when this opens, so detection has to carry itself visually or the answer to
-    // "which of these do I even have?" costs a keypress: a found agent is bold and says so, one that
-    // is missing is dimmed whole. Both keep their word — only the automatic ticking went away.
+    // Detected agents open ticked (so the common case is a single Enter), but detection still carries
+    // itself visually: a found agent is bold and says so, one that is missing is dimmed whole.
     const found = !!detected.get(a.id);
     const label = found ? `${bold(a.label)}${dim("  (detected)")}` : dim(`${a.label}  (not detected)`);
     rows.push(`  ${here ? bold("❯") : " "} ${dim(`${i + 1}.`)} [${on ? "*" : " "}] ${label}`);
-    // The plan follows the CURSOR as well as the tick. With an empty starting selection, tying it to
-    // the tick alone would open on a list of three bare names — the commands each row would run are
-    // the whole point of showing a plan before the install, and moving is cheaper than guessing.
+    // The plan follows the CURSOR as well as the tick, so an unticked row still shows what it would
+    // run before anyone ticks it.
     if (on || here) for (const line of a.plan()) rows.push(`         ${dim(line)}`);
   });
   rows.push("");
-  if (cursor >= 0) rows.push(`  ${dim("↑↓ move · space select · enter install · esc/q quit")}`);
+  if (cursor >= 0) rows.push(`  ${dim("enter install the ticked agents · space tick/untick · ↑↓ move · q quit")}`);
   return rows;
 }
 
@@ -918,8 +916,8 @@ function chooseArrows(selected) {
   // waste even when it is a fast one.
   const detected = new Map(AGENTS.map((a) => [a.id, a.detect()]));
   const stdin = process.stdin;
-  // Open on the first agent this machine actually has, so the common single-agent case is
-  // space-enter and never "arrow past the two I do not own". All-missing falls back to the top.
+  // Open on the first agent this machine actually has (already ticked — see main), so its plan is the
+  // one on screen. All-missing falls back to the top.
   let cursor = Math.max(AGENTS.findIndex((a) => detected.get(a.id)), 0);
   let live = true;
   painted = [];
@@ -1033,7 +1031,7 @@ async function chooseNumbered(selected) {
     for (;;) {
       render(selected);
       // Ctrl+D (end of input) is a user saying "no", not a crash — see ask() for why it needs help.
-      const line = await ask(rl, `Type a number to toggle, ${bold("Enter")} to install, ${bold("q")} to quit: `);
+      const line = await ask(rl, `${bold("Enter")} to install the ticked agents, a number to tick/untick, ${bold("q")} to quit: `);
       if (line === null) {
         say();
         return false;
@@ -1308,7 +1306,7 @@ function globalBinDir(/** @type {string} */ pm) {
 /** One line from `rl`, or null at end of input. node:readline/promises leaves `question()` PENDING
  *  forever when stdin ends (Ctrl-D on an empty line, a closed pipe): nothing else keeps the event loop
  *  alive, so node quit with "unsettled top-level await" and exit 13 — after a successful install, with
- *  the Next: hints never printed. So a close (or a stdin that already ended) settles it as null.
+ *  the "What's left" list never printed. So a close (or a stdin that already ended) settles it as null.
  *  @param {import("node:readline/promises").Interface} rl @param {string} q
  *  @returns {Promise<string | null>} */
 function ask(rl, q) {
@@ -1324,7 +1322,7 @@ function ask(rl, q) {
 }
 
 /** Install the short command (or, under -n, show the command). Returns whether `nomo` is now usable
- *  and ours — which decides the form the Next: hints print. Never fails the run, never asks.
+ *  and ours — which decides the form the "What's left" list prints. Never fails the run, never asks.
  *  @param {boolean} noGlobal --no-global: install nothing, say nothing, just report what is there. */
 function installShortCommand(noGlobal) {
   const state = shortCommandState();
@@ -1354,6 +1352,82 @@ function installShortCommand(noGlobal) {
   else say(`Installed, but ${globalBinDir(pm)} is not on your PATH — add it, or keep using \`bunx nomo-ai\`.`);
   say();
   return ok;
+}
+
+// ── pairing offer + what's left ──────────────────────────────────────────────────────────────────
+//
+// Pairing is still a deliberate act: it happens only on a typed (or Entered) yes to one question, and
+// only when there is a human at a terminal to answer it. Pairing BEFORE the restart is fine for every
+// agent and REQUIRED for OpenCode: Claude Code, Codex, Cursor, Antigravity and Devin run each hook as
+// a fresh process that reads config.json every time, but OpenCode's resident plugin reads it once at
+// server start and no-ops for that whole server if it was unpaired then. So the question comes before
+// the restart steps, and when pairing is left for later the pair step leads the list.
+
+/** Is this computer already paired? A DELIBERATE TWIN of parseConfig in src/core/shared.ts (this file
+ *  ships alone): a completed config.json carries url, pairingId, pcSecret and e2eKeyB64. A pending one
+ *  (QR shown, never scanned) has no e2eKeyB64 and reads as not paired — re-pairing replaces it. */
+function isPaired() {
+  try {
+    const c = JSON.parse(readFileSync(join(ccDir(), "config.json"), "utf8"));
+    return ["url", "pairingId", "pcSecret", "e2eKeyB64"].every((k) => typeof c?.[k] === "string");
+  } catch {
+    return false;
+  }
+}
+
+/** `CI` set to anything but empty/0/false — the convention every CI provider follows. */
+const inCI = () => !!process.env.CI && !/^(0|false)$/i.test(process.env.CI);
+
+/** Ask `Pair your phone now? [Y/n]` — or don't, and say nothing. Never asked under --yes, --dry-run,
+ *  CI, or without a terminal on both ends; nor when no installed copy can run the pair entry (the
+ *  native Devin plugin), since a yes would only print "not installed". Enter is yes; Ctrl-D is no.
+ *  @param {boolean} yes */
+async function offerPair(yes) {
+  if (yes || DRY || inCI() || !interactive() || !installedEntry("pair")) return false;
+  const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: false });
+  try {
+    const answer = await ask(rl, `${bold("Pair your phone now?")} [Y/n] `);
+    say();
+    return answer !== null && /^(y|yes)?$/i.test(answer.trim());
+  } finally {
+    rl.close();
+  }
+}
+
+/** Exactly what `nomo pair` runs (runCommand: the installed pair entry, start then wait). Ctrl-C while
+ *  it waits stops the pairing, not the installer — the restart steps still need printing. spawnSync
+ *  blocks the loop, so the no-op listener only has to exist to stop node's default SIGINT exit. */
+function runPair() {
+  const keep = () => {};
+  process.on("SIGINT", keep);
+  try {
+    runCommand("pair", []);
+  } finally {
+    process.off("SIGINT", keep);
+  }
+  say();
+}
+
+/** One numbered list of what is left, naming the agents just installed. The pair step leads it when
+ *  this computer is still unpaired (see above for why it goes before the restarts).
+ *  @param {typeof AGENTS} done @param {string} cli @param {boolean} wasPaired */
+function summary(done, cli, wasPaired) {
+  const steps = done.flatMap((a) => a.next());
+  if (!isPaired()) {
+    // The pair entry can be missing only for the native Devin plugin; its own skill pairs instead.
+    const how = installedEntry("pair") ? `run \`${cli} pair\` from any folder` : `type ${done[0].pair}`;
+    steps.unshift(`Pair your phone: ${how}, then scan the QR code with the Nomo app. One pairing covers every agent.`);
+  } else if (wasPaired) {
+    say(dim("This computer is already paired with your phone."));
+  }
+  if (steps.length > 0) {
+    say(bold("What's left:"));
+    steps.forEach((s, i) => say(`  ${i + 1}. ${s}`));
+  } else {
+    say(bold("All set — nothing left to do."));
+  }
+  say();
+  say(dim("Docs: https://docs.nomo.gg"));
 }
 
 // ── main ─────────────────────────────────────────────────────────────────────────────────────────
@@ -1409,11 +1483,10 @@ async function main() {
 
   const explicit = args.picked.size > 0;
   const found = AGENTS.filter((a) => a.detect()).map((a) => a.id);
-  // The PROMPT opens with nothing ticked: this writes into ~/.claude, ~/.codex and
-  // ~/.config/opencode, and a stray Enter should do nothing rather than install three things. What
-  // was detected is still on screen, it just no longer ticks itself. --yes and the agent flags are
-  // untouched — those are a caller who already said what they want.
-  const selected = explicit ? args.picked : new Set(args.yes ? found : []);
+  // The prompt opens with every DETECTED agent ticked, so the common case is one Enter — the same
+  // set --yes installs without asking. Undetected agents stay unticked. Agent flags are a caller who
+  // already said what they want, so they replace the detected set.
+  const selected = explicit ? args.picked : new Set(found);
 
   if (!explicit && found.length === 0) {
     err("\nnomo-ai: found no Claude Code, Codex, OpenCode, Cursor, Antigravity or Devin install on this machine.");
@@ -1499,14 +1572,9 @@ async function main() {
   }
   const cli = short ? "nomo" : "bunx nomo-ai";
   if (done.length > 0 && !DRY) {
-    say(bold("Next:"));
-    for (const a of done) {
-      say(`  ${a.label}`);
-      for (const step of a.next()) say(`    - ${step}`);
-    }
-    say();
-    say(dim(`Pairing is one QR scan from the Nomo app's Sessions tab (\`${cli} pair\` from any folder). One pairing covers every agent.`));
-    say(dim("Docs: https://docs.nomo.gg"));
+    const wasPaired = isPaired();
+    if (!wasPaired && (await offerPair(!!args.yes))) runPair();
+    summary(done, cli, wasPaired);
   }
 
   return failures.length > 0 ? 1 : 0;

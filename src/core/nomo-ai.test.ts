@@ -46,6 +46,14 @@ async function machine(sourceType: string | undefined): Promise<string> {
   return home;
 }
 
+/** Shell that lays down a fake installed plugin copy at `root`: dist/pair.mjs plus a run.sh that logs
+ *  "<entry> <args>" to `root`/../calls.log — enough for installedEntry("pair") to find and run it. */
+function fakeCopySh(root: string): string {
+  return `mkdir -p '${root}/scripts' '${root}/dist' && : > '${root}/dist/pair.mjs' && ` +
+    `printf '#!/bin/sh\\ne=$(basename "$1" .mjs); shift; echo "$e $*" >> "%s"\\n' '${root}/calls.log' > '${root}/scripts/run.sh' && ` +
+    `chmod +x '${root}/scripts/run.sh'`;
+}
+
 async function plan(home: string): Promise<string> {
   const proc = spawnTestProcess({
     cmd: ["node", NOMO_AI, "--dry-run", "--codex"],
@@ -385,7 +393,9 @@ describe("the short `nomo` command", () => {
     const gbin = join(h, "gbin");
     await mkdir(bin, { recursive: true });
     await mkdir(gbin, { recursive: true });
-    await writeFile(join(bin, "claude"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    // Like the real one, `claude plugin install` leaves a copy in the plugin cache — the copy
+    // `nomo pair` runs, so the summary can name that command.
+    await writeFile(join(bin, "claude"), `#!/bin/sh\ncase "$*" in *"plugin install"*) ${fakeCopySh(join(h, ".claude", "plugins", "cache", "nomo", "nomo-cc", "2.5.0"))} ;; esac\nexit 0\n`, { mode: 0o755 });
     const log = join(h, "npm.log");
     const install = npm === "ok" ? `ln -s '${NOMO_AI}' '${gbin}/nomo'; exit 0` : npm === "fail" ? "echo npm ERR! boom >&2; exit 1" : "exit 0";
     await writeFile(join(bin, "npm"), `#!/bin/sh\necho "$*" >> '${log}'\ncase "$1" in\n  prefix) echo '${h}/elsewhere'; exit 0 ;;\n  install) ${install} ;;\nesac\nexit 0\n`, { mode: 0o755 });
@@ -626,5 +636,125 @@ describe("bunx nomo-ai --devin", () => {
     const r = await nomoAi(["--dry-run", "--devin", "--ref", "dev"]);
     expect(r.out).toContain("(OpenCode, Cursor, Antigravity, Devin) only");
     expect(r.out).not.toContain("None of them is selected");
+  });
+});
+
+// Driven through a REAL pseudo-terminal (Bun.spawn's `terminal`), because the picker and the pair
+// question only exist when stdin AND stdout are TTYs. The pair entry is the fake copy's run.sh, which
+// only logs — no browser, no network.
+describe("one step: detected agents open ticked, then `Pair your phone now?`", () => {
+  const QUESTION = "Pair your phone now? [Y/n]";
+  async function session(flags: string[], opts: { paired?: boolean; env?: Record<string, string | undefined>; tty?: boolean } = {}) {
+    const h = await mkdtemp(join(tmpdir(), "nomo-ai-tty-"));
+    homes.push(h);
+    const bin = join(h, "bin");
+    const copy = join(h, ".claude", "plugins", "cache", "nomo", "nomo-cc", "2.5.0");
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(bin, "claude"), `#!/bin/sh\ncase "$*" in *"plugin install"*) ${fakeCopySh(copy)} ;; esac\nexit 0\n`, { mode: 0o755 });
+    const cc = join(h, "cc");
+    const pair = async () => {
+      await mkdir(cc, { recursive: true });
+      await writeFile(join(cc, "config.json"), JSON.stringify({ url: "https://x", pairingId: "p", pcSecret: "s", e2eKeyB64: "k" }));
+    };
+    if (opts.paired) await pair();
+    let out = "";
+    const decoder = new TextDecoder();
+    const env = isolatedTestEnv(h, { NO_COLOR: "1", PATH: `${bin}:/usr/bin:/bin`, NOMO_CC_DIR: cc, CI: undefined, ...opts.env });
+    const cmd = [Bun.which("node")!, NOMO_AI, "--no-global", ...flags];
+    const proc = opts.tty === false
+      ? spawnTestProcess({ cmd, cwd: h, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" })
+      : spawnTestProcess({ cmd, cwd: h, env, terminal: { cols: 160, rows: 50, data: (_t, d) => { out += decoder.decode(d); } } });
+    if (opts.tty === false) {
+      void Promise.all([new Response(proc.stdout as ReadableStream).text(), new Response(proc.stderr as ReadableStream).text()]).then(([o, e]) => { out = o + e; });
+    }
+    let exited = false;
+    const code = proc.exited.then(async (c) => { await Bun.sleep(100); exited = true; return c; });
+    const waitFor = async (text: string) => {
+      for (const end = Date.now() + 10_000; !out.includes(text);) {
+        if (exited || Date.now() > end) throw new Error(`never saw ${JSON.stringify(text)} in:\n${out}`);
+        await Bun.sleep(20);
+      }
+    };
+    return {
+      waitFor,
+      type: (s: string) => proc.terminal!.write(s),
+      done: async () => ({ code: await code, out }),
+      calls: async () => (await readFile(join(copy, "calls.log"), "utf8").catch(() => "")),
+      pair,
+    };
+  }
+
+  test("the picker opens with detected agents ticked and undetected ones not; Enter installs them", async () => {
+    const s = await session(["--dry-run"]);
+    await s.waitFor("enter install the ticked agents · space tick/untick");
+    s.type("\r");
+    const r = await s.done();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("[*] Claude Code  (detected)");
+    expect(r.out).toContain("[ ] OpenAI Codex  (not detected)");
+    expect(r.out).toContain("would run: claude plugin install nomo-cc@nomo -y");
+    expect(r.out).not.toContain("would run: codex");
+    expect(r.out).not.toContain(QUESTION); // --dry-run never asks
+    expect(await s.calls()).toBe("");
+  });
+
+  test("a terminal install asks once; Enter runs exactly `nomo pair` (start, then wait); the list is restarts only", async () => {
+    const s = await session([]);
+    await s.waitFor("enter install");
+    s.type("\r");
+    await s.waitFor(QUESTION);
+    await s.pair(); // what a successful scan leaves behind
+    s.type("\r");
+    const r = await s.done();
+    expect(r.code).toBe(0);
+    expect(await s.calls()).toBe("pair \npair wait\n");
+    expect(r.out).toContain("What's left:\r\n  1. Restart Claude Code so Nomo's hooks load.");
+    expect(r.out).not.toContain("Pair your phone: run");
+    expect(r.out).not.toContain("already paired");
+  });
+
+  test("named agent flags still get the question on a terminal", async () => {
+    const s = await session(["--claude"]);
+    await s.waitFor(QUESTION);
+    s.type("y\r");
+    await s.done();
+    expect(await s.calls()).toBe("pair \npair wait\n");
+  });
+
+  test("declining pairs nothing and leads the list with the later command (pair before the restart)", async () => {
+    const s = await session([]);
+    await s.waitFor("enter install");
+    s.type("\r");
+    await s.waitFor(QUESTION);
+    s.type("n\r");
+    const r = await s.done();
+    expect(r.code).toBe(0);
+    expect(await s.calls()).toBe("");
+    expect(r.out).toContain("1. Pair your phone: run `bunx nomo-ai pair` from any folder, then scan the QR code with the Nomo app.");
+    expect(r.out).toContain("2. Restart Claude Code so Nomo's hooks load.");
+  });
+
+  test("already paired: no question, no pair step, one line saying so", async () => {
+    const s = await session(["--claude"], { paired: true });
+    const r = await s.done();
+    expect(r.out).not.toContain(QUESTION);
+    expect(r.out).toContain("This computer is already paired with your phone.");
+    expect(r.out).not.toContain("Pair your phone:");
+    expect(await s.calls()).toBe("");
+  });
+
+  test("--yes, CI and a non-terminal run never ask and never pair", async () => {
+    for (const [flags, opts] of [
+      [["-y"], {}],
+      [["--claude"], { env: { CI: "true" } }],
+      [["--claude"], { tty: false }],
+    ] as const) {
+      const s = await session([...flags], opts);
+      const r = await s.done();
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain(QUESTION);
+      expect(r.out).toContain("1. Pair your phone: run `bunx nomo-ai pair`");
+      expect(await s.calls()).toBe("");
+    }
   });
 });

@@ -63,10 +63,18 @@ update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
 bunx nomo-ai     # or: npx nomo-ai
 ```
 
-It detects which agents are on this computer and installs Nomo for each through that agent's own
-install path (`--claude` `--codex` `--opencode` `--cursor` `--antigravity` `--devin` pick agents;
-`-n` prints the plan and runs nothing). Installing never pairs your phone and has no `postinstall`
-hook; pairing is the separate, explicit `nomo pair` (or the pair command inside your agent). Devin
+It detects which agents are on this computer, opens a picker with those agents already ticked, and on
+Enter installs Nomo for each through that agent's own install path (`--claude` `--codex` `--opencode`
+`--cursor` `--antigravity` `--devin` pick agents; `-n` prints the plan and runs nothing). There is no
+`postinstall` hook.
+
+**Pairing stays an explicit yes.** In an interactive terminal (stdin and stdout both a TTY), once at
+least one agent is installed and this computer is not already paired, the installer asks
+`Pair your phone now? [Y/n]`; yes runs exactly `nomo pair`. It never pairs without that answer:
+`--yes`, `--dry-run`, `CI=…` and piped or scripted runs never ask and never pair, and a computer that is
+already paired is never re-paired (re-pairing revokes the old pairing). Pair any time with `nomo pair`
+or the pair command inside your agent. Pairing before restarting the agents is fine for all of them,
+and OpenCode needs it that way round: it reads the pairing once, at start. Devin
 can instead use the plugin: `devin plugins install KarrixLee/nomo`. The three agent config files it
 merges into directly are undone with `nomo uninstall --cursor`, `nomo uninstall --antigravity` and
 `nomo uninstall --devin` (also spelled `--uninstall`; the same as
