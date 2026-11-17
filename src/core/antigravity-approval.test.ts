@@ -388,11 +388,15 @@ describe("Nomo's own /nomo-* commands never become phone cards", () => {
       expect((await run(`${c}\n`)).out).toBe('{"decision":"auto_approve"}');
       expect((await run(c, false)).out).toBe(ANTIGRAVITY_FALLBACK); // unpaired: Antigravity's own prompt
     }
-    expect([...SAFE_SKILL_COMMANDS].sort()).toEqual(["approvals-on", "approvals-status", "pair", "pair-wait", "reset", "status", "status-verbose"]);
+    expect([...SAFE_SKILL_COMMANDS].sort()).toEqual(["approvals-on", "approvals-status", "status", "status-verbose"]);
   });
 
-  test("pausing approvals, unpairing and the typed pairing code still ask the phone", async () => {
-    for (const key of ["approvals-off", "unpair", "pair-code"]) expect([key, (await run(skillCommand(ROOT, key))).held]).toEqual([key, true]);
+  // 2026-11-14 audit L2: on a paired computer `pair` revokes the current pairing, so a prompt-injected agent
+  // running the public skill line could silently cut the phone off. Pair/unpair/reset always ask.
+  test("pausing approvals, pairing, unpairing, reset and the typed pairing code still ask the phone", async () => {
+    for (const key of ["approvals-off", "unpair", "pair", "pair-wait", "pair-code", "reset"]) {
+      expect([key, await run(skillCommand(ROOT, key))]).toEqual([key, { out: ANTIGRAVITY_FALLBACK, held: true }]);
+    }
   });
 
   test("near misses go to the phone", async () => {

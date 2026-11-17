@@ -1,0 +1,4 @@
+[test]
+# Point CC_DIR (NOMO_CC_DIR) at a fresh temp dir for the whole run, so no in-process test reads or writes
+# the developer's real ~/.config/cc-status (free-mode marker, no-hold flag, sessions).
+preload = ["./src/test/preload.ts"]

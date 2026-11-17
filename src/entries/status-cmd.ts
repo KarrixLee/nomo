@@ -27,7 +27,7 @@ import { antigravityAdapter, claudeAdapter, codexAdapter, cursorAdapter, devinAd
 import { devinInstallerActive, devinPluginInstalled, devinPluginLockPath } from "../core/devin";
 import {
   AgentKind, ANTIGRAVITY_HOOK_MARKER, antigravityConfigDir, CC_DIR, CODEX_HOOK_MARKER, codexAppServerSocketAvailable, codexHome, CURSOR_HOOK_MARKER, cursorHome, DEVIN_HOOK_MARKER, devinConfigDir, flagExists,
-  LAST_SEND_PATH, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
+  isFreeMode, LAST_SEND_PATH, lanBlockedByFreeMode, localApprovalsState, NO_HOLD_PATH, parseConfig, parsePendingConfig, pidAlive,
   opencodeStubPaths, opencodeStubTarget, PLUGIN_VERSION, SESSION_TRACE_PATH, SESSIONS_DIR,
   WATCHDOG_PID_PATH,
 } from "../core/shared";
@@ -97,6 +97,8 @@ export interface StatusDeps {
    *  prompts stay in the terminal and never reach the phone — the single commonest reason a user
    *  reports "my phone never asked me". Injected so a test can point it at a temp file. */
   noHoldPath?: string;
+  /** The free-mode marker (`<CC_DIR>/free-mode`); tests point it at a temp file. */
+  freeModePath?: string;
   /** The installer's short-command record (see terminalCommand); tests point it at a temp file. */
   shortCommandPath?: string;
   /** Cursor's user-level hooks.json (defaults to `<cursorHome>/hooks.json`), its transcripts dir and
@@ -520,6 +522,16 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
   print("");
   if (config) {
     print(row("Phone", `paired · ${config.url} · pairing ${config.pairingId.slice(0, 8)}…`));
+    // The plan, as the server last said it — never a guess. A fresh free-mode marker = Free. Only a real
+    // Pro answer deletes the marker, and last-send is written only on a 2xx from the Pro-only /cc/event,
+    // so no marker + a last-send = the last answer was Pro. Anything else (just paired, or the marker
+    // aged out while the server was quiet) is not known yet: no row beats a wrong one.
+    if (await isFreeMode(now(), deps.freeModePath)) {
+      print(row("Plan", "Nomo Free — your streak, coding time and live status sync."));
+      print(cont("Live sessions, the Dynamic Island and approvals come with Nomo Pro."));
+    } else if (!lanBlockedByFreeMode(deps.freeModePath) && await flagExists(lastSendPath)) {
+      print(row("Plan", "Nomo Pro"));
+    }
   } else if (pending) {
     // Mid-pairing: the QR was printed but no phone has claimed yet — not broken, just unfinished.
     print(row("Phone", "waiting for the QR scan — pairing was started but no phone has claimed it"));
@@ -570,7 +582,13 @@ export async function statusCmd(deps: StatusDeps = {}): Promise<number> {
     // The local remote-approvals escape hatch. This is the whole answer to "why didn't my phone ask
     // me?", and nothing else on the machine hints at it — so it earns a permanent row, one calm line
     // when on and a named fix when off.
-    if (await localApprovalsState(noHoldPath) === "on") {
+    // A free (not Pro) pairing never holds (permission.ts skips the hold), so it outranks the switch: the
+    // approvals command could not turn holds on, and "on" would be false. It also sends only presence
+    // and the activity summary — say so, or the stale "last event sent" above reads like a fault.
+    const free = await isFreeMode(now(), deps.freeModePath);
+    if (free) {
+      print(row("Approvals", "off — free pairing, prompts stay in this terminal"));
+    } else if (await localApprovalsState(noHoldPath) === "on") {
       print(row("Approvals", "on — permission prompts are held and sent to your phone"));
     } else {
       print(row("Approvals", "PAUSED — prompts stay in this terminal, your phone is never asked"));

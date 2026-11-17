@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
 import { decryptBlob } from "./crypto";
@@ -16,6 +16,7 @@ import {
   stampPermissionDetailFullAt, watchdogBuildStamp,
   watchdogHolderIsLive,
   INTERRUPT_FLAG_MAX_AGE_MS, clearInterruptFlagAt, interruptFlagFileName, interruptFlagSetAt, writeInterruptFlagAt,
+  clearFreeMode, FREE_MODE_PATH, FREE_MODE_TTL_MS, isFreeMode, isNotProResponse, lanBlockedByFreeMode, markFreeMode, applyTierFromResponse,
 } from "./shared";
 
 describe("codexCompanionBrokerEvidence (structural companion-session proof)", () => {
@@ -1135,6 +1136,128 @@ describe("runtimeArgs", () => {
   test("node and the hook shim are left alone", () => {
     for (const rt of ["node", "/opt/homebrew/bin/node", "/Users/me/.config/cc-status/hook-shim.sh", "/bun/dir/node"]) {
       expect(runtimeArgs(rt, ["/p/x.mjs"])).toEqual(["/p/x.mjs"]);
+    }
+  });
+});
+
+describe("free mode (2.5.0 free pairing)", () => {
+  test("isNotProResponse matches only the suspended body", () => {
+    expect(isNotProResponse(403, '{"error":"entitlement suspended"}')).toBe(true);
+    expect(isNotProResponse(403, '{"error":"forbidden"}')).toBe(false);
+    expect(isNotProResponse(404, '{"error":"entitlement suspended"}')).toBe(false);
+    expect(isNotProResponse(401, "")).toBe(false);
+  });
+
+  test("free-mode marker expires after 15 minutes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "free-mode-"));
+    const path = join(dir, "free-mode");
+    try {
+      expect(await isFreeMode(1_000, path)).toBe(false); // no marker → Pro behaviour (fail open)
+      await markFreeMode(path, 1_000);
+      expect(await isFreeMode(1_000 + FREE_MODE_TTL_MS - 1, path)).toBe(true);
+      expect(await isFreeMode(1_000 + FREE_MODE_TTL_MS, path)).toBe(false);
+      await markFreeMode(path, 2_000);
+      await clearFreeMode(path);
+      expect(await isFreeMode(2_001, path)).toBe(false);
+      expect(FREE_MODE_TTL_MS).toBe(15 * 60_000);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("applyTierFromResponse marks on the suspended 403 and nothing else", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "free-mode-"));
+    const path = join(dir, "free-mode");
+    try {
+      await applyTierFromResponse(new Response('{"error":"forbidden"}', { status: 403 }), path);
+      await applyTierFromResponse(new Response("{}", { status: 404 }), path);
+      expect(await isFreeMode(Date.now(), path)).toBe(false);
+      await applyTierFromResponse(new Response('{"error":"entitlement suspended"}', { status: 403 }), path);
+      expect(await isFreeMode(Date.now(), path)).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// M1 (2026-11-14 audit): the LAN gate must not fail open when the marker ages out. Event sending keeps
+// the 15-minute fail-open; the LAN listener stays keyed off until the server actually answers "pro".
+describe("free mode: the LAN gate is sticky until the server says pro", () => {
+  test("any marker blocks LAN — fresh, expired or malformed; only a cleared marker re-opens it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "free-lan-"));
+    const path = join(dir, "free-mode");
+    try {
+      expect(lanBlockedByFreeMode(path)).toBe(false); // never told "free": LAN as before
+      await markFreeMode(path, Date.now());
+      expect(lanBlockedByFreeMode(path)).toBe(true);
+      await markFreeMode(path, Date.now() - FREE_MODE_TTL_MS - 60_000); // the worker went quiet
+      expect(await isFreeMode(Date.now(), path)).toBe(false); // events fail open…
+      expect(lanBlockedByFreeMode(path)).toBe(true); // …the LAN listener does not
+      await writeFile(path, "garbage");
+      expect(lanBlockedByFreeMode(path)).toBe(true); // unreadable/malformed is not a "pro"
+      await clearFreeMode(path); // what a presence `tier:"pro"` or a 2xx session route does
+      expect(lanBlockedByFreeMode(path)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("applyTierFromResponse: a 2xx clears the marker; 409, 5xx and other 403s leave it alone", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "free-lan-"));
+    const path = join(dir, "free-mode");
+    try {
+      await markFreeMode(path, Date.now() - FREE_MODE_TTL_MS - 60_000);
+      for (const [status, body] of [[409, '{"error":"pairing not claimed"}'], [503, ""], [403, '{"error":"forbidden"}'], [429, ""]] as const) {
+        await applyTierFromResponse(new Response(body, { status }), path);
+        expect([status, lanBlockedByFreeMode(path)]).toEqual([status, true]);
+      }
+      await applyTierFromResponse(new Response('{"ok":true}', { status: 200 }), path);
+      expect(lanBlockedByFreeMode(path)).toBe(false);
+      // A 409 never marks free mode either.
+      await applyTierFromResponse(new Response('{"error":"pairing not claimed"}', { status: 409 }), path);
+      expect(lanBlockedByFreeMode(path)).toBe(false);
+      expect(await isFreeMode(Date.now(), path)).toBe(false);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("free mode: postFullText and test isolation", () => {
+  test("postFullText routes its response through applyTierFromResponse", async () => {
+    const fn = (async () => new Response('{"error":"entitlement suspended"}', { status: 403 })) as unknown as typeof fetch;
+    const config = { url: "https://w.example", pairingId: "p1", pcSecret: "s1", e2eKey: new Uint8Array(32).fill(7) };
+    try {
+      expect(await isFreeMode()).toBe(false);
+      await postFullText(config, "sess-1", "plan", "the whole thing", fn);
+      expect(await isFreeMode()).toBe(true); // default path = the preload's temp CC dir
+    } finally {
+      await clearFreeMode(); // the temp CC dir is shared by the whole run: leave it clean
+    }
+  });
+
+  // The owner tests free pairings on the same Mac the suite runs on. A fresh marker in the real
+  // ~/.config/cc-status must never reach a default-path call in a test.
+  test("a marker in the real home dir doesn't affect a default-path call", async () => {
+    expect(process.env.NOMO_CC_DIR).toBeTruthy();
+    expect(FREE_MODE_PATH).toBe(`${process.env.NOMO_CC_DIR}/free-mode`);
+    expect(FREE_MODE_PATH.startsWith(join(homedir(), ".config"))).toBe(false);
+    // A stand-in "real home" holding a fresh marker (never the developer's actual home).
+    const home = await mkdtemp(join(tmpdir(), "fake-home-"));
+    try {
+      await mkdir(join(home, ".config", "cc-status"), { recursive: true });
+      await writeFile(join(home, ".config", "cc-status", "free-mode"), String(Date.now()));
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (v !== undefined && k !== "NOMO_CC_DIR") env[k] = v;
+      env.HOME = home;
+      const shared = join(import.meta.dir, "shared.ts");
+      const script = `import { isFreeMode } from ${JSON.stringify(shared)}; console.log(await isFreeMode());`;
+      const preload = join(import.meta.dir, "..", "test", "preload.ts");
+      const run = (args: string[]) => Bun.spawnSync({ cmd: ["bun", ...args, "-e", script], env }).stdout.toString().trim();
+      expect(run([])).toBe("true"); // CONTROL: without isolation the home marker is read
+      expect(run(["--preload", preload])).toBe("false");
+    } finally {
+      await rm(home, { recursive: true, force: true });
     }
   });
 });

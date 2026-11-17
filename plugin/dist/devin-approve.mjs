@@ -171,6 +171,49 @@ var SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+var FREE_MODE_PATH = `${CC_DIR}/free-mode`;
+var FREE_MODE_TTL_MS = 15 * 60000;
+async function isFreeMode(now = Date.now(), path = FREE_MODE_PATH) {
+  return isFreeModeSync(now, path);
+}
+function isFreeModeSync(now = Date.now(), path = FREE_MODE_PATH) {
+  try {
+    const at = Number(readFileSync(path, "utf8").trim());
+    return Number.isFinite(at) && at > 0 && now - at >= 0 && now - at < FREE_MODE_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+function lanBlockedByFreeMode(path = FREE_MODE_PATH) {
+  try {
+    statSync(path);
+    return true;
+  } catch (e) {
+    return e?.code !== "ENOENT";
+  }
+}
+function freeModePathBeside(configPath) {
+  return join(dirname(configPath), "free-mode");
+}
+async function markFreeMode(path = FREE_MODE_PATH, now = Date.now()) {
+  await atomicWrite(path, String(now)).catch(() => {});
+}
+async function clearFreeMode(path = FREE_MODE_PATH) {
+  await unlink(path).catch(() => {});
+}
+function isNotProResponse(status, body) {
+  return status === 403 && body.includes("entitlement suspended");
+}
+async function applyTierFromResponse(res, path = FREE_MODE_PATH) {
+  if (res.ok)
+    return clearFreeMode(path);
+  if (res.status !== 403)
+    return;
+  try {
+    if (isNotProResponse(res.status, await res.text()))
+      await markFreeMode(path);
+  } catch {}
+}
 var BLOB_FIT_CHARS = 3008;
 function sealedBlobChars(plaintextBytes) {
   return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
@@ -237,6 +280,8 @@ var FULL_TEXT_POST_TIMEOUT_MS = 5000;
 async function postFullText(config, sessionId, what, content, fetchFn = fetch, trace, requestId) {
   if (content === undefined)
     return;
+  if (isFreeModeSync())
+    return;
   try {
     const blob = await encryptBlob(config.e2eKey, {
       sessionId,
@@ -257,6 +302,7 @@ async function postFullText(config, sessionId, what, content, fetchFn = fetch, t
       signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS)
     });
     trace?.({ event: "full-text", what, chars: content.length, status: res.status });
+    await applyTierFromResponse(res);
   } catch (e) {
     trace?.({ event: "full-text", what, chars: content.length, status: 0, error: e?.name ?? "Error" });
   }
@@ -649,7 +695,8 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
   try {
     const blob = await encryptBlob(e2eKey, stash.blob);
     const envelope = { v: 2, sessionId: stash.sessionId, op: stash.op, prio: stash.prio, ts: now, blob };
-    for (let attempt = 0;attempt < attempts; attempt++) {
+    const free = await isFreeMode();
+    for (let attempt = 0;attempt < attempts && !free; attempt++) {
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
@@ -657,7 +704,10 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs)
         });
+        await applyTierFromResponse(res);
         if (res.ok)
+          break;
+        if (await isFreeMode())
           break;
       } catch {}
       if (attempt < attempts - 1)
@@ -728,6 +778,11 @@ async function completePendingPairing(pending, configPath, opts = {}) {
   } catch {
     return { state: "tampered" };
   }
+  const freeModePath = freeModePathBeside(configPath);
+  if (body.suspended === true)
+    await markFreeMode(freeModePath);
+  else
+    await clearFreeMode(freeModePath);
   try {
     await chmod(configPath, CONFIG_MODE);
   } catch {}
@@ -1013,10 +1068,11 @@ async function atomicWrite(path, data, mode) {
   await writeFile(tmp, data, mode !== undefined ? { mode } : undefined);
   await rename(tmp, path);
 }
-async function removeRevokedConfig(configPath = `${CC_DIR}/config.json`, lastSendPath = LAST_SEND_PATH, goneStrikesPath = GONE_STRIKES_PATH) {
+async function removeRevokedConfig(configPath = `${CC_DIR}/config.json`, lastSendPath = LAST_SEND_PATH, goneStrikesPath = GONE_STRIKES_PATH, freeModePath = freeModePathBeside(configPath)) {
   await unlink(configPath).catch(() => {});
   await unlink(lastSendPath).catch(() => {});
   await unlink(goneStrikesPath).catch(() => {});
+  await clearFreeMode(freeModePath);
 }
 async function readGoneStrikes(goneStrikesPath = GONE_STRIKES_PATH) {
   try {
@@ -3811,22 +3867,23 @@ async function reconcileProvisional(config, hookPid) {
       traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
       return;
     }
-    let delivered = false;
+    let delivered = await isFreeMode();
     const started = Date.now();
     let status;
     let error;
-    try {
-      const res = await fetch(`${config.url}/v1/cc/event`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
-        body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
-        signal: AbortSignal.timeout(2000)
-      });
-      status = res.status;
-      delivered = res.ok;
-    } catch (e) {
-      error = e?.name === "TimeoutError" ? "timeout" : "network";
-    }
+    if (!delivered)
+      try {
+        const res = await fetch(`${config.url}/v1/cc/event`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
+          body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
+          signal: AbortSignal.timeout(2000)
+        });
+        status = res.status;
+        delivered = res.ok;
+      } catch (e) {
+        error = e?.name === "TimeoutError" ? "timeout" : "network";
+      }
     traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered)
       await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
@@ -3847,21 +3904,22 @@ async function readTrackedSessions() {
 }
 async function retireLineageSession(config, sessionId, agent, input, reason) {
   let delivered = false;
-  try {
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        "x-cc-approvals": await localApprovalsState()
-      },
-      body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
-      signal: AbortSignal.timeout(2000)
-    });
-    delivered = res.ok;
-  } catch {}
+  if (!await isFreeMode())
+    try {
+      const res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          "x-cc-approvals": await localApprovalsState()
+        },
+        body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
+        signal: AbortSignal.timeout(2000)
+      });
+      delivered = res.ok;
+    } catch {}
   await unlink2(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
   traceSession({
     event: "retire",
@@ -4159,6 +4217,11 @@ async function runHook(agent) {
     ensureWatchdog();
     if (agent === "codex")
       await reconcileProvisional(config, hookPid);
+    if (await isFreeMode()) {
+      if (plan.op === "done")
+        await markDoneDelivered(sessionId);
+      return;
+    }
     const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
     const postStarted = Date.now();
     let res;
@@ -4187,6 +4250,7 @@ async function runHook(agent) {
     }
     if (!res.ok)
       await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
+    await applyTierFromResponse(res);
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
@@ -4201,6 +4265,8 @@ async function runHook(agent) {
       }
     } else {
       await resetGoneStrikes();
+      if (res.status === 409 && plan.op !== "done" && plan.op !== "end")
+        await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob);
     }
   } catch {} finally {
     await fullUpload;
@@ -4209,6 +4275,8 @@ async function runHook(agent) {
 
 // src/opencode/state.ts
 async function postOcEvent(config, envelope) {
+  if (await isFreeMode())
+    return true;
   try {
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
@@ -4222,6 +4290,7 @@ async function postOcEvent(config, envelope) {
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000)
     });
+    await applyTierFromResponse(res);
     if (!res.ok)
       return false;
     await atomicWrite(LAST_SEND_PATH, String(Date.now())).catch(() => {});
@@ -5971,7 +6040,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
   try {
     if (agent === "claude" && cursorHostInvocation(undefined))
       return;
-    if (await flagExists(noHoldPath)) {
+    if (await flagExists(noHoldPath) || await isFreeMode(Date.now(), deps.freeModePath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
@@ -6102,6 +6171,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             if (typeof body.reason === "string")
               reason = body.reason;
           }
+          await applyTierFromResponse(res);
           trace({
             event: "posted",
             requestId,
@@ -6261,6 +6331,12 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     let unknownBlob;
     let unknownReads = 0;
     let seq = 0;
+    const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
+      method: "POST",
+      headers: { ...pcHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ requestId }),
+      signal: AbortSignal.timeout(3000)
+    }).then(() => {}, () => {});
     for (;; ) {
       seq += 1;
       if (deps.deadlineAt !== undefined && clock() >= deps.deadlineAt) {
@@ -6270,15 +6346,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       if (await answeredAtTheMac()) {
         settleAsWorking = true;
         trace({ event: "local-answer", seq });
-        trace({ event: "exit", reason: "local-answer" });
+        await withdrawCard();
+        trace({ event: "exit", reason: "local-answer", resolveSent: true });
         return;
       }
-      const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
-        method: "POST",
-        headers: { ...pcHeaders, "content-type": "application/json" },
-        body: JSON.stringify({ requestId }),
-        signal: AbortSignal.timeout(3000)
-      }).then(() => {}, () => {});
       if (deps.abandoned?.()) {
         settleAsWorking = true;
         trace({ event: "exit", reason: "abandoned", seq });
@@ -6417,11 +6488,21 @@ var PLUGIN_CACHE_GLOB = '"$HOME"/.local/share/devin/cli/plugins/cache/*nomo*/*/p
 var SAFE_DEVIN_SKILL_COMMANDS = [
   ["status-cmd", "devin"],
   ["cc-permission", "status"],
-  ["cc-permission", "on"],
-  ["reset", ""],
-  ["pair", ""],
-  ["pair", "wait --timeout 60"]
+  ["cc-permission", "on"]
 ];
+var NOMO_LIFECYCLE = [
+  /\bnomo(?:-ai)?(?:@[\w.-]+)?\s+(?:pair|unpair|reset|uninstall)\b/,
+  /--uninstall\b/,
+  /\b(?:uninstall|disable|remove)\b[^;&|\n]*nomo/,
+  /hook-shim\.sh\s+(?:pair|unpair|reset)\b/,
+  /\b(?:pair|unpair|reset)\.mjs\b/,
+  /cc-status/,
+  /\/\.nomo(?:\/|\s|$)/
+];
+function isNomoLifecycleCommand(command) {
+  const c = command.replace(/['"\\]/g, "").toLowerCase();
+  return NOMO_LIFECYCLE.some((re) => re.test(c));
+}
 function devinSkillCommand(loop, script, args, reinstall) {
   const a = args ? ` ${args}` : "";
   return `/bin/sh -c 'NOMOS="$HOME/.config/cc-status/hook-shim.sh"; for NOMOR in ${loop}; do [ -x "$NOMOR/scripts/run.sh" ] && [ -f "$NOMOR/dist/${script}.mjs" ] && exec "$NOMOR/scripts/run.sh" "$NOMOR/dist/${script}.mjs"${a}; done; [ -x "$NOMOS" ] && exec "$NOMOS" ${script}${a}; echo "Nomo could not find its installed files - ${reinstall}"; exit 1'`;
@@ -6438,62 +6519,36 @@ function isOwnExec(cardTool, toolInput, root) {
 }
 var PLAIN_COMMAND = /^[A-Za-z0-9_./-]+( [^;&|`$<>(){}\n]*)?$/;
 var commandOf = (toolInput) => typeof toolInput.command === "string" ? toolInput.command : "";
-var WRAPPERS = new Set([
-  "bash",
-  "sh",
-  "zsh",
-  "fish",
-  "dash",
-  "ksh",
-  "csh",
-  "tcsh",
-  "pwsh",
-  "env",
-  "sudo",
-  "doas",
-  "su",
-  "timeout",
-  "xargs",
-  "npx",
-  "bunx",
-  "pnpx",
-  "nohup",
-  "nice",
-  "exec",
-  "eval",
-  "command",
-  "builtin",
-  "time",
-  "watch",
-  ".",
-  "source",
-  "python",
-  "node",
-  "bun",
-  "deno",
-  "ruby",
-  "perl",
-  "php",
-  "lua",
-  "osascript",
-  "find",
-  "awk",
-  "gawk",
-  "stdbuf",
-  "setsid",
-  "caffeinate",
-  "arch",
-  "chroot",
-  "script",
-  "ssh"
+var INERT_COMMANDS = new Set([
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "touch",
+  "mkdir",
+  "grep",
+  "echo",
+  "pwd",
+  "which",
+  "file",
+  "stat",
+  "du",
+  "cut",
+  "tr",
+  "jq"
 ]);
-var isWrapper = (word) => WRAPPERS.has((word.split("/").pop() ?? "").toLowerCase().replace(/(?<=[a-z])[\d.]+$/, ""));
+function nameGrantable(name, toolInput) {
+  const command = commandOf(toolInput);
+  return INERT_COMMANDS.has(name) && PLAIN_COMMAND.test(command) && !/[*?[]/.test(command) && toolInput.workdir === undefined;
+}
+var onlyCommandKeys = (toolInput) => Object.keys(toolInput).every((k) => k === "command" || k === "workdir");
 function devinGrantFor(cardTool, toolInput) {
   if (cardTool !== "shell")
     return { tool: cardTool };
   const command = commandOf(toolInput);
   const name = command.split(" ", 1)[0];
-  return PLAIN_COMMAND.test(command) && !isWrapper(name) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
+  return nameGrantable(name, toolInput) ? { tool: "shell", prefix: name } : { tool: "shell", exact: command };
 }
 function devinGrantText(cardTool, toolInput) {
   const g = devinGrantFor(cardTool, toolInput);
@@ -6506,10 +6561,12 @@ function devinGrantMatches(grant, cardTool, toolInput) {
     return false;
   if (cardTool !== "shell")
     return true;
+  if (!onlyCommandKeys(toolInput))
+    return false;
   const command = commandOf(toolInput);
   if (typeof grant.exact === "string")
     return command === grant.exact;
-  return typeof grant.prefix === "string" && grant.prefix.length > 0 && !isWrapper(grant.prefix) && PLAIN_COMMAND.test(command) && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
+  return typeof grant.prefix === "string" && nameGrantable(grant.prefix, toolInput) && (command === grant.prefix || command.startsWith(`${grant.prefix} `));
 }
 async function readGrants(path) {
   try {
@@ -6590,10 +6647,11 @@ async function runDevinApproval(raw, deps = {}) {
       return "";
     const { session_id: sessionId, tool_name: cardTool, tool_input: toolInput } = JSON.parse(stdin);
     const paired = Boolean(await (deps.hold?.loadConfigFn ?? loadConfig)());
-    const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
-    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
-      return APPROVE;
     if (paired && isOwnExec(cardTool, toolInput, deps.pluginRoot))
+      return APPROVE;
+    const grantsPath = devinGrantsPath(deps.sessionsDir ?? SESSIONS_DIR, sessionId);
+    const lifecycle = cardTool === "shell" && isNomoLifecycleCommand(`${commandOf(toolInput)} ${typeof toolInput.workdir === "string" ? toolInput.workdir : ""}`);
+    if (paired && cardTool !== DEVIN_QUESTION_CARD_TOOL && !lifecycle && (await readGrants(grantsPath)).some((g) => devinGrantMatches(g, cardTool, toolInput)))
       return APPROVE;
     let line;
     let gone = false;

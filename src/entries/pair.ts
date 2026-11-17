@@ -30,7 +30,7 @@ import { access, mkdir, readFile, stat, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  atomicWrite, CC_DIR, codexHome, completePendingPairing, ensureWatchdog, PAIR_HTML_FILE, PAIR_HTML_PATH,
+  atomicWrite, CC_DIR, clearFreeMode, codexHome, completePendingPairing, ensureWatchdog, freeModePathBeside, PAIR_HTML_FILE, PAIR_HTML_PATH,
   parseConfig, parsePendingConfig,
 } from "../core/shared";
 import { nomoNotifyProgram, parseNotifyFromToml, replaceNotifyInToml, wireNotifyArray } from "../core/notify-wire";
@@ -290,6 +290,8 @@ export async function pairStart(deps: PairDeps = {}): Promise<number> {
   // disk, so it must run BEFORE the atomicWrite below overwrites it. Ordering it after /start means a
   // transient /start failure above returns early WITHOUT touching a healthy existing pairing.
   await revokeExisting(fetchFn, configPath, print);
+  // The old pairing's tier must not leak into this one (completion sets it from the claim).
+  await clearFreeMode(freeModePathBeside(configPath));
 
   // Persist the PENDING config BEFORE opening the page: qrSecret, the ephemeral ratchet private key
   // (and codeIkm, if any) must be on disk so the `wait` step (or the watchdog self-heal) can finish the

@@ -25,7 +25,7 @@ import { execFileSync } from "node:child_process";
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { basename } from "node:path";
 import { ActivityOutcome, CycleDeps, runActivityCycle } from "../core/activity";
-import { Config, forgetAllDevinGrants, isWatchdogCommand, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
+import { Config, forgetAllDevinGrants, isFreeMode, isWatchdogCommand, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
 import { terminalCommand } from "../core/terminal-command";
 
 export type ResetVerdict = "clear" | "keep";
@@ -106,6 +106,7 @@ async function stopWatchdog(deps: ResetDeps): Promise<"killed" | "stale-pidfile"
 /** POST a blob-less op:end for a cleared session under the CURRENT pairing. Best-effort, 2 s ceiling;
  *  true iff the worker 2xx'd (the phone row will clear). */
 async function postEnd(config: Config, sessionId: string, fetchFn: typeof fetch): Promise<boolean> {
+  if (await isFreeMode()) return true; // a free pairing's relay holds no session rows to clear
   try {
     const res = await fetchFn(`${config.url}/v1/cc/event`, {
       method: "POST",

@@ -29,7 +29,7 @@ import { runHook, buildBlob, OpPlan } from "./hook";
 import {
   AgentKind, appendFittedPlanAndDebug, atomicWrite, BLOB_FIT_CHARS, CC_DIR, clearDecisionHold, codexHome, Config,
   DecisionHold, flagExists, formatDecisionHoldDebug,
-  fullTextForRecord, loadConfig, NO_HOLD_PATH, postFullText,
+  fullTextForRecord, isFreeMode, loadConfig, applyTierFromResponse, NO_HOLD_PATH, postFullText,
   PLUGIN_VERSION, readPrefix, readRecord, readSuffix, sealedBlobChars, SessionRecord,
   settleDecisionHoldRecord, stampPermissionDetailFull,
   writeDecisionHold,
@@ -1906,6 +1906,8 @@ export interface PermissionHookDeps {
   /** Extra ms added to each poll interval so many concurrent holds don't poll in lockstep. */
   jitter?: () => number;
   noHoldPath?: string;
+  /** The free-mode marker (defaults to FREE_MODE_PATH); a fresh one takes the no-hold exit. */
+  freeModePath?: string;
   /** The no-hold fire-and-forget path (defaults to the normal attention event via runHook). */
   delegate?: () => Promise<void>;
   pollIntervalMs?: number;
@@ -1983,7 +1985,10 @@ export async function runPermissionHook(
     // locally, behave exactly as the old fire-and-forget attention event (instant terminal dialog).
     // Delegating to runHook reuses the entire needs-attention pipeline (POST, tracking, watchdog) and
     // returns silently with exit 0 — it also no-ops cleanly when unpaired, so zero network in that case.
-    if (await flagExists(noHoldPath)) {
+    // A FREE pairing (2.5.0) takes the same exit: it never holds for the phone. The prompt falls
+    // through to the agent's own dialog at once, and the delegate tracks it locally with no POST (runHook
+    // and postOcEvent both skip the relay in free mode) — nothing that could drive the Dynamic Island.
+    if (await flagExists(noHoldPath) || await isFreeMode(Date.now(), deps.freeModePath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
@@ -2256,6 +2261,8 @@ export async function runPermissionHook(
             hold = body.hold === true;
             if (typeof body.reason === "string") reason = body.reason;
           }
+          // Not Pro → the next prompt skips the hold entirely; a 2xx clears free mode.
+          await applyTierFromResponse(res);
           // The worker names the FIRST failing gate in `reason` (stale-session / toggle-off /
           // no-activity). Without it a field trace of a prompt that fell open is unfalsifiable — a
           // re-ask killed by the staleness guard looks exactly like the user having approvals off.
@@ -2553,6 +2560,12 @@ export async function runPermissionHook(
     let unknownBlob: string | undefined;
     let unknownReads = 0;
     let seq = 0;
+    // Retire THIS hold's worker record (never "the session's active one" — a newer hold has its own
+    // requestId). Best-effort: 3 s cap, errors swallowed, so no exit can hang or throw on it.
+    const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
+      method: "POST", headers: { ...pcHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ requestId }), signal: AbortSignal.timeout(3_000),
+    }).then(() => {}, () => {});
     for (;;) {
       seq += 1;
       if (deps.deadlineAt !== undefined && clock() >= deps.deadlineAt) {
@@ -2563,19 +2576,18 @@ export async function runPermissionHook(
       // network so a worker outage can never keep a settled card on the phone. Nothing goes to stdout —
       // CC already took the local answer and moved the turn on — but the record settles as WORKING,
       // which is what clears the worker's decision overlay and retires the phone's Allow/Deny card.
+      // The clean exit leaves no dead-pid marker for the watchdog's prune, so tell the worker here —
+      // otherwise the record stays `pending` until the silence sweep (30-90 s of a stale purple card).
       if (await answeredAtTheMac()) {
         settleAsWorking = true;
         trace({ event: "local-answer", seq });
-        trace({ event: "exit", reason: "local-answer" });
+        await withdrawCard();
+        trace({ event: "exit", reason: "local-answer", resolveSent: true });
         return;
       }
       // STOPPED FROM THE PHONE: the turn is being stopped, so the tool it is waiting on must not run.
       // Deny here (never the fallback: that would open the agent's own prompt and park the turn), then
       // retire the worker's pending card best-effort so the phone drops its Allow/Deny.
-      const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
-        method: "POST", headers: { ...pcHeaders, "content-type": "application/json" },
-        body: JSON.stringify({ requestId }), signal: AbortSignal.timeout(3_000),
-      }).then(() => {}, () => {});
       if (deps.abandoned?.()) {
         // Settled as WORKING (the `finally`): the tool call was cancelled, not necessarily the turn.
         settleAsWorking = true;

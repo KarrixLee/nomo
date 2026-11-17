@@ -54,13 +54,14 @@ import type { CodexAppServerSocketState, DecisionHold, PlanPickerTraceDecision }
 import {
   AgentKind, AgentKindWire, appendCodexBridgeMarker, appendFittedPlanAndDebug, atomicWrite, CC_DIR, CCOp, CCStatus, codexAppServerSocketAvailable, codexAppServerSocketState, Config, completePendingPairing, DECISION_HOLD_SUFFIX, decisionHoldFileName, formatPlanPickerDebug, formatWatchdogPidfile,
   startCodexAppServerDaemon,
-  forgetDevinGrants, GONE_STRIKE_LIMIT, loadConfig, loadPendingConfig, localApprovalsState,
+  forgetDevinGrants, GONE_STRIKE_LIMIT, isFreeMode, lanBlockedByFreeMode, loadConfig, applyTierFromResponse, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, sidField, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
   watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
 import { startActivityLoop } from "../core/activity";
+import { startPresenceLoop } from "../core/presence";
 
 // The transcript-tail interrupt PARSERS live in the agent adapters now (the two detections are
 // structurally different). Re-export them so existing importers/tests that reference "./cc-watchdog"
@@ -1029,6 +1030,14 @@ let activeLanListener: LanListener | undefined;
  *  a module singleton for the same reason the buffers above are: postEvent has no place to hang state. */
 const lanHintPublisher = createLanHintPublisher({ address: () => activeLanListener?.address() ?? null });
 
+/** The config the LAN listener is keyed with this tick: null (keyed off) while unpaired or while any
+ *  free-mode marker exists. Unlike event sending, an EXPIRED marker still blocks (2026-11-14 audit M1):
+ *  LAN never touches the server, so "the worker went quiet" must not hand a free pairing its LAN feed
+ *  back. Only a server "pro" answer (presence, or a 2xx session route) clears the marker. */
+export function lanConfigFor(config: Config | null, freeModePath?: string): Config | null {
+  return config && !lanBlockedByFreeMode(freeModePath) ? config : null;
+}
+
 /** Default budget for every watchdog POST — the same 2 s the hooks use, because the sweep awaits its
  *  POSTs one after another and an unreachable relay must not stretch a tick by more than this per send. */
 const POST_TIMEOUT_MS = 2000;
@@ -1047,9 +1056,13 @@ export interface PostDetail {
  *  delivered and the caller would delete/rewrite the session file, losing the session. A 404 is
  *  `revoked` (the definitive pairing-is-gone signal, keyed on the server's own not-found response).
  *  Any network error / timeout is a transient `failed`. Best-effort: never throws across its boundary. */
-async function postEvent(
-  config: Config, body: object, opts: { timeoutMs?: number; detail?: PostDetail } = {},
+export async function postEvent(
+  config: Config, body: object, opts: { timeoutMs?: number; detail?: PostDetail; freeModePath?: string } = {},
 ): Promise<PostOutcome> {
+  // Free pairing (2.5.0): every sweep path's /cc/event comes through here, so this is the one gate. Nothing
+  // is owed to a relay that refuses session events, so the caller's bookkeeping proceeds as if delivered
+  // (records retire, debts clear) and no request leaves the computer.
+  if (await isFreeMode(Date.now(), opts.freeModePath)) return "delivered";
   const started = Date.now();
   const detail = opts.detail;
   // The LAN listener's sealed host hint rides along on the POSTs this daemon already makes — no new
@@ -1068,6 +1081,8 @@ async function postEvent(
     });
     if (detail) { detail.status = res.status; detail.ms = Date.now() - started; }
     const outcome = postOutcomeForStatus(res.status);
+    // 2xx clears free mode (and re-opens the LAN gate); a not-Pro 403 marks it and is never a gone strike.
+    await applyTierFromResponse(res, opts.freeModePath);
     // Tell the hint publisher what became of the hint this POST carried. A hint handed to a POST that
     // failed must NOT count as published — see LanHintPublisher.settle. `revoked` settles as undelivered
     // too: the pairing is gone, so nothing was advertised to anyone.
@@ -3982,6 +3997,22 @@ export async function goneStrikeShouldTeardown(goneStrikesPath?: string): Promis
   return (await recordGoneStrike(goneStrikesPath)) >= GONE_STRIKE_LIMIT;
 }
 
+/** One watchdog cycle's verdict on the shared gone streak. `gone`: a /cc/event POST or a presence ping
+ *  answered 404/410 → a strike via goneStrikeShouldTeardown ("teardown" at the limit, else "retry"). Do
+ *  NOT tear down on the first one — a single gone can be a transient/racing delete (worker redeploy, KV
+ *  eventual consistency); a genuine revoke 404s every request, so the streak reaches GONE_STRIKE_LIMIT
+ *  within a couple of cycles. Otherwise a delivered sweep proves the pairing alive and clears any stray
+ *  strike — EXCEPT for a free pairing, whose "delivered" is postEvent's local short-circuit, not a 2xx:
+ *  resetting on it would wipe every strike presence records, and a revoked free pairing would never
+ *  tear down. Paths injectable for tests. */
+export async function settleGoneStrikes(
+  gone: boolean, delivered: boolean, paths: { goneStrikesPath?: string; freeModePath?: string } = {},
+): Promise<"teardown" | "retry" | "ok"> {
+  if (gone) return (await goneStrikeShouldTeardown(paths.goneStrikesPath)) ? "teardown" : "retry";
+  if (delivered && !(await isFreeMode(Date.now(), paths.freeModePath))) await resetGoneStrikes(paths.goneStrikesPath);
+  return "ok";
+}
+
 // --- Codex remote-input bridge supervision (presence-gated, deadline-decoupled) ----------------
 //
 // The bridge attaches to the SHARED codex app-server through `codex app-server proxy`, and a real
@@ -4518,6 +4549,19 @@ async function run(): Promise<void> {
   // NOM-142 daily activity summary: scan now, then hourly, off the sweep path (chunked + yielding, so
   // the first ~2 GB backfill never stalls the 5 s poll). Self-gated on pairing; swallows every error.
   const stopActivity = startActivityLoop();
+  // 2.5.0 presence: who is coding + waiting yes/no, for every pairing — at once on a change, else every
+  // 60 s. Its reply's tier keeps the free-mode marker fresh (or clears it the minute a purchase flips the
+  // pairing to Pro). Its answer also feeds the gone-strike streak: a free pairing sends no events, so
+  // presence is the only request that can learn the phone revoked it (a 404/410 counts as a strike, any
+  // tier answer proves the pairing alive).
+  let presenceGone = false;
+  const stopPresence = startPresenceLoop({
+    onResult: async (r) => {
+      if (r === "gone") presenceGone = true;
+      else if (r !== null) await resetGoneStrikes();
+    },
+  });
+  let idleExit = false;
   try {
     while (true) {
       // A claim can be stolen or removed after startup (upgrade takeover, reset, racing spawn). An
@@ -4539,7 +4583,9 @@ async function run(): Promise<void> {
       // Re-key the LAN listener from the CURRENT config (a re-pair rotates e2eKey, and K_lan derives
       // from it). Deliberately NOT awaited-on-IO: sync() only swaps a promise and returns, so the LAN
       // channel can never sit on the sweep path — the design's non-negotiable.
-      lan.sync(config);
+      // A free pairing keys the listener OFF (null config): the phone gets no LAN state feed and no LAN
+      // answer path, so nothing local can drive the island either. Sticky — see lanConfigFor.
+      lan.sync(lanConfigFor(config));
       // Discovery + reconcile run BEFORE the sweep (only when paired). Backstop-reconcile first (retire
       // any provisional whose real session already reported), then discover new TUIs — so a just-
       // surfaced provisional is counted in `remaining` this same cycle, keeping the daemon alive
@@ -4555,26 +4601,21 @@ async function run(): Promise<void> {
       // Drained once per tick, off the POST path, so a slow osascript can never delay a status event.
       // Best-effort by construction — drainCommands swallows everything and returns a count.
       if (config) await enqueueDrainCommands(config);
-      if (result.revoked) {
-        // A /cc/event POST came back gone (404/410) this sweep. Do NOT tear down on the first one — a
-        // single gone can be a transient/racing delete (worker redeploy, KV eventual-consistency), and
-        // nuking a healthy pairing's credential config on one blip is exactly what the hook's 2-strike
-        // guard prevents. Count it against the SAME shared streak and only tear down at the limit; the
-        // hook's own successful POSTs (or a later watchdog delivery) reset it. A genuine revoke 404s
-        // every POST, so the streak reaches GONE_STRIKE_LIMIT within a couple of cycles either way.
-        if (await goneStrikeShouldTeardown()) {
-          // Confirmed gone: tear the stale config down so /status stops claiming "paired", then quit —
-          // the next hook (if any) starts a fresh, unpaired-inert cycle.
-          await removeRevokedConfig();
-          return;
-        }
+      // A /cc/event POST or a presence ping came back gone (404/410) this sweep → one strike against the
+      // shared streak; teardown only at the limit (see settleGoneStrikes).
+      const strikes = await settleGoneStrikes(result.revoked || presenceGone, !result.revoked && result.delivered);
+      presenceGone = false;
+      if (strikes === "teardown") {
+        // Confirmed gone: tear the stale config down so /status stops claiming "paired", then quit —
+        // the next hook (if any) starts a fresh, unpaired-inert cycle.
+        await removeRevokedConfig();
+        return;
+      }
+      if (strikes === "retry" || result.revoked) { // (a revoked sweep is always a strike; this narrows its type)
         // First strike → treat as transient: retry next cycle instead of tearing down.
         await new Promise((r) => setTimeout(r, POLL_MS));
         continue;
       }
-      // A delivered POST this sweep proves the pairing is alive → clear any stray gone-strike so two
-      // transient blips separated by a success can never accumulate to a false teardown.
-      if (result.delivered) await resetGoneStrikes();
       const remaining = result.remaining;
       if (!config) {
         // Unpaired OR mid-pairing. Opportunistically complete a pending pairing (self-heal), then keep
@@ -4608,19 +4649,24 @@ async function run(): Promise<void> {
         // No sessions this sweep. Unpaired (or mid-pairing with no pending) → nothing to discover, so
         // retire immediately as before; the hook re-spawns us. Paired → linger through the idle grace so
         // discovery can surface the next freshly-opened Codex TUI, then retire once truly idle.
-        if (!config || nowMs - lastActiveMs >= IDLE_GRACE_MS) return;
+        if (!config) return;
+        if (nowMs - lastActiveMs >= IDLE_GRACE_MS) { idleExit = true; return; }
       }
       await new Promise((r) => setTimeout(r, POLL_MS));
     }
   } finally {
     clearInterval(settleTimer);
     stopActivity();
+    const presenceStopped = stopPresence(idleExit);
     shutdown(); // bridge child AND the LAN socket — a retired daemon must leave no listener behind
     activeBridgeShutdown = undefined;
     activeCodexInterrupt = undefined;
     activeLanShutdown = undefined;
     activeLanListener = undefined;
     releaseSingleInstance(); // auto-quit on empty: drop our pidfile so the next hook re-spawns
+    // Retiring idle: one last presence clears a server copy that still says "coding" (only if it does).
+    // After the pidfile release so a successor is never blocked on it; bounded by its 5 s timeout.
+    await presenceStopped;
   }
 }
 

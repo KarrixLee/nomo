@@ -196,6 +196,86 @@ export const GONE_STRIKE_LIMIT = 2;
  *  cycle. */
 export const NO_HOLD_PATH = `${CC_DIR}/no-hold`;
 
+// --- Free mode (2.5.0 free pairing) -----------------------------------------------------------
+//
+// A pairing is Pro or "not Pro" (free, or a lapsed subscription). The server tells us on every presence
+// reply (`tier`) and on any session route it refuses (403 `{"error":"entitlement suspended"}`). While not
+// Pro, the plugin sends NO session events, opens NO approval holds and uploads NO full text — only
+// presence and the sealed daily activity summary. The marker is a TTL'd epoch-ms stamp, refreshed by the
+// presence loop every ~60 s (set or cleared from the claim at pairing; unpair, re-pair and a revoke
+// teardown remove it): if the server goes quiet it expires and the plugin fails OPEN to Pro
+// behaviour for SENDING, and the first refused event re-marks it. The LAN listener does not fail open: it
+// stays keyed off while the marker file exists at all (lanBlockedByFreeMode), and only a real "pro"
+// answer deletes it — presence `tier:"pro"`, or a 2xx on a session route (applyTierFromResponse). It is
+// never a reason to tear the pairing down — only 404/410 gone strikes do that.
+
+/** Epoch-ms text: the last time the server said this pairing is not Pro. */
+export const FREE_MODE_PATH = `${CC_DIR}/free-mode`;
+/** How long one "not Pro" answer counts. The presence loop refreshes it every minute. */
+export const FREE_MODE_TTL_MS = 15 * 60_000;
+
+/** True while the free-mode marker exists and is younger than FREE_MODE_TTL_MS. Absent, unreadable or
+ *  malformed → false (Pro behaviour). Never throws. */
+export async function isFreeMode(now: number = Date.now(), path: string = FREE_MODE_PATH): Promise<boolean> {
+  return isFreeModeSync(now, path);
+}
+
+/** isFreeMode without the await, for a caller whose request must START before the caller's next one does
+ *  (postFullText: the upload must leave before the decision/event POST it accompanies). One tiny read. */
+export function isFreeModeSync(now: number = Date.now(), path: string = FREE_MODE_PATH): boolean {
+  try {
+    const at = Number(readFileSync(path, "utf8").trim());
+    return Number.isFinite(at) && at > 0 && now - at >= 0 && now - at < FREE_MODE_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+
+/** The LAN gate (2026-11-14 audit M1): true while ANY free-mode marker exists — fresh, expired or
+ *  malformed. LAN traffic never reaches the server, so an aged-out "free" (worker unreachable, its
+ *  hostname blocked) must not re-key the listener; clearFreeMode on a real "pro" answer is the only way
+ *  back. A stat error other than "no such file" keeps it blocked. One stat; never throws. */
+export function lanBlockedByFreeMode(path: string = FREE_MODE_PATH): boolean {
+  try {
+    statSync(path);
+    return true;
+  } catch (e) {
+    return (e as { code?: string } | null)?.code !== "ENOENT";
+  }
+}
+
+/** The free-mode marker beside a given config.json (FREE_MODE_PATH for the live config). Pair/unpair
+ *  paths resolve it from their (injectable) config path, like the sessions dir. */
+export function freeModePathBeside(configPath: string): string {
+  return join(dirname(configPath), "free-mode");
+}
+
+export async function markFreeMode(path: string = FREE_MODE_PATH, now: number = Date.now()): Promise<void> {
+  await atomicWrite(path, String(now)).catch(() => {});
+}
+
+export async function clearFreeMode(path: string = FREE_MODE_PATH): Promise<void> {
+  await unlink(path).catch(() => {});
+}
+
+/** The server's one "not Pro" signal (free and lapsed pairings answer identically). */
+export function isNotProResponse(status: number, body: string): boolean {
+  return status === 403 && body.includes("entitlement suspended");
+}
+
+/** Every SESSION-route response (/cc/event, /cc/decision, plan/permission /cc/full — never the activity
+ *  upload, which free pairings may make) goes through this: a not-Pro 403 marks free mode, and a 2xx is
+ *  the server accepting a Pro-only write, so it clears the marker (which re-opens the LAN gate). Anything
+ *  else — 409 pending, 429, 5xx — says nothing about the tier. Reads the body only for a 403, so it never
+ *  consumes a response a caller still needs. Never throws. */
+export async function applyTierFromResponse(res: Response, path: string = FREE_MODE_PATH): Promise<void> {
+  if (res.ok) return clearFreeMode(path);
+  if (res.status !== 403) return;
+  try {
+    if (isNotProResponse(res.status, await res.text())) await markFreeMode(path);
+  } catch { /* unreadable body → not the signal */ }
+}
+
 /** Shared sealed-blob fit ceiling. The worker's hard limit is 3072 base64 characters; keep the
  *  existing 64-character safety margin used by permission frames. Blob producers must measure the
  *  complete plaintext shape before appending optional large text. */
@@ -360,6 +440,7 @@ export async function postFullText(
   fetchFn: typeof fetch = fetch, trace?: (event: object) => void, requestId?: string,
 ): Promise<void> {
   if (content === undefined) return;
+  if (isFreeModeSync()) return; // a free pairing uploads no plan / permission text (sync: keeps the start order)
   try {
     const blob = await encryptBlob(config.e2eKey, {
       sessionId, what, requestId, content, complete: recordFullTextIsComplete(content),
@@ -374,6 +455,7 @@ export async function postFullText(
       signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS),
     });
     trace?.({ event: "full-text", what, chars: content.length, status: res.status });
+    await applyTierFromResponse(res);
   } catch (e) {
     trace?.({ event: "full-text", what, chars: content.length, status: 0, error: (e as { name?: string })?.name ?? "Error" });
   }
@@ -1510,7 +1592,9 @@ async function flushPendingStash(
   try {
     const blob = await encryptBlob(e2eKey, stash.blob);
     const envelope = { v: 2, sessionId: stash.sessionId, op: stash.op, prio: stash.prio, ts: now, blob };
-    for (let attempt = 0; attempt < attempts; attempt++) {
+    // A free pairing sends no session events: the session is still tracked below, just not POSTed.
+    const free = await isFreeMode();
+    for (let attempt = 0; attempt < attempts && !free; attempt++) {
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
@@ -1518,7 +1602,9 @@ async function flushPendingStash(
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs),
         });
+        await applyTierFromResponse(res);
         if (res.ok) break;
+        if (await isFreeMode()) break; // refused as not Pro: retrying cannot help
       } catch {
         // transient (network / timeout) — retry within the ack's budget
       }
@@ -1601,7 +1687,7 @@ export async function completePendingPairing(
   if (res.status === 404) return { state: "gone" };
   if (!res.ok) return { state: "rejected", httpStatus: res.status };
 
-  const body = (await res.json()) as { state?: string; phoneNonce?: string; deviceNameEnc?: string; path?: string; phoneEphPub?: string };
+  const body = (await res.json()) as { state?: string; phoneNonce?: string; deviceNameEnc?: string; path?: string; phoneEphPub?: string; suspended?: boolean };
   // A claimed record whose phoneNonce was stripped means it was ALREADY acked by a concurrent
   // completer (the watchdog / a prior wait) — the server keeps state:"claimed" but drops the nonce +
   // name blob after ack. We can't derive the key from it, so this is NOT "pending" (which would spin
@@ -1637,6 +1723,14 @@ export async function completePendingPairing(
   } catch {
     return { state: "tampered" }; // wrong key / malformed phone key → tampered; do NOT persist a bogus key
   }
+
+  // The new pairing's tier, set BEFORE its config exists so no hook ever runs it on the previous
+  // pairing's marker. `suspended: true` (a free claim) → free from the first hook: no events, no holds,
+  // LAN keyed off. Anything else — Pro, or a server that doesn't send the flag — clears it (fail open,
+  // like an absent marker); presence or the first refused event re-marks within a minute.
+  const freeModePath = freeModePathBeside(configPath);
+  if (body.suspended === true) await markFreeMode(freeModePath);
+  else await clearFreeMode(freeModePath);
 
   // Belt-and-suspenders: lock down any pre-existing file ahead of the atomicWrite (which already
   // writes the replacement at 0600 regardless).
@@ -2290,7 +2384,7 @@ export async function atomicWrite(path: string, data: string, mode?: number): Pr
 
 /** Best-effort teardown of the local pairing after the server has DEFINITIVELY revoked it (a
  *  /cc/event POST 404'd or 410'd — see requirePCAuth / dormant GC). Drops config.json, the last-send
- *  marker, AND the gone-strike counter, mirroring `unpair`, so /status stops reporting "paired" the
+ *  marker, the gone-strike counter AND the free-mode marker, mirroring `unpair`, so /status stops reporting "paired" the
  *  moment the phone forgets this machine. Shared by the hook (its 2-strike gone path) and the watchdog
  *  (its revoke sweep) so the teardown stays identical. Paths are injectable so tests can point at a
  *  temp HOME; the defaults are the live locations. Tolerates already-gone files (ENOENT). */
@@ -2298,10 +2392,12 @@ export async function removeRevokedConfig(
   configPath = `${CC_DIR}/config.json`,
   lastSendPath = LAST_SEND_PATH,
   goneStrikesPath = GONE_STRIKES_PATH,
+  freeModePath = freeModePathBeside(configPath),
 ): Promise<void> {
   await unlink(configPath).catch(() => {});
   await unlink(lastSendPath).catch(() => {});
   await unlink(goneStrikesPath).catch(() => {});
+  await clearFreeMode(freeModePath); // the tier belonged to the gone pairing
 }
 
 // --- Shared consecutive-gone strike counter -------------------------------------------------
