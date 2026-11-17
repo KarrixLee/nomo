@@ -432,8 +432,8 @@ describe("the short `nomo` command", () => {
     if (opts.foreign) await writeFile(join(bin, "nomo"), "#!/bin/sh\necho not ours\n", { mode: 0o755 });
     return { h, log, path: `${bin}:${gbin}:/usr/bin:/bin` };
   }
-  async function cli(b: { h: string; path: string }, flags: string[]) {
-    const env = isolatedTestEnv(b.h, { NO_COLOR: "1", PATH: b.path, npm_config_user_agent: "", NOMO_CC_DIR: join(b.h, "cc") });
+  async function cli(b: { h: string; path: string }, flags: string[], ua = "") {
+    const env = isolatedTestEnv(b.h, { NO_COLOR: "1", PATH: b.path, npm_config_user_agent: ua, NOMO_CC_DIR: join(b.h, "cc") });
     const proc = spawnTestProcess({
       cmd: [Bun.which("node")!, NOMO_AI, ...flags], cwd: b.h, env, stdin: "ignore", stdout: "pipe", stderr: "pipe",
     });
@@ -461,6 +461,21 @@ describe("the short `nomo` command", () => {
     expect(help).toContain("  nomo pair");
     expect(help).not.toContain("bunx nomo-ai pair");
     expect(help).not.toMatch(/(bunx|npx) nomo (pair|status|reset|unpair|uninstall)/);
+  });
+
+  test("without the short command, hints name the runner this came through: npx (npm) or bunx", async () => {
+    const b = await box("ok");
+    const npm = await cli(b, ["--claude", "--no-global"], "npm/11.6.0 node/v22.23.4 darwin arm64 workspaces/false");
+    expect(npm.out).toContain("run `npx nomo-ai pair` from any folder");
+    expect(npm.out).not.toContain("bunx");
+    const npmHelp = (await cli(b, ["--help"], "npm/11.6.0 node/v22.23.4 darwin arm64 workspaces/false")).out;
+    expect(npmHelp).toContain("  npx nomo-ai pair");
+    expect(npmHelp).not.toContain("bunx nomo-ai");
+    const bun = await cli(b, ["--claude", "--no-global"], "bun/1.4.4 npm/? node/v24.3.0 darwin arm64");
+    expect(bun.out).toContain("run `bunx nomo-ai pair` from any folder");
+    const bunHelp = (await cli(b, ["--help"], "bun/1.4.4 npm/? node/v24.3.0 darwin arm64")).out;
+    expect(bunHelp).toContain("  bunx nomo-ai pair");
+    expect(bunHelp).toContain("  npx nomo-ai              same, without bun");
   });
 
   test("-y installs it too", async () => {

@@ -70,15 +70,18 @@ const VERSION = JSON.parse(
 /** The name this was run as: `nomo` (the short bin, after `bun add -g nomo-ai`) or `nomo-ai`. Only the
  *  help text uses it. Never suggest `bunx nomo`/`npx nomo`: the npm package `nomo` is someone else's. */
 const INVOKED = (process.argv[1] ?? "").split("/").pop() === "nomo" ? "nomo" : "nomo-ai";
-/** How the help names commands: `nomo` when run as it or when ours is on PATH, else `bunx nomo-ai`. */
-const CMD = INVOKED === "nomo" || ["ours", "old"].includes(shortCommandState()) ? "nomo" : "bunx nomo-ai";
+/** The long form for this run: `npx nomo-ai` when it came through npm (npx sets npm_config_user_agent
+ *  to `npm/…`), else `bunx nomo-ai` — an npx user may have no bun at all. */
+const RUNNER = /^npm\//.test(process.env.npm_config_user_agent || "") ? "npx nomo-ai" : "bunx nomo-ai";
+/** How the help names commands: `nomo` when run as it or when ours is on PATH, else RUNNER. */
+const CMD = INVOKED === "nomo" || ["ours", "old"].includes(shortCommandState()) ? "nomo" : RUNNER;
 /** One help row: the command, padded so the descriptions line up whichever name is shown. */
 const row = (/** @type {string} */ c, /** @type {string} */ what) => `  ${`${CMD}${c}`.padEnd(CMD.length + 12)} ${what}`;
 
 const USAGE = `${INVOKED} ${VERSION} — install (or update) the Nomo plugin for your coding agents.
 
 ${row("", "detect agents (ticked), press Enter, install, then pair")}
-${CMD === "nomo" ? "" : `  ${"npx nomo-ai".padEnd(CMD.length + 12)} same, without bun\n`}
+${CMD === "bunx nomo-ai" ? `  ${"npx nomo-ai".padEnd(CMD.length + 12)} same, without bun\n` : ""}
 Commands (from any folder; they run your installed Nomo, shared by every agent here):
 ${row(" pair", "pair this computer with your phone (opens the QR page, then waits")}
 ${row("", "for the scan); `pair code` prints the typeable code instead").replace(CMD, " ".repeat(CMD.length))}
@@ -1237,7 +1240,7 @@ function runCommand(name, rest) {
   const [entry, args] = COMMANDS[name](rest);
   const how = installedEntry(entry);
   if (!how) {
-    err("nomo-ai: Nomo is not installed on this computer yet — run `bunx nomo-ai` first.");
+    err(`nomo-ai: Nomo is not installed on this computer yet — run \`${RUNNER}\` first.`);
     return 1;
   }
   const exec = (/** @type {string[]} */ a) => {
@@ -1341,7 +1344,7 @@ function installShortCommand(noGlobal) {
     return true;
   }
   if (state === "foreign") {
-    say(dim("Another program called `nomo` is already on your PATH — keep using `bunx nomo-ai`."));
+    say(dim(`Another program called \`nomo\` is already on your PATH — keep using \`${RUNNER}\`.`));
     say();
     return false;
   }
@@ -1354,9 +1357,9 @@ function installShortCommand(noGlobal) {
     return false;
   }
   const ok = !fail && shortCommandState() !== "missing";
-  if (fail) say("Could not install the short nomo command — bunx nomo-ai pair works the same.");
+  if (fail) say(`Could not install the short nomo command — ${RUNNER} pair works the same.`);
   else if (ok) say(`Installed the short command: ${usable}`);
-  else say(`Installed, but ${globalBinDir(pm)} is not on your PATH — add it, or keep using \`bunx nomo-ai\`.`);
+  else say(`Installed, but ${globalBinDir(pm)} is not on your PATH — add it, or keep using \`${RUNNER}\`.`);
   say();
   return ok;
 }
@@ -1577,7 +1580,7 @@ async function main() {
       writeFileSync(join(ccDir(), "short-command"), short ? "1\n" : "0\n");
     } catch {}
   }
-  const cli = short ? "nomo" : "bunx nomo-ai";
+  const cli = short ? "nomo" : RUNNER;
   if (done.length > 0 && !DRY) {
     const wasPaired = isPaired();
     if (!wasPaired && (await offerPair(!!args.yes))) runPair();

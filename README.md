@@ -99,7 +99,7 @@ They run the same plugin code as the in-agent commands (`/nomo-cc:pair`, `$nomo-
 `npm install -g nomo-ai` when not run from bun; no `sudo`), so `nomo pair`, `nomo status`, … work from
 any folder; pass `--no-global` to skip it, and remove it with `bun remove -g nomo-ai` (or
 `npm uninstall -g nomo-ai`). Without it, every command works the same as `bunx nomo-ai pair`,
-`bunx nomo-ai status`, … Never type `bunx nomo` or `npx nomo`: the npm package named `nomo` is
+`bunx nomo-ai status`, … (`npx nomo-ai …` when you ran the installer with npx; its hints name that form) Never type `bunx nomo` or `npx nomo`: the npm package named `nomo` is
 someone else's.
 
 The full guides live at [docs.nomo.gg](https://docs.nomo.gg):
