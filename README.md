@@ -242,7 +242,7 @@ computer names from the app's own App Group container. It never leaves the devic
 | `~/.config/cc-status/free-mode` | time the relay last said this pairing is not Pro (counts for 15 minutes for sending; keeps the LAN listener off until the relay says Pro) | hooks, watchdog |
 | `~/.config/cc-status/short-command` | `1` or `0`: whether the short `nomo` command is installed, so status and reset name `nomo …` or `bunx nomo-ai …` | `bunx nomo-ai` |
 | `~/.config/cc-status/*-trace.log` (`0600`) | local diagnostics; never uploaded | hooks, watchdog |
-| `~/.codex/config.toml` | Codex `notify` backstop (your existing `notify` is chained, mode kept, one-time `config.toml.bak-nomo`); refuses an unparseable `notify` line | Codex pair |
+| `~/.codex/config.toml` | Codex `notify` backstop (your existing `notify` is chained, mode kept, one-time `config.toml.bak-nomo`); refuses an unparseable `notify` line | Codex pair; `nomo pair` (and the installer's pair question) when Codex has Nomo |
 | `~/.config/opencode/plugins/nomo.js`, `commands/nomo-*.md` | OpenCode stub + commands | `opencode-install.sh` |
 | `~/.cursor/hooks.json` (merged), `~/.cursor/skills/nomo-*/` | Cursor hooks + skills (`$CURSOR_CONFIG_DIR` if set) | `cursor-install.mjs` |
 | `~/.gemini/config/hooks.json` (`"nomo"` block), `~/.gemini/config/plugins/nomo/` | Antigravity hooks + plugin | `antigravity-install.mjs` |

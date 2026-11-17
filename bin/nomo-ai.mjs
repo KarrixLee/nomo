@@ -1248,7 +1248,14 @@ function runCommand(name, rest) {
   const code = exec(args);
   // `pair` = start, then wait for the scan, unless the caller already chose a step.
   if (name === "pair" && code === 0 && !args.some((a) => a === "wait" || a === "wire-notify" || a === "--check")) {
-    return exec(["wait"]);
+    const waited = exec(["wait"]);
+    // Codex's $nomo-pair also wires its `notify` backstop (a reliable "done" when a Codex hook
+    // misfires); pairing from here has to do the same or Codex users lose it. Same entry, same
+    // idempotent command the skill runs. Best-effort: the pairing already succeeded.
+    if (waited === 0 && AGENTS.find((a) => a.id === "codex")?.installed()) {
+      if (exec(["wire-notify"]) !== 0) say(dim("Codex's notify backstop was not wired — $nomo-pair in Codex retries it."));
+    }
+    return waited;
   }
   return code;
 }

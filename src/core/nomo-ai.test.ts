@@ -267,6 +267,36 @@ describe("commands: pair / status / reset / uninstall", () => {
     expect(await readFile(log2, "utf8")).toBe("pair \n");
   });
 
+  test("pair with Codex installed also wires Codex's notify backstop; not without Codex, not after a failed pair", async () => {
+    const h = await home();
+    const log = join(h, "calls.log");
+    await plugin(join(h, ".nomo", "plugin"), log);
+    await mkdir(join(h, ".codex", "plugins", "cache", "nomo", "nomo"), { recursive: true });
+    expect((await cli(h, ["pair"])).code).toBe(0);
+    expect(await readFile(log, "utf8")).toBe("pair \npair wait\npair wire-notify\n");
+    const noCodex = await home();
+    await plugin(join(noCodex, ".nomo", "plugin"), join(noCodex, "calls.log"));
+    await cli(noCodex, ["pair"]);
+    expect(await readFile(join(noCodex, "calls.log"), "utf8")).toBe("pair \npair wait\n");
+    const failed = await home();
+    await plugin(join(failed, ".nomo", "plugin"), join(failed, "calls.log"), 1);
+    await mkdir(join(failed, ".codex", "plugins", "cache", "nomo", "nomo"), { recursive: true });
+    await cli(failed, ["pair"]);
+    expect(await readFile(join(failed, "calls.log"), "utf8")).toBe("pair \n");
+  });
+
+  test("a failed wire-notify is one quiet line and the pairing still exits 0", async () => {
+    const h = await home();
+    const log = join(h, "calls.log");
+    await plugin(join(h, ".nomo", "plugin"), log);
+    // run.sh: everything succeeds except wire-notify.
+    await writeFile(join(h, ".nomo", "plugin", "scripts", "run.sh"), `#!/bin/sh\ne=$(basename "$1" .mjs); shift\necho "$e $*" >> '${log}'\n[ "$1" = wire-notify ] && exit 1\nexit 0\n`, { mode: 0o755 });
+    await mkdir(join(h, ".codex", "plugins", "cache", "nomo", "nomo"), { recursive: true });
+    const r = await cli(h, ["pair"]);
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe("Codex's notify backstop was not wired — $nomo-pair in Codex retries it.");
+  });
+
   test("the copy hooks last ran (the shim stamp) wins over ~/.nomo", async () => {
     const h = await home();
     const log = join(h, "calls.log");
@@ -644,13 +674,15 @@ describe("bunx nomo-ai --devin", () => {
 // only logs — no browser, no network.
 describe("one step: detected agents open ticked, then `Pair your phone now?`", () => {
   const QUESTION = "Pair your phone now? [Y/n]";
-  async function session(flags: string[], opts: { paired?: boolean; env?: Record<string, string | undefined>; tty?: boolean } = {}) {
+  async function session(flags: string[], opts: { paired?: boolean; env?: Record<string, string | undefined>; tty?: boolean; codex?: boolean } = {}) {
     const h = await mkdtemp(join(tmpdir(), "nomo-ai-tty-"));
     homes.push(h);
     const bin = join(h, "bin");
     const copy = join(h, ".claude", "plugins", "cache", "nomo", "nomo-cc", "2.5.0");
     await mkdir(bin, { recursive: true });
     await writeFile(join(bin, "claude"), `#!/bin/sh\ncase "$*" in *"plugin install"*) ${fakeCopySh(copy)} ;; esac\nexit 0\n`, { mode: 0o755 });
+    // A fake `codex` whose `plugin add` leaves Codex's cache entry, the way installed() detects it.
+    if (opts.codex) await writeFile(join(bin, "codex"), `#!/bin/sh\ncase "$*" in *"plugin add"*) mkdir -p '${join(h, ".codex", "plugins", "cache", "nomo", "nomo")}' ;; esac\nexit 0\n`, { mode: 0o755 });
     const cc = join(h, "cc");
     const pair = async () => {
       await mkdir(cc, { recursive: true });
@@ -711,6 +743,23 @@ describe("one step: detected agents open ticked, then `Pair your phone now?`", (
     expect(r.out).toContain("What's left:\r\n  1. Restart Claude Code so Nomo's hooks load.");
     expect(r.out).not.toContain("Pair your phone: run");
     expect(r.out).not.toContain("already paired");
+  });
+
+  test("Codex installed in this run: yes pairs, then wires Codex's notify backstop; declining wires nothing", async () => {
+    const yes = await session([], { codex: true });
+    await yes.waitFor("enter install");
+    yes.type("\r");
+    await yes.waitFor(QUESTION);
+    yes.type("\r");
+    await yes.done();
+    expect(await yes.calls()).toBe("pair \npair wait\npair wire-notify\n");
+    const no = await session([], { codex: true });
+    await no.waitFor("enter install");
+    no.type("\r");
+    await no.waitFor(QUESTION);
+    no.type("n\r");
+    await no.done();
+    expect(await no.calls()).toBe("");
   });
 
   test("named agent flags still get the question on a terminal", async () => {
