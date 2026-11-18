@@ -63,10 +63,18 @@ update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
 bunx nomo-ai     # or: npx nomo-ai
 ```
 
-It detects which agents are on this computer and installs Nomo for each through that agent's own
-install path (`--claude` `--codex` `--opencode` `--cursor` `--antigravity` `--devin` pick agents;
-`-n` prints the plan and runs nothing). Installing never pairs your phone and has no `postinstall`
-hook; pairing is the separate, explicit `nomo pair` (or the pair command inside your agent). Devin
+It detects which agents are on this computer, opens a picker with those agents already ticked, and on
+Enter installs Nomo for each through that agent's own install path (`--claude` `--codex` `--opencode`
+`--cursor` `--antigravity` `--devin` pick agents; `-n` prints the plan and runs nothing). There is no
+`postinstall` hook.
+
+**Pairing stays an explicit yes.** In an interactive terminal (stdin and stdout both a TTY), once at
+least one agent is installed and this computer is not already paired, the installer asks
+`Pair your phone now? [Y/n]`; yes runs exactly `nomo pair`. It never pairs without that answer:
+`--yes`, `--dry-run`, `CI=…` and piped or scripted runs never ask and never pair, and a computer that is
+already paired is never re-paired (re-pairing revokes the old pairing). Pair any time with `nomo pair`
+or the pair command inside your agent. Pairing before restarting the agents is fine for all of them,
+and OpenCode needs it that way round: it reads the pairing once, at start. Devin
 can instead use the plugin: `devin plugins install KarrixLee/nomo`. The three agent config files it
 merges into directly are undone with `nomo uninstall --cursor`, `nomo uninstall --antigravity` and
 `nomo uninstall --devin` (also spelled `--uninstall`; the same as
@@ -91,7 +99,7 @@ They run the same plugin code as the in-agent commands (`/nomo-cc:pair`, `$nomo-
 `npm install -g nomo-ai` when not run from bun; no `sudo`), so `nomo pair`, `nomo status`, … work from
 any folder; pass `--no-global` to skip it, and remove it with `bun remove -g nomo-ai` (or
 `npm uninstall -g nomo-ai`). Without it, every command works the same as `bunx nomo-ai pair`,
-`bunx nomo-ai status`, … Never type `bunx nomo` or `npx nomo`: the npm package named `nomo` is
+`bunx nomo-ai status`, … (`npx nomo-ai …` when you ran the installer with npx; its hints name that form) Never type `bunx nomo` or `npx nomo`: the npm package named `nomo` is
 someone else's.
 
 The full guides live at [docs.nomo.gg](https://docs.nomo.gg):
@@ -234,7 +242,7 @@ computer names from the app's own App Group container. It never leaves the devic
 | `~/.config/cc-status/free-mode` | time the relay last said this pairing is not Pro (counts for 15 minutes for sending; keeps the LAN listener off until the relay says Pro) | hooks, watchdog |
 | `~/.config/cc-status/short-command` | `1` or `0`: whether the short `nomo` command is installed, so status and reset name `nomo …` or `bunx nomo-ai …` | `bunx nomo-ai` |
 | `~/.config/cc-status/*-trace.log` (`0600`) | local diagnostics; never uploaded | hooks, watchdog |
-| `~/.codex/config.toml` | Codex `notify` backstop (your existing `notify` is chained, mode kept, one-time `config.toml.bak-nomo`); refuses an unparseable `notify` line | Codex pair |
+| `~/.codex/config.toml` | Codex `notify` backstop (your existing `notify` is chained, mode kept, one-time `config.toml.bak-nomo`); refuses an unparseable `notify` line | Codex pair; `nomo pair` (and the installer's pair question) when Codex has Nomo |
 | `~/.config/opencode/plugins/nomo.js`, `commands/nomo-*.md` | OpenCode stub + commands | `opencode-install.sh` |
 | `~/.cursor/hooks.json` (merged), `~/.cursor/skills/nomo-*/` | Cursor hooks + skills (`$CURSOR_CONFIG_DIR` if set) | `cursor-install.mjs` |
 | `~/.gemini/config/hooks.json` (`"nomo"` block), `~/.gemini/config/plugins/nomo/` | Antigravity hooks + plugin | `antigravity-install.mjs` |
