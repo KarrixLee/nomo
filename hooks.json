@@ -1,0 +1,69 @@
+{
+  "UserPromptSubmit": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "R=\"${DEVIN_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; [ -n \"$R\" ] && [ -f \"$R/plugin/scripts/run.sh\" ] && exec /bin/sh \"$R/plugin/scripts/run.sh\" \"$R/plugin/dist/devin-status.mjs\" --via=devin-plugin; exit 0",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "PreToolUse": [
+    {
+      "matcher": "^ask_user_question$",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "R=\"${DEVIN_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; [ -n \"$R\" ] && [ -f \"$R/plugin/scripts/run.sh\" ] && /bin/sh \"$R/plugin/scripts/run.sh\" \"$R/plugin/dist/devin-approve.mjs\" --via=devin-plugin; exit 0",
+          "timeout": 86400
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "R=\"${DEVIN_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; [ -n \"$R\" ] && [ -f \"$R/plugin/scripts/run.sh\" ] && exec /bin/sh \"$R/plugin/scripts/run.sh\" \"$R/plugin/dist/devin-status.mjs\" --via=devin-plugin; exit 0",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "Stop": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "R=\"${DEVIN_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; [ -n \"$R\" ] && [ -f \"$R/plugin/scripts/run.sh\" ] && exec /bin/sh \"$R/plugin/scripts/run.sh\" \"$R/plugin/dist/devin-status.mjs\" --via=devin-plugin; exit 0",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "SessionEnd": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "R=\"${DEVIN_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; [ -n \"$R\" ] && [ -f \"$R/plugin/scripts/run.sh\" ] && exec /bin/sh \"$R/plugin/scripts/run.sh\" \"$R/plugin/dist/devin-status.mjs\" --via=devin-plugin; exit 0",
+          "timeout": 10
+        }
+      ]
+    }
+  ],
+  "PermissionRequest": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "R=\"${DEVIN_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}\"; [ -n \"$R\" ] && [ -f \"$R/plugin/scripts/run.sh\" ] && /bin/sh \"$R/plugin/scripts/run.sh\" \"$R/plugin/dist/devin-approve.mjs\" --via=devin-plugin; exit 0",
+          "timeout": 86400
+        }
+      ]
+    }
+  ]
+}

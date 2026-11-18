@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import { createLanAnswerStore } from "../core/lan-listener";
 import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
-import { GONE_STRIKE_LIMIT, readGoneStrikes, recordGoneStrike, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
+import { GONE_STRIKE_LIMIT, isFreeMode, markFreeMode, readGoneStrikes, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
+import { addEvent, emptyState, maybeUpload } from "../core/activity";
 import {
   acceptLanAnswer, acceptLanCommand, enqueueDrainCommands, LAN_ANSWER_ECHO_DELAY_MS, LAN_COMMAND_ID_PREFIX,
   buildDoneEnvelope, buildEndEnvelope, buildHeartbeatEnvelope, buildNeedsAttentionEnvelope, buildProvisionalBlob,
@@ -14,7 +15,7 @@ import {
   claudeTailPendingApproval, codexLastTurnEvent, codexTailPendingApproval, correctIdleClaude, correctInterrupt,
   CODEX_TUI_SESSION_START_SKEW_MS, correlateCodexTuiPid, resolveCodexTuiOwner,
   COMMAND_FUTURE_SKEW_MS, COMMAND_TTL_MS, commandIsFresh,
-  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPendingUpdate, resealForPairing, shouldReseal, noteResend, resendAllowed, resendBackoffMs, resetResendBackoff, RESEND_BACKOFF_MAX_MS, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown,
+  codexBridgeIsDown, correctPendingApproval, correctPendingDone, correctPendingUpdate, resealForPairing, shouldReseal, noteResend, resendAllowed, resendBackoffMs, resetResendBackoff, RESEND_BACKOFF_MAX_MS, correctPlanPickerVerification, correctResolvedPlanPicker, createBridgeSupervisor, discoverLiveSessions, drainCommands, effectiveDoneAttempts, extractCommands, goneStrikeShouldTeardown, settleGoneStrikes,
   enforceWatchdogOwnership, hasInterruptMarker, IDLE_GRACE_MS, isClaudeIdleReapEligible, isRetireEligible, isRightfulWatchdogOwner, lastTurnLine, PAIRING_TTL_MS, pendingDoneRetryWrite,
   pendingDoneSettleWrite, pendingPairingExpired, planPickerPendingExpired, PLAN_PICKER_PENDING_MAX_MS, pruneStaleDecisionHolds,
   PLAN_PICKER_RECENT_DONE_MS, PLAN_PICKER_VERIFY_MAX_MS, RETIRE_AFTER_MS,
@@ -22,7 +23,7 @@ import {
   setCodexBridgeDown, shouldHeartbeat, shouldIdleProvisionalCheck,
   heartbeatKind, isWaitingSession, CLAUDE_AWAITING_PROMPT_REAP_MS, CLAUDE_IDLE_REAP_MAX_ATTEMPTS, POLL_MS,
   shouldInterruptCheck, shouldPendingApprovalCheck, shouldPendingDoneCheck, PENDING_DONE_GRACE_MS, PENDING_DONE_POST_TIMEOUT_MS, shouldPlanPickerVerificationCheck, shouldRepairTitle, tailShowsInterrupt, titleRepairedRecord,
-  watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline,
+  watchdogEventHeaders, WAITING_HEARTBEAT_AFTER_MS, withDeadline, postEvent, lanConfigFor,
 } from "./cc-watchdog";
 import type { CommandPayload, DrainCommandsDeps, PostDetail, PostOutcome, RecordEntry } from "./cc-watchdog";
 import { resolveOnRelay } from "../core/codex-remote-input";
@@ -122,6 +123,11 @@ describe("classifySession", () => {
 describe("isClaudeIdleReapEligible (a resumed Claude session gone silent past the reap grace)", () => {
   const REAP_MS = 1_800_000; // must mirror CLAUDE_IDLE_REAP_MS in cc-watchdog.ts
   const now = 100_000_000;
+
+  test("a quiet working devin row is idle-reap eligible (its hooks are its only signal)", () => {
+    expect(isClaudeIdleReapEligible(rec({ agent: "devin", lastEvent: "working", ts: now - REAP_MS }), now)).toBe(true);
+    expect(isClaudeIdleReapEligible(rec({ agent: "devin", lastEvent: "working", ts: now - REAP_MS + 1 }), now)).toBe(false);
+  });
 
   test("a working Claude session idle ≥30 min → eligible; just under → not", () => {
     expect(isClaudeIdleReapEligible(rec({ lastEvent: "working", ts: now - REAP_MS }), now)).toBe(true);
@@ -1731,6 +1737,42 @@ describe("watchdog gone-strike gate (shared 2-strike teardown, not single-strike
       await resetGoneStrikes(path);                              // a delivered POST cleared it
       expect(await exists(path)).toBe(false);
       expect(await goneStrikeShouldTeardown(path)).toBe(false); // strike 1 again — NOT 2
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("settleGoneStrikes: a presence/event gone strikes; a free pairing's fake 'delivered' never resets the streak", async () => {
+    const { path, cleanup } = await tmpStrikes();
+    const freeModePath = join(path, "..", "free-mode");
+    try {
+      // Revoked free pairing: presence 404s, the sweep's short-circuited posts report "delivered".
+      await markFreeMode(freeModePath);
+      expect(await settleGoneStrikes(true, false, { goneStrikesPath: path, freeModePath })).toBe("retry"); // strike 1
+      expect(await settleGoneStrikes(false, true, { goneStrikesPath: path, freeModePath })).toBe("ok");   // free → no reset
+      expect(await readGoneStrikes(path)).toBe(1);
+      expect(await settleGoneStrikes(true, false, { goneStrikesPath: path, freeModePath })).toBe("teardown"); // strike 2
+      // Pro: a real delivered sweep still breaks the streak (one transient 404 can't accumulate).
+      await resetGoneStrikes(path);
+      await rm(freeModePath, { force: true });
+      expect(await settleGoneStrikes(true, false, { goneStrikesPath: path, freeModePath })).toBe("retry");
+      expect(await settleGoneStrikes(false, true, { goneStrikesPath: path, freeModePath })).toBe("ok");
+      expect(await exists(path)).toBe(false);
+      expect(await settleGoneStrikes(true, false, { goneStrikesPath: path, freeModePath })).toBe("retry"); // 1 again, not 2
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("teardown drops the free-mode marker with the config (status stops saying Nomo Free)", async () => {
+    const { path, cleanup } = await tmpStrikes();
+    const dir = join(path, "..");
+    try {
+      await writeFile(join(dir, "config.json"), "{}");
+      await markFreeMode(join(dir, "free-mode"));
+      await removeRevokedConfig(join(dir, "config.json"), join(dir, "last-send"), path);
+      expect(await exists(join(dir, "config.json"))).toBe(false);
+      expect(await exists(join(dir, "free-mode"))).toBe(false);
     } finally {
       await cleanup();
     }
@@ -4190,6 +4232,20 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
       expect(traces[0]).toMatchObject({ agent: "antigravity", result: "interrupt-flagged" });
     });
 
+    test("a Devin session gets the shared hook flag (its PostToolUse hook prints continue:false)", async () => {
+      const { traces, deps } = harness();
+      const flagged: string[] = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "devin" })],
+        writeInterruptFlagFn: async (sessionId) => { flagged.push(sessionId); },
+      });
+      expect(flagged).toEqual(["sess-a"]);
+      expect(traces[0]).toMatchObject({ agent: "devin", result: "interrupt-flagged" });
+    });
+
     test("a Codex session is interrupted through the bridge with the record's own turn id", async () => {
       const { traces, deps } = harness();
       const calls: Array<[string, string]> = [];
@@ -4830,5 +4886,90 @@ describe("resealForPairing (re-announce live sessions to a new pairing)", () => 
     expect(await resealForPairing(cfg(), "/tmp/s.json", "s", stale(), NOW, w.seams)).toBe("pending");
     expect(w.disk!.pairingId).toBe("old");
     expect(resendAllowed(NOW + 1)).toBe(false);
+  });
+});
+
+// --- 2.5.0 free pairing ---------------------------------------------------------------------------
+// Every sweep path routes its /cc/event through postEvent (the deps.post seams default to it), so the
+// free-mode gate lives there once. Free = nothing to deliver: the local bookkeeping proceeds as if the
+// event landed, and no request leaves the computer.
+describe("free mode in the watchdog", () => {
+  const CONFIG: Config = { url: "https://relay.test", pairingId: "p", pcSecret: "s", e2eKey: KEY };
+  const realFetch = globalThis.fetch;
+  let dir = "";
+  let urls: string[] = [];
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "wd-free-"));
+    urls = [];
+  });
+  afterEach(async () => {
+    globalThis.fetch = realFetch;
+    await rm(dir, { recursive: true, force: true });
+  });
+  const stubFetch = (status: number, body: string) => {
+    globalThis.fetch = (async (url: string) => { urls.push(String(url)); return new Response(body, { status }); }) as unknown as typeof fetch;
+  };
+
+  test("free mode: sweep sends no /v1/cc/event", async () => {
+    const freeModePath = join(dir, "free-mode");
+    await writeFile(freeModePath, String(Date.now()));
+    stubFetch(200, "{}");
+    const outcome = await postEvent(CONFIG, buildEndEnvelope("s1", Date.now(), rec()), { freeModePath });
+    expect(urls).toEqual([]);
+    expect(outcome).toBe("delivered"); // nothing owed: the sweep may retire/rewrite the record
+    // CONTROL: without the marker the same POST goes out.
+    await postEvent(CONFIG, buildEndEnvelope("s1", Date.now(), rec()), { freeModePath: join(dir, "absent") });
+    expect(urls).toEqual(["https://relay.test/v1/cc/event"]);
+  });
+
+  test("a 403 entitlement suspended marks free mode and is never a gone strike", async () => {
+    const freeModePath = join(dir, "free-mode");
+    stubFetch(403, '{"error":"entitlement suspended"}');
+    const outcome = await postEvent(CONFIG, buildEndEnvelope("s1", Date.now(), rec()), { freeModePath });
+    expect(outcome).toBe("failed"); // not "revoked": run() never counts it toward teardown
+    expect(await isFreeMode(Date.now(), freeModePath)).toBe(true);
+  });
+
+  // M1: the LAN listener's key must not come back just because the marker aged out (worker unreachable,
+  // api.nomo.gg blocked). Only a real "pro" answer — presence, or a 2xx on a session route — re-keys it.
+  test("an expired free-mode marker keeps the LAN listener keyed off; a 2xx /cc/event re-keys it", async () => {
+    const freeModePath = join(dir, "free-mode");
+    expect(lanConfigFor(CONFIG, freeModePath)).toBe(CONFIG); // never free: LAN as before
+    expect(lanConfigFor(null, freeModePath)).toBeNull();
+    await writeFile(freeModePath, String(Date.now() - 16 * 60_000)); // 15-min TTL lapsed, no answer since
+    expect(await isFreeMode(Date.now(), freeModePath)).toBe(false); // events fail open (unchanged)
+    expect(lanConfigFor(CONFIG, freeModePath)).toBeNull(); // LAN does not
+    // The fail-open event is refused as not pending (409): still no "pro" fact, LAN stays off.
+    stubFetch(409, '{"error":"pairing not claimed"}');
+    await postEvent(CONFIG, buildEndEnvelope("s1", Date.now(), rec()), { freeModePath });
+    expect(lanConfigFor(CONFIG, freeModePath)).toBeNull();
+    // The server accepts a session event → the pairing is Pro → LAN re-keys.
+    stubFetch(200, "{}");
+    expect(await postEvent(CONFIG, buildEndEnvelope("s1", Date.now(), rec()), { freeModePath })).toBe("delivered");
+    expect(lanConfigFor(CONFIG, freeModePath)).toBe(CONFIG);
+  });
+
+  // 409 {"error":"pairing not claimed"}: the server refuses a still-pending pairing on session routes (the
+  // PC's colo can serve the pending record for ~60 s after a claim). Transient: retry next sweep, never a
+  // gone strike (that would unpair a brand-new computer), never free mode.
+  test("a 409 pairing-not-claimed is a transient failure: not revoked, not free mode", async () => {
+    const freeModePath = join(dir, "free-mode");
+    stubFetch(409, '{"error":"pairing not claimed"}');
+    expect(postOutcomeForStatus(409)).toBe("failed");
+    expect(await postEvent(CONFIG, buildEndEnvelope("s1", Date.now(), rec()), { freeModePath })).toBe("failed");
+    expect(urls).toEqual(["https://relay.test/v1/cc/event"]);
+    expect(await isFreeMode(Date.now(), freeModePath)).toBe(false);
+  });
+
+  test("activity upload still runs in free mode", async () => {
+    const freeModePath = join(dir, "free-mode");
+    await writeFile(freeModePath, String(Date.now()));
+    const st = emptyState();
+    addEvent(st, { ts: Date.now(), agent: "claude", sessionId: "s", kind: "turn", id: "a" });
+    const seen: string[] = [];
+    const fetchFn = (async (url: string) => { seen.push(String(url)); return new Response("{}"); }) as unknown as typeof fetch;
+    expect(await isFreeMode(Date.now(), freeModePath)).toBe(true);
+    expect(await maybeUpload(st, CONFIG, Date.now(), fetchFn)).toBe(true);
+    expect(seen).toEqual(["https://relay.test/v1/cc/full"]);
   });
 });

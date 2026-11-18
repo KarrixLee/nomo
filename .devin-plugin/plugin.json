@@ -1,0 +1,14 @@
+{
+  "name": "nomo",
+  "displayName": "Nomo",
+  "version": "2.5.0",
+  "description": "Mirror Devin sessions to the Nomo iPhone app as an end-to-end-encrypted Live Activity, and answer Devin permission prompts from your phone.",
+  "author": { "name": "Nomo" },
+  "homepage": "https://nomo.gg",
+  "repository": "https://github.com/KarrixLee/nomo",
+  "license": "MIT",
+  "keywords": ["devin", "live-activity", "dynamic-island", "ios", "e2e"],
+  "logo": "plugin/assets/icon.png",
+  "platforms": ["local"],
+  "skills": "plugin/devin-skills"
+}

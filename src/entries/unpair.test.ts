@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -180,5 +180,26 @@ describe("unpair (edge cases)", () => {
     }]);
     await unpair({ fetchFn: fn, print, configPath, lastSendPath, revokeTimeoutMs: 1000 });
     expect(sawSignal).toBe(true);
+  });
+});
+
+describe("unpair forgets Devin's Always-allow grants", () => {
+  test("every <id>.devin-allow beside the config is deleted — paired, and even when already unpaired", async () => {
+    const sessions = join(dir, "sessions");
+    await mkdir(sessions);
+    const seed = async () => {
+      await writeFile(join(sessions, "a.devin-allow"), '[{"tool":"Write"}]');
+      await writeFile(join(sessions, "b.devin-allow"), '[{"tool":"shell","prefix":"touch"}]');
+      await writeFile(join(sessions, "a.json"), "{}");
+    };
+    await seed();
+    await writeFile(configPath, JSON.stringify({ url: WORKER, pairingId: PAIRING_ID, pcSecret: PC_SECRET, e2eKeyB64: E2E_KEY_B64 }));
+    const { fn } = scriptedFetch([() => json({ ok: true })]);
+    expect(await unpair({ fetchFn: fn, print, configPath, lastSendPath })).toBe(0);
+    expect(await readdir(sessions)).toEqual(["a.json"]);
+    // a crashed session's file found after the config is already gone is removed too
+    await seed();
+    expect(await unpair({ fetchFn: scriptedFetch([]).fn, print, configPath, lastSendPath })).toBe(0);
+    expect(await readdir(sessions)).toEqual(["a.json"]);
   });
 });

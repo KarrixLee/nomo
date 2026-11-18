@@ -8,6 +8,7 @@
 <picture><source media="(prefers-color-scheme: dark)" srcset="assets/opencode-dark.png"><img src="assets/opencode-light.png" height="26" alt="OpenCode"></picture>&nbsp;&nbsp;
 <picture><source media="(prefers-color-scheme: dark)" srcset="assets/cursor-dark.png"><img src="assets/cursor-light.png" height="26" alt="Cursor"></picture>&nbsp;&nbsp;
 <img src="assets/antigravity.png" height="26" alt="Antigravity">&nbsp;&nbsp;
+<picture><source media="(prefers-color-scheme: dark)" srcset="assets/devin-dark.png"><img src="assets/devin-light.png" height="26" alt="Devin"></picture>&nbsp;&nbsp;
 <img src="https://img.shields.io/badge/License-MIT-blue" alt="License: MIT">
 </p>
 
@@ -15,11 +16,10 @@
 <a href="https://apps.apple.com/app/nomo-ai-status-usage/id6779366830"><img src="assets/app-store-badge.svg" height="48" alt="Download Nomo on the App Store"></a>
 </p>
 
-Nomo mirrors your **Claude Code**, **OpenAI Codex** (CLI and desktop app), **OpenCode**, **Cursor**
-and **Antigravity** sessions to the Nomo iPhone app as a Live Activity — working, needs you, done — and
-lets you answer permission prompts and questions from the phone (Cursor is status-only; Antigravity
-answers Allow/Deny for shell commands and file writes). Everything is end-to-end encrypted; one pairing
-covers every agent on a computer.
+Nomo mirrors your **Claude Code**, **OpenAI Codex** (CLI and desktop app), **OpenCode**, **Cursor**,
+**Antigravity** and **Devin** sessions to the Nomo iPhone app as a Live Activity — working, needs you,
+done — and lets you answer permission prompts and questions from the phone. Everything is end-to-end
+encrypted; one pairing covers every agent on a computer.
 
 This README is the **technical and security reference**. How to install, pair, use the commands,
 update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
@@ -34,7 +34,11 @@ update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
   opened only on your iPhone. The key comes from pairing (QR secret or six-word code, then a per-pairing
   ephemeral **ECDH P-256** exchange) and never passes through a server. [Encryption](#encryption)
 - **The relay is blind.** The Cloudflare Worker that forwards pushes sees routing metadata only — never a
-  title, machine name, status text, command, answer or even which agent sent it.
+  title, machine name, status text, command or answer. The one thing it sees in the clear is the
+  presence ping (once a minute, and when it changes): which agents have a turn open, and whether one is
+  waiting for approval.
+  A free (not Pro) pairing sends only that ping and the sealed daily activity summary, except that after
+  a quiet spell the first prompt's requests still go out (end-to-end encrypted, as always) and are refused.
   [What leaves your computer](#what-leaves-your-computer)
 - **No telemetry, no credentials.** The plugin's only network peer is that relay (`https://api.nomo.gg`
   by default). It never reads your agents' API keys or logins, and has no analytics. The installer and
@@ -42,7 +46,8 @@ update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
 - **Hooks can only do what you answered.** A phone Allow, Deny or answer is acted on only when it is
   sealed by your paired phone for that exact request. Every failure — unpaired, offline, timeout,
   crash — **fails open** to the agent's own prompt. Nomo can delay a decision; it never makes one for
-  you, except auto-approving its **own** status/pair commands in Antigravity, matched byte for byte.
+  you, except auto-approving its **own** status commands, matched byte for byte. Nomo's own pair,
+  unpair, reset and uninstall commands always ask.
   [Hooks security](#hooks-security)
 - **Local files are owner-only.** Pairing keys and session records live in `~/.config/cc-status/`,
   written `0600`. Every file Nomo writes into an agent's config is listed below, and the installers
@@ -58,12 +63,21 @@ update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
 bunx nomo-ai     # or: npx nomo-ai
 ```
 
-It detects which agents are on this computer and installs Nomo for each through that agent's own
-install path (`--claude` `--codex` `--opencode` `--cursor` `--antigravity` pick agents; `-n` prints
-the plan and runs nothing). Installing never pairs your phone and has no `postinstall` hook;
-pairing is the separate, explicit `nomo pair` (or the pair command inside your agent). The two
-agent config files it merges into directly are undone with `nomo uninstall --cursor` and
-`nomo uninstall --antigravity` (also spelled `--uninstall`; the same as
+It detects which agents are on this computer, opens a picker with those agents already ticked, and on
+Enter installs Nomo for each through that agent's own install path (`--claude` `--codex` `--opencode`
+`--cursor` `--antigravity` `--devin` pick agents; `-n` prints the plan and runs nothing). There is no
+`postinstall` hook.
+
+**Pairing stays an explicit yes.** In an interactive terminal (stdin and stdout both a TTY), once at
+least one agent is installed and this computer is not already paired, the installer asks
+`Pair your phone now? [Y/n]`; yes runs exactly `nomo pair`. It never pairs without that answer:
+`--yes`, `--dry-run`, `CI=…` and piped or scripted runs never ask and never pair, and a computer that is
+already paired is never re-paired (re-pairing revokes the old pairing). Pair any time with `nomo pair`
+or the pair command inside your agent. Pairing before restarting the agents is fine for all of them,
+and OpenCode needs it that way round: it reads the pairing once, at start. Devin
+can instead use the plugin: `devin plugins install KarrixLee/nomo`. The three agent config files it
+merges into directly are undone with `nomo uninstall --cursor`, `nomo uninstall --antigravity` and
+`nomo uninstall --devin` (also spelled `--uninstall`; the same as
 `node ~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall`). An agent flag is required. For Claude
 Code, Codex and OpenCode, uninstall only prints the host's own removal command.
 
@@ -85,7 +99,7 @@ They run the same plugin code as the in-agent commands (`/nomo-cc:pair`, `$nomo-
 `npm install -g nomo-ai` when not run from bun; no `sudo`), so `nomo pair`, `nomo status`, … work from
 any folder; pass `--no-global` to skip it, and remove it with `bun remove -g nomo-ai` (or
 `npm uninstall -g nomo-ai`). Without it, every command works the same as `bunx nomo-ai pair`,
-`bunx nomo-ai status`, … Never type `bunx nomo` or `npx nomo`: the npm package named `nomo` is
+`bunx nomo-ai status`, … (`npx nomo-ai …` when you ran the installer with npx; its hints name that form) Never type `bunx nomo` or `npx nomo`: the npm package named `nomo` is
 someone else's.
 
 The full guides live at [docs.nomo.gg](https://docs.nomo.gg):
@@ -94,7 +108,7 @@ The full guides live at [docs.nomo.gg](https://docs.nomo.gg):
 | --- | --- |
 | **Get started** | [Install](https://docs.nomo.gg/setup/install) · [Pair your iPhone](https://docs.nomo.gg/setup/pairing) |
 | **Everyday use** | [Answer from your phone](https://docs.nomo.gg/sessions/approvals) · [Commands, update and uninstall](https://docs.nomo.gg/sessions/commands) |
-| **Each agent** | [Codex](https://docs.nomo.gg/sessions/codex) · [OpenCode](https://docs.nomo.gg/sessions/opencode) · [Cursor](https://docs.nomo.gg/sessions/cursor) · [Antigravity](https://docs.nomo.gg/sessions/antigravity) |
+| **Each agent** | [Codex](https://docs.nomo.gg/sessions/codex) · [OpenCode](https://docs.nomo.gg/sessions/opencode) · [Cursor](https://docs.nomo.gg/sessions/cursor) · [Antigravity](https://docs.nomo.gg/sessions/antigravity) · [Devin](https://docs.nomo.gg/sessions/devin) |
 | **Help** | [Troubleshooting](https://docs.nomo.gg/sessions/troubleshooting) |
 
 ## Architecture
@@ -157,9 +171,9 @@ valid. The page is deleted when pairing completes.
 
 | Destination | When | What |
 |---|---|---|
-| Relay Worker (`https://api.nomo.gg`, or `NOMO_WORKER_URL` at pair time) | every session event; approval holds; pairing; unpair; the activity summary | `/v1/cc/event`, `/v1/cc/decision*`, `/v1/cc/full`, `/v1/cc/pair/*` |
+| Relay Worker (`https://api.nomo.gg`, or `NOMO_WORKER_URL` at pair time) | every session event; approval holds; pairing; unpair; the activity summary; presence about once a minute while an agent session is open, plus one when it changes (at most every ~27 s) | `/v1/cc/event`, `/v1/cc/decision*`, `/v1/cc/full`, `/v1/cc/pair/*`, `/v1/cc/presence` |
 | Your iPhone, on the same network (only if LAN is turned on in the app) | commands and answers | `POST /v1/lan`, sealed under `K_lan` |
-| `github.com/KarrixLee/nomo` via `git` | `bunx nomo-ai` (OpenCode, Cursor, Antigravity legs) and `/nomo-update` | clone / fetch / pull of this repo |
+| `github.com/KarrixLee/nomo` via `git` | `bunx nomo-ai` (OpenCode, Cursor, Antigravity, Devin legs) and `/nomo-update` | clone / fetch / pull of this repo |
 | The npm registry, via your package manager | `bunx nomo-ai`, for the short `nomo` command (skip with `--no-global`) | `bun add -g nomo-ai` or `npm install -g nomo-ai` |
 
 Nothing else: no analytics, no crash reporting, no reads of agent credentials.
@@ -190,6 +204,28 @@ was sent. The relay cannot read them and deletes them after
 computer twice — a UUID made once and kept in `~/.config/cc-status/machine-id` (owner-only), **never**
 derived from serial, MAC, hostname or user name; delete the file for a new one.
 
+**Presence — two fields, every pairing.** About once a minute while the watchdog runs (an agent session
+is open), and as soon as the answer changes (never more than once per ~27 s), the plugin POSTs `/v1/cc/presence` with exactly `{ "coding": [agent ids], "waiting": true|false }`:
+which agents (`claude`, `codex`, …) have a turn open, and whether any session is waiting for an
+approval. No session id, title, folder, command or text. It is not sealed (the relay keeps it about 3
+minutes so the phone can show "Claude is coding"), and the reply tells the plugin whether the pairing is
+Pro.
+
+**Free pairing (not Pro) — only presence and the activity summary leave the computer.** When the relay
+says a pairing is not Pro (the presence reply, or a 403 `{"error":"entitlement suspended"}` on any
+session route — or, from a relay that says so, the claim itself at pairing time), the plugin writes
+`~/.config/cc-status/free-mode` (removed on unpair, re-pair and a revoke teardown) and, while it is fresh (15 minutes,
+refreshed by each presence reply), sends **no** session events, opens **no** approval holds (every prompt
+goes straight to the agent's own dialog), uploads **no** plan or permission text, and keys the LAN
+listener off. Sessions are still tracked on disk so presence stays accurate. After a quiet spell (15
+minutes with no presence reply) the marker has expired, so the first prompt's sealed requests go out (one
+event; on a permission prompt also the full text and the approval request), the relay refuses them and
+stores nothing, and free mode resumes. The LAN listener does not come back when the marker expires: it
+stays keyed off until the relay says the pairing is Pro (a presence reply, or an accepted session
+request), which deletes the marker. A 403 is never treated as an unpair (only a 404/410 is), and neither
+is a `409` (a pairing the relay has not seen claimed yet): a session event is retried later, and a
+prompt's approval request falls open to the agent's own prompt, as on any other relay error.
+
 **On the iPhone,** the Live Agents widget (Nomo Pro) reads a snapshot of decrypted titles, states and
 computer names from the app's own App Group container. It never leaves the device.
 
@@ -199,16 +235,19 @@ computer names from the app's own App Group container. It never leaves the devic
 |---|---|---|
 | `~/.config/cc-status/config.json` (`0600`) | pairing id, computer secret, 32-byte key; deleted by unpair (after a server revoke) | pair |
 | `~/.config/cc-status/sessions/*.json` (`0600`) | one record per live session (agent pid, last sealed blob) | hooks, watchdog |
+| `~/.config/cc-status/sessions/<id>.devin-allow` (owner-only) | Devin "Always allow (this session)" grants; deleted by unpair, reset and pairing again | Devin approval hook |
 | `~/.config/cc-status/sessions/<conv>.<id>.agy-inbox` (owner-only) | queued Antigravity phone replies, deleted after a day | watchdog |
 | `~/.config/cc-status/hook-shim.sh` (`0700`) | version-stable hook launcher | `run.sh`, pair |
 | `~/.config/cc-status/activity-days.json`, `machine-id` | activity summary, per-computer id | watchdog |
+| `~/.config/cc-status/free-mode` | time the relay last said this pairing is not Pro (counts for 15 minutes for sending; keeps the LAN listener off until the relay says Pro) | hooks, watchdog |
 | `~/.config/cc-status/short-command` | `1` or `0`: whether the short `nomo` command is installed, so status and reset name `nomo …` or `bunx nomo-ai …` | `bunx nomo-ai` |
 | `~/.config/cc-status/*-trace.log` (`0600`) | local diagnostics; never uploaded | hooks, watchdog |
-| `~/.codex/config.toml` | Codex `notify` backstop (your existing `notify` is chained, mode kept, one-time `config.toml.bak-nomo`); refuses an unparseable `notify` line | Codex pair |
+| `~/.codex/config.toml` | Codex `notify` backstop (your existing `notify` is chained, mode kept, one-time `config.toml.bak-nomo`); refuses an unparseable `notify` line | Codex pair; `nomo pair` (and the installer's pair question) when Codex has Nomo |
 | `~/.config/opencode/plugins/nomo.js`, `commands/nomo-*.md` | OpenCode stub + commands | `opencode-install.sh` |
 | `~/.cursor/hooks.json` (merged), `~/.cursor/skills/nomo-*/` | Cursor hooks + skills (`$CURSOR_CONFIG_DIR` if set) | `cursor-install.mjs` |
 | `~/.gemini/config/hooks.json` (`"nomo"` block), `~/.gemini/config/plugins/nomo/` | Antigravity hooks + plugin | `antigravity-install.mjs` |
-| `~/.nomo/` | git checkout of this repo (OpenCode, Cursor, Antigravity installer) | `bunx nomo-ai` |
+| `~/.config/devin/config.json` (`"hooks"` key, merged), `~/.config/devin/skills/nomo-*/` | Devin hooks + skills | `devin-install.mjs` |
+| `~/.nomo/` | git checkout of this repo (OpenCode, Cursor, Antigravity, Devin installer) | `bunx nomo-ai` |
 
 Claude Code and Codex install through their own marketplaces; Nomo writes nothing into `~/.claude` or
 `~/.codex` except the Codex `notify` line above. `NOMO_CC_DIR` (testing only) moves the state folder;
@@ -230,8 +269,26 @@ real installs never set it, and anything that can set your agent's environment c
   at the terminal, or the agent's hook timeout).
 - **Approvals switch.** One machine-wide flag pauses remote approvals for every agent; prompts then go
   straight to the computer.
+- **Free pairings never hold.** While the pairing is not Pro (see
+  [What leaves your computer](#what-leaves-your-computer)) every prompt goes straight to the agent's own
+  dialog, exactly like the paused switch, and nothing is posted.
 - **Shell cards keep the command.** The model-written one-line description is a caption: shortened
   first, and dropped before the command when space runs out.
+- **The "Always allow" label is display-only.** At hold time the plugin seals what an Always-allow tap
+  would grant into the card as `permissionGrant`: structured data, never prose, so the phone builds the
+  label in its own language. Format: `""`, or one or more entries joined by `\n`, each `kind` or
+  `kind:literal` (the literal is everything after the first `:`, has no control characters, is capped at
+  80 characters, and the phone shows it verbatim in monospace, never as Markdown). Kinds: `cmd:<prefix>`
+  (commands starting with it, or a Claude Code rule with a `*` wildcard shown as written), `exact` (this
+  exact command), `domain:<host>`, `edit:<glob>`,
+  `dir:<path>` (one folder), `dirs:<N>` (N folders), `edits`, `reads`, `fetches`, `searches`, `commands`
+  (every one of that kind), `planmode`, `automode`, `plans` (plan approvals), `tool:<tool id>` (the whole
+  tool) and `similar` (a rule the plugin can't name; also how the phone shows a kind it doesn't know).
+  Any unnamed part, or a value over 240 characters, collapses to `similar`, never a shorter list. It is
+  built from the same input as the answer: Claude Code's own suggestions (after the filter below),
+  OpenCode's `always` patterns, or Devin's Nomo-side grant rule. `""` means the tap would only be a
+  one-time allow, and the phone hides the option; absent (Codex, Antigravity, questions, older plugins)
+  means unknown. It only labels the button: the rule itself is still decided and enforced by the agent.
 - **Claude Code Computer Use** app-access dialogs fire no answerable hook, so the phone shows a sealed
   heads-up naming the apps with no Allow/Deny; approve it on the computer.
 
@@ -246,6 +303,8 @@ real installs never set it, and anything that can set your agent's environment c
   `bypassPermissions` / `dontAsk` modes. A phone tap never writes a settings file and the grant ends
   with the session. It never widens the suggestion: the whole-tool rule (e.g. plain `Read`) is used only
   when nothing was suggested; if everything suggested was dropped, the tap is a one-time allow.
+- Inside Devin (which also runs `~/.claude` hooks), Nomo's Claude Code hooks stand down, so a Devin
+  session is never a Claude Code row and never answered by them.
 
 ### Codex hooks
 
@@ -337,11 +396,12 @@ real installs never set it, and anything that can set your agent's environment c
   `auto_approve` once, without a new card. Any other difference gets a fresh card; never after a Deny;
   the one-use ticket is a `0600` file in the sessions folder.
 - **Own commands:** so that `/nomo-status` doesn't put a card on your phone, the approval hook answers
-  `auto_approve` — on a paired computer, after the deny rules and a pending Stop — for exactly seven
+  `auto_approve` — on a paired computer, after the deny rules and a pending Stop — for exactly four
   command lines rebuilt in code from the template the installer writes the skills from (never read from
-  the skill files): status (plain and verbose), approvals status, approvals **on**, reset, pair, and the
-  pair wait. Byte-for-byte match (one trailing newline forgiven; a second line, a `cd`, `&& …` or other
-  quoting goes to the phone). Approvals **off**, unpair and the typed pairing code still ask your phone.
+  the skill files): status (plain and verbose), approvals status and approvals **on**. Byte-for-byte
+  match (one trailing newline forgiven; a second line, a `cd`, `&& …` or other quoting goes to the
+  phone). Approvals **off**, pair, the pair wait, reset, unpair and the typed pairing code still ask your
+  phone: on a paired computer, pairing again first revokes the current pairing.
 - **What it reads.** The approval hook: tool name, `CommandLine` or file path, and the model's
   `toolSummary` (sent sealed). Status events: only `conversationId`, the first `workspacePaths` entry,
   `transcriptPath` (its mtime and first line) and `modelName` — never tool arguments. From
@@ -355,6 +415,61 @@ real installs never set it, and anything that can set your agent's environment c
   never blocks a tool. The plugin folder carries a marker file; an unmarked `nomo` folder is someone
   else's and the installer refuses. The `/nomo-*` skills run only Nomo's own local commands and never
   print the pairing link or QR secret. Uninstall deletes only that block and the marked folder.
+
+### Devin hooks
+
+- **The status hook observes only, except to end a turn you interrupted.** It prints nothing — except
+  that after you tap **Interrupt**, its next `PostToolUse` prints
+  `{"continue":false,"stopReason":"Interrupted from Nomo"}` (the watchdog writes the flag only for an
+  interrupt sealed by your paired phone; the next prompt clears it). From each event it reads only
+  `session_id`, `prompt_id`, the event and tool names, the first prompt (for the title) and
+  `DEVIN_PROJECT_DIR`; from Devin's `sessions.db` only that session's `title`, `model` and
+  `working_directory`, read-only (the id must be a plain slug before it enters the query).
+- **The approval hook can only defer, approve what you approved, deny what you denied, or pass on your
+  answer.** On `PermissionRequest` it sends the tool name and command or file path sealed, and prints
+  `{"decision":"approve"}` only for an Allow sealed by your paired phone for that exact request id
+  (`{"decision":"block"}` with your note, or "Denied from phone", for a Deny). On `PreToolUse` it holds
+  only `ask_user_question`: questions and options go sealed to the phone, and your answer comes back as
+  `{"decision":"block","reason":"The user answered from their phone (Nomo): …"}` — Devin has no way to
+  take an answer from a hook, so the model reads the decline reason as your answer and the transcript
+  shows the question as rejected. A Deny is a block saying you chose not to answer. **Fail-open:**
+  unpaired, approvals paused, session not on the phone, offline, expiry, crash or timeout all print
+  nothing, leaving Devin's own prompt. If Devin stops waiting (its timeout, Ctrl-C, session end), the
+  hook notices its parent shell is gone, withdraws the card and exits.
+- **"Always allow (this session)"** is stored only on this computer in
+  `~/.config/cc-status/sessions/<session>.devin-allow` and forgotten when the session ends (or Nomo
+  retires its quiet row), and every one is deleted by unpair, by reset, and when you pair again. While it exists, and only
+  while this computer is paired, a matching request in that session is approved at once, even with
+  approvals paused. A shell grant covers the command's name only for a short list of tools whose
+  arguments cannot run code (`ls`, `cat`, `head`, `tail`, `wc`, `touch`, `mkdir`, `grep`, `echo`,
+  `pwd`, `which`, `file`, `stat`, `du`, `cut`, `tr`, `jq`), typed as the bare name, with no shell
+  operators, no glob (`*`, `?`, `[`) and no Devin Desktop `workdir` (`touch` covers `touch b.txt`, not
+  `touchy` or `./touch`). Such a grant still lets `cat`, `grep` or `jq` read any file you can read.
+  Every other command — shells, interpreters, `git`, `make`, `rg`, build tools, agents, `cp`, `rm`,
+  anything with `&&`, `;`, `|`, `$(…)`, backticks or a redirect — is covered only by a grant for that
+  exact text: `git status` does not
+  cover `git -c core.fsmonitor=… status`, and `touch x && rm -rf ~` still asks. An exact grant re-runs
+  that text as-is, in any folder, and does not pin what it runs (`make test` runs whatever the Makefile
+  says then). A shell grant never matches a request carrying any key besides the command and `workdir`.
+  Nomo's own pair, unpair, reset, disable and uninstall commands, and commands whose text or `workdir`
+  names its state folders (`~/.config/cc-status`, `~/.nomo`), are never approved by a grant; quoting
+  tricks are normalized, but a glob can still slip past that check in an exact grant's text (a glob
+  never gets or uses a name grant). For any other tool it covers that tool for the session.
+- **Own commands:** on a paired computer, before any card, Nomo auto-approves exactly three command
+  lines, rebuilt in code and matched byte for byte against what the skills run (the plugin's `/nomo:*`
+  and the installer's `/nomo-*` forms, with at most Devin Desktop's `workdir` beside them): status,
+  approvals status and approvals **on**. One trailing newline is forgiven; any other difference (`&& …`,
+  `;`, `|`, a redirect, a second line, another script or path, an extra argument) goes to the phone.
+  Approvals **off**, pair, the pair wait, reset, unpair and the typed pairing code still ask your phone:
+  on a paired computer, pairing again first revokes the current pairing.
+- **Writes.** Devin's own config files are never written by the hooks. The installer writes only its
+  entries in the `"hooks"` key and the marked `nomo-*` skills (which run only Nomo's local commands and
+  never print the pairing link or QR secret); a same-named skill of yours is left alone. A
+  `config.json` with comments is first copied to `config.json.nomo-backup`, then written back without
+  them. The plugin registers the same two bundles through its `hooks.json`, adds no rules, MCP servers
+  or agents, and declares `"platforms": ["local"]`; while the installer's entries are present its copies
+  exit without sending anything. Uninstall removes only Nomo's entries and marked skills.
+- Devin Desktop's **Restricted Mode** turns hooks off, and Nomo with them.
 
 ### Runtime and launch
 
@@ -378,9 +493,9 @@ real installs never set it, and anything that can set your agent's environment c
 
 Every integration runs from one shared `plugin/` directory: a **Claude Code plugin**
 (`nomo-cc`), a **native Codex plugin** (`nomo`), an **OpenCode plugin module**, and hooks merged into
-**Cursor** and **Antigravity** config. The hooks, watchdog and commands are single-file `.mjs` bundles
-that run under **bun or node ≥ 18** (`run.sh` picks whichever is installed); OpenCode loads one
-resident `.js` bundle. **Zero npm dependencies.**
+**Cursor**, **Antigravity** and **Devin** config (Devin can also use a native plugin). The hooks,
+watchdog and commands are single-file `.mjs` bundles that run under **bun or node ≥ 18** (`run.sh` picks
+whichever is installed); OpenCode loads one resident `.js` bundle. **Zero npm dependencies.**
 
 - **Pairing.** `pair` writes a themed local page with a QR and one-time code, derives the key as in
   [Architecture](#architecture), and writes `~/.config/cc-status/config.json` (`0600`). Every agent
@@ -482,6 +597,20 @@ process. Codex has no plugin update verb: with a `local` marketplace (`source_ty
   `~/.gemini/antigravity-cli` (`agy`), available after the first turn; before that, the first prompt
   from the transcript, then the workspace folder. The model badge is `modelName`.
 
+### Devin integration
+
+- Two install routes for the Devin CLI and Devin Desktop's Devin Local: the installer (hooks merged into
+  `~/.config/devin/config.json`, read by both) or the native plugin (`.devin-plugin/plugin.json`,
+  `"platforms": ["local"]`, never runs in Devin cloud sessions). If both are present the installer's
+  entries win and the plugin stands down ("both installed — plugin idle" in status).
+- Hooks: status on `UserPromptSubmit`, `PostToolUse`, `Stop`, `SessionEnd` (10 s); approval on
+  `PermissionRequest` and `PreToolUse` matched to `^ask_user_question$` (24 h). Commands are skills —
+  `/nomo:*` from the plugin, `/nomo-*` from the installer.
+- Interrupt (local link) ends the turn after the current step; Devin cannot cut a command or reply off
+  halfway. While the phone holds a prompt, Devin Desktop shows no buttons of its own for it (like
+  Claude Code's terminal). In Desktop's default Code mode Devin asks only for commands, web fetches and
+  writes outside the project.
+
 ### Installer (`nomo-ai`)
 
 - A **bootstrapper, not a package manager**: it drives each host's own install path and never writes
@@ -489,7 +618,7 @@ process. Codex has no plugin update verb: with a `local` marketplace (`source_ty
   versions end up fighting over one watchdog. The npm package ships only `bin/`, not the plugin bundle.
 - With no flags and no terminal it refuses rather than guessing; every failure names the step, exit code
   and the command to run by hand, and the exit status is non-zero if any agent failed.
-- Updates: OpenCode, Cursor and Antigravity legs update `~/.nomo` themselves (the checkout is the
+- Updates: OpenCode, Cursor, Antigravity and Devin legs update `~/.nomo` themselves (the checkout is the
   version). Claude Code and Codex rows only **print** the host command, because install begins with
   `marketplace add`, which would silently repoint a marketplace you aimed elsewhere (a fork, a local
   checkout). A Codex `local` marketplace prints nothing, since there is nothing to run.
@@ -553,8 +682,9 @@ and `build.ts` checks only the JSON):
 - `plugin/.claude-plugin/plugin.json` (`nomo-cc`)
 - `plugin/.codex-plugin/plugin.json` (`nomo`)
 - `package.json` (the `nomo-ai` npm bootstrapper)
+- `.devin-plugin/plugin.json` (the native Devin plugin, `nomo`)
 
-OpenCode has no manifest; its checkout is its version. `bun build.ts` refuses to build when the five
+OpenCode has no manifest; its checkout is its version. `bun build.ts` refuses to build when the six
 disagree. `package.json` carries the version only so `bunx nomo-ai --version` is quotable in a bug
 report. The npm publish is manual — `npm pack --dry-run` first: the tarball is `bin/` plus
 `package.json`, `README.md` and `LICENSE`, nothing else.

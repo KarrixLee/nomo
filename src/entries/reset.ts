@@ -6,13 +6,14 @@
 //      PROVISIONAL (a discovery sentinel), or that is corrupt, gets an op:end POSTed under the
 //      CURRENT pairing (an end carries no blob, so it clears the phone row regardless of which key
 //      sealed the record's stale blob) and its file deleted. Records with LIVE pids are left alone.
-//   3. When paired, scans the agents' history and sends the daily activity summary NOW (heatmap +
+//   3. Deletes every Devin session's "Always allow" grants (<id>.devin-allow).
+//   4. When paired, scans the agents' history and sends the daily activity summary NOW (heatmap +
 //      streak), skipping the watchdog's 6 h upload gate for this one call. It runs after step 1, but a
 //      hook CAN start a new watchdog meanwhile, so two scans may overlap. No lock: every event is
 //      deduped by id, files are written atomically, so the worst case is one extra upload or the other
 //      writer's last save winning. A watchdog started afterwards reads the fresh lastUpload/hash and
 //      does not re-send the same rows.
-//   4. Pairing, keys, and config.json are NOT touched — that is `unpair`'s job.
+//   5. Pairing, keys, and config.json are NOT touched — that is `unpair`'s job.
 //
 // Interactive command (same output contract as unpair): sequential stdout lines, ALWAYS exit 0 —
 // "nothing to reset" is a normal, successful outcome. The watchdog restarts automatically on the
@@ -24,7 +25,7 @@ import { execFileSync } from "node:child_process";
 import { readdir, readFile, unlink } from "node:fs/promises";
 import { basename } from "node:path";
 import { ActivityOutcome, CycleDeps, runActivityCycle } from "../core/activity";
-import { Config, isWatchdogCommand, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
+import { Config, forgetAllDevinGrants, isFreeMode, isWatchdogCommand, loadConfig, localApprovalsState, pidAlive, PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, WATCHDOG_PID_PATH } from "../core/shared";
 import { terminalCommand } from "../core/terminal-command";
 
 export type ResetVerdict = "clear" | "keep";
@@ -105,6 +106,7 @@ async function stopWatchdog(deps: ResetDeps): Promise<"killed" | "stale-pidfile"
 /** POST a blob-less op:end for a cleared session under the CURRENT pairing. Best-effort, 2 s ceiling;
  *  true iff the worker 2xx'd (the phone row will clear). */
 async function postEnd(config: Config, sessionId: string, fetchFn: typeof fetch): Promise<boolean> {
+  if (await isFreeMode()) return true; // a free pairing's relay holds no session rows to clear
   try {
     const res = await fetchFn(`${config.url}/v1/cc/event`, {
       method: "POST",
@@ -161,8 +163,10 @@ export async function reset(deps: ResetDeps = {}): Promise<number> {
     print("No stale sessions to clear.");
   }
   if (kept > 0) print(`Left ${kept} live session${kept === 1 ? "" : "s"} untouched.`);
+  // 3. Devin "Always allow" grants are forgotten too, live session or not (the next prompt just asks).
+  await forgetAllDevinGrants(sessionsDir);
 
-  // 3. Activity summary, sent now. The watchdog was stopped above (step 1).
+  // 4. Activity summary, sent now. The watchdog was stopped above (step 1).
   if (config) {
     let outcome: ActivityOutcome | "error";
     try {

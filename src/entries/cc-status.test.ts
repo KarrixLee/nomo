@@ -5,7 +5,7 @@ import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
-  BLOB_FIT_CHARS, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER, postFullText,
+  BLOB_FIT_CHARS, CC_DIR, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER, postFullText,
   decisionHoldFileName, interruptFlagFileName, readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt, writeInterruptFlagAt,
 } from "../core/shared";
 import {
@@ -1865,6 +1865,90 @@ await child.exited;
     });
   }, 20000);
 
+  // --- 2.5.0 free pairing ----------------------------------------------------------------------
+  test("free mode skips the session event POST but still tracks the session locally", async () => {
+    await withEventServer(async ({ home, ccDir, sessionsDir, bodies }) => {
+      await writeFile(join(ccDir, "free-mode"), String(Date.now()));
+      const sid = "f1f1f1f1-1111-4222-8333-444444444444";
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "hi", cwd: "/x/api-status" });
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "Stop", cwd: "/x/api-status" });
+      expect(bodies).toEqual([]); // no /v1/cc/event (and no full-text upload) left the computer
+      const record = await readLocalRecord(sessionsDir, sid);
+      expect(record).toMatchObject({ op: "done", lastEvent: "done" });
+      expect(record?.donePending).toBeUndefined(); // nothing owed to a relay that refuses it
+      // CONTROL: an expired marker (older than 15 min) is Pro again — fail open.
+      await writeFile(join(ccDir, "free-mode"), String(Date.now() - 16 * 60_000));
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "again", cwd: "/x/api-status" });
+      expect(bodies.map((b) => b.sessionId)).toEqual([sid]);
+    });
+  }, 20000);
+
+  test("a 403 suspended reply marks free mode (and is not a gone strike)", async () => {
+    let posts = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => { posts += 1; return new Response('{"error":"entitlement suspended"}', { status: 403 }); },
+    });
+    const { home, ccDir, sessionsDir } = await setupHookHome(`http://127.0.0.1:${server.port}`);
+    try {
+      const sid = "f2f2f2f2-1111-4222-8333-444444444444";
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "hi", cwd: "/x/api-status" });
+      expect(posts).toBe(1);
+      const marker = Number(await readFile(join(ccDir, "free-mode"), "utf8"));
+      expect(Date.now() - marker).toBeLessThan(60_000);
+      expect(await readdir(ccDir)).not.toContain("gone-strikes");
+      expect(await readdir(ccDir)).toContain("config.json"); // never torn down
+      // The next event is already free: no second POST.
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "PostToolUse", tool_name: "Bash", cwd: "/x/api-status" });
+      expect(posts).toBe(1);
+      expect(await readLocalRecord(sessionsDir, sid)).not.toBeNull();
+    } finally {
+      server.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  // 409 {"error":"pairing not claimed"}: the server refuses a still-pending pairing (a colo can serve the
+  // pending record for ~60 s after the claim). Transient like a network failure: never a gone strike (that
+  // would unpair a brand-new computer), never free mode, and the update is left for the watchdog to retry.
+  test("a 409 pairing-not-claimed reply is transient: no gone strike, no free mode, update left to retry", async () => {
+    let posts = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch: () => { posts += 1; return new Response('{"error":"pairing not claimed"}', { status: 409 }); },
+    });
+    const { home, ccDir, sessionsDir } = await setupHookHome(`http://127.0.0.1:${server.port}`);
+    try {
+      // One strike already on the books: if a 409 counted, this hook would reach GONE_STRIKE_LIMIT and unpair.
+      await writeFile(join(ccDir, "gone-strikes"), "1");
+      const sid = "f3f3f3f3-1111-4222-8333-444444444444";
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "UserPromptSubmit", prompt: "hi", cwd: "/x/api-status" });
+      await spawnHook(claudeEntry, home, { session_id: sid, hook_event_name: "PostToolUse", tool_name: "Bash", cwd: "/x/api-status" });
+      expect(posts).toBe(2); // not free: every event still tries
+      const files = await readdir(ccDir);
+      expect(files).toContain("config.json"); // never torn down
+      expect(files).not.toContain("gone-strikes"); // the streak is broken, not extended
+      expect(files).not.toContain("free-mode");
+      expect(await readLocalRecord(sessionsDir, sid)).toMatchObject({ updatePending: true, op: "update" });
+    } finally {
+      server.stop(true);
+      await rm(home, { recursive: true, force: true });
+    }
+  }, 20000);
+
+  test("runHook claude stands down under Devin (DEVIN_PROJECT_DIR + a Devin payload)", async () => {
+    await withEventServer(async ({ home, ccDir, sessionsDir, bodies }) => {
+      const payload = { session_id: "brawny-shirt", prompt_id: "p1", hook_event_name: "UserPromptSubmit", prompt: "hi" };
+      await spawnHook(claudeEntry, home, payload, { DEVIN_PROJECT_DIR: "/w" });
+      expect(bodies).toEqual([]);
+      expect(await readdir(sessionsDir)).toEqual([]);
+      expect(await exists(join(ccDir, "last-hook-claude"))).toBe(false);
+      // CONTROL: a real claude launched from a Devin exec inherits the env but sends transcript_path.
+      await spawnHook(claudeEntry, home, { ...payload, session_id: "real-claude", transcript_path: join(home, "t.jsonl") }, { DEVIN_PROJECT_DIR: "/w" });
+      expect(bodies.map((b) => b.sessionId)).toEqual(["real-claude"]);
+    });
+  }, 20000);
+
   const workingRecord = (over: Record<string, unknown> = {}) => JSON.stringify({
     pid: process.pid, machine: "m", label: "api-status", ts: Date.now(), lastEvent: "working",
     sentDone: false, op: "update", prio: 0, title: "Kept title", ...over,
@@ -2300,7 +2384,7 @@ await child.exited;
   }, 20000);
 
   test("SESSION_TRACE_PATH sits next to config and the permission trace", () => {
-    expect(SESSION_TRACE_PATH.endsWith("/.config/cc-status/session-trace.log")).toBe(true);
+    expect(SESSION_TRACE_PATH).toBe(`${CC_DIR}/session-trace.log`); // CC_DIR = the preload's temp dir in tests
   });
 });
 
@@ -2636,6 +2720,8 @@ describe("statusCmd — hooks-not-firing warning", () => {
     codexInstalled?: boolean;
     codexSessionAgeMs?: number; claudeSessionAgeMs?: number;
     codexStampAgeMs?: number; claudeStampAgeMs?: number;
+    freeModeAgeMs?: number;
+    lastSendAgeMs?: number;
   }): Promise<string[]> {
     const dir = await mkdtemp(join(tmpdir(), "cc-hooksniff-"));
     try {
@@ -2671,6 +2757,8 @@ describe("statusCmd — hooks-not-firing warning", () => {
       }
       if (opts.codexStampAgeMs !== undefined) await writeFile(lastHookCodexPath, String(NOW - opts.codexStampAgeMs));
       if (opts.claudeStampAgeMs !== undefined) await writeFile(lastHookClaudePath, String(NOW - opts.claudeStampAgeMs));
+      if (opts.freeModeAgeMs !== undefined) await writeFile(join(dir, "free-mode"), String(NOW - opts.freeModeAgeMs));
+      if (opts.lastSendAgeMs !== undefined) await writeFile(join(dir, "last-send"), String(NOW - opts.lastSendAgeMs));
 
       const lines: string[] = [];
       await statusCmd({
@@ -2686,6 +2774,7 @@ describe("statusCmd — hooks-not-firing warning", () => {
         lastHookOpencodePath: join(dir, "last-hook-opencode"),
         opencodeStubPaths: [join(dir, "absent-stub.js")],
         noHoldPath: join(dir, "no-hold"),
+        freeModePath: join(dir, "free-mode"),
         codexAppServerAvailable: async () => false,
         isAlive: () => false,
         now: () => NOW,
@@ -2702,6 +2791,34 @@ describe("statusCmd — hooks-not-firing warning", () => {
     const name = agent === "Codex" ? "Codex" : "Claude Code";
     return lines.some((l) => l.includes(`! ${name} was active`) && l.includes("Nomo never heard about it"));
   };
+
+  test("plan: a fresh free-mode marker prints Nomo Free and what Pro adds", async () => {
+    const lines = await run({ freeModeAgeMs: 2 * MIN, lastSendAgeMs: 60 * MIN });
+    const i = lines.findIndex((l) => l.startsWith("Plan"));
+    expect(lines[i]).toBe(`${"Plan".padEnd(14)}Nomo Free — your streak, coding time and live status sync.`);
+    expect(lines[i + 1]).toBe(`${" ".repeat(14)}Live sessions, the Dynamic Island and approvals come with Nomo Pro.`);
+    expect(lines.some((l) => l.startsWith("Free mode"))).toBe(false);
+  });
+
+  test("plan: no marker + a delivered event (the server's last answer was Pro) prints Nomo Pro", async () => {
+    const plan = (await run({ lastSendAgeMs: 5 * MIN })).filter((l) => l.startsWith("Plan"));
+    expect(plan).toEqual([`${"Plan".padEnd(14)}Nomo Pro`]);
+  });
+
+  test("plan: unknown prints no row — just paired (no signal), or an expired marker (absence is not proof of Pro)", async () => {
+    const plan = (lines: string[]) => lines.find((l) => l.startsWith("Plan"));
+    expect(plan(await run({}))).toBeUndefined();
+    expect(plan(await run({ freeModeAgeMs: 16 * MIN }))).toBeUndefined();
+    expect(plan(await run({ freeModeAgeMs: 16 * MIN, lastSendAgeMs: 5 * MIN }))).toBeUndefined();
+    expect(plan(await run({ paired: false, lastSendAgeMs: 5 * MIN }))).toBeUndefined();
+  });
+
+  test("free mode: the Approvals row says prompts stay in the terminal (holds are skipped)", async () => {
+    const approvals = (lines: string[]) => lines.find((l) => l.startsWith("Approvals"));
+    expect(approvals(await run({ freeModeAgeMs: 2 * MIN })))
+      .toBe(`${"Approvals".padEnd(14)}off — free pairing, prompts stay in this terminal`);
+    expect(approvals(await run({}))).toBe(`${"Approvals".padEnd(14)}on — permission prompts are held and sent to your phone`);
+  });
 
   test("recent codex rollout + NO stamp → codex hooks-not-firing warning with the #16430/#30835 hint", async () => {
     const lines = await run({ codexSessionAgeMs: 3 * MIN });

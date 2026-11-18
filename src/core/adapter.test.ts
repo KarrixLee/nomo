@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
   adapterFor, allAdapters, claudeAdapter, claudeClearPredecessor, claudeDesktopInvocation, cursorHostInvocation, claudeForkResumePredecessor, claudeHeadlessInvocation, claudeLocateTuiPid, claudeSessionModel, claudeSessionTitle,
-  claudeTailPendingApproval, codexAdapter, codexChildSessionGhost, codexDesktopAppPid, codexDesktopOriginator, codexLocateTuiPid, codexTuiCandidates,
+  claudeTailPendingApproval, codexAdapter, devinAdapter, devinHostInvocation, devinSessionMeta, codexChildSessionGhost, codexDesktopAppPid, codexDesktopOriginator, codexLocateTuiPid, codexTuiCandidates,
   opencodeAdapter, opencodeLocateTuiPid,
   codexConfigModel, codexDiscoverLive, codexInternalSessionGhost, codexModelFromRollout,
   CODEX_ROLLOUT_IDLE_SILENCE_MS,
@@ -2216,5 +2216,56 @@ describe("interrupt capability is stated per agent", () => {
   test("opencode and unknown agents have none", () => {
     expect(opencodeAdapter.interrupt).toBeUndefined();
     expect(unknownAgentAdapter("some-future-agent").interrupt).toBeUndefined();
+  });
+});
+
+// NOM-158. Devin runs ~/.claude hooks with its own payloads; DEVIN_PROJECT_DIR is set for every Devin
+// hook but is also inherited by a real `claude` launched from a Devin exec — whose payloads carry
+// transcript_path, which Devin's never do.
+describe("devinHostInvocation", () => {
+  test("Devin env + Devin-shaped payload", () => {
+    expect(devinHostInvocation({ session_id: "brawny-shirt", prompt_id: "p" }, { DEVIN_PROJECT_DIR: "/w" })).toBe(true);
+    expect(devinHostInvocation({}, { DEVIN_PROJECT_DIR: "" })).toBe(true);
+  });
+  test("a real Claude payload under an inherited Devin env is NOT Devin", () => {
+    expect(devinHostInvocation({ session_id: "s", transcript_path: "/x.jsonl" }, { DEVIN_PROJECT_DIR: "/w" })).toBe(false);
+  });
+  test("no env, or a non-object payload → false", () => {
+    expect(devinHostInvocation({ session_id: "s" }, {})).toBe(false);
+    expect(devinHostInvocation(undefined, { DEVIN_PROJECT_DIR: "/w" })).toBe(false);
+    expect(devinHostInvocation(["x"], { DEVIN_PROJECT_DIR: "/w" })).toBe(false);
+  });
+});
+
+describe("devinAdapter", () => {
+  test("adapterFor('devin') is devinAdapter and stamps agent:devin; hook-flag interrupt, no allowMode; not discovered", () => {
+    expect(adapterFor("devin")).toBe(devinAdapter);
+    expect(devinAdapter.blobAgentFields).toEqual({ agent: "devin" });
+    expect(devinAdapter.interrupt).toBe("hook-flag");
+    expect(devinAdapter.interruptFlagSuffix).toBeUndefined(); // the shared `.interrupt`
+    expect(devinAdapter.allowMode).toBeUndefined();
+    expect(devinAdapter.answerExtras).toBe(true);
+    expect(allAdapters).not.toContain(devinAdapter);
+  });
+  test("title is the prompt's display title", async () => {
+    expect(await devinAdapter.title({ sessionId: "s", prefix: "", input: { prompt: "fix the login bug" } })).toBe("fix the login bug");
+    expect(await devinAdapter.title({ sessionId: "s", prefix: "", input: {} })).toBeUndefined();
+  });
+  test("devinSessionMeta reads title/model/cwd and rejects unsafe ids", () => {
+    const dir = require("node:fs").mkdtempSync(join(require("node:os").tmpdir(), "nomo-devin-db-"));
+    const db = join(dir, "sessions.db");
+    require("node:child_process").execFileSync("sqlite3", [db,
+      "create table sessions(id text primary key, working_directory text, model text, title text);" +
+      "insert into sessions values ('special-knight','/w','swe-2-flash-medium','Create hello.txt file');" +
+      "insert into sessions values ('blank-one','','  ',null);"]);
+    try {
+      expect(devinSessionMeta("special-knight", db)).toEqual({ title: "Create hello.txt file", model: "swe-2-flash-medium", cwd: "/w" });
+      expect(devinSessionMeta("blank-one", db)).toEqual({});
+      expect(devinSessionMeta("missing-row", db)).toEqual({});
+      expect(devinSessionMeta("x' or '1'='1", db)).toEqual({});
+      expect(devinSessionMeta("special-knight", "/nope.db")).toEqual({});
+    } finally {
+      require("node:fs").rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -12,6 +12,7 @@
 // scripts rather than reimplementing them. `--dry-run` guarantees nothing is installed or written.
 
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "bun:test";
@@ -43,6 +44,14 @@ async function machine(sourceType: string | undefined): Promise<string> {
     );
   }
   return home;
+}
+
+/** Shell that lays down a fake installed plugin copy at `root`: dist/pair.mjs plus a run.sh that logs
+ *  "<entry> <args>" to `root`/../calls.log — enough for installedEntry("pair") to find and run it. */
+function fakeCopySh(root: string): string {
+  return `mkdir -p '${root}/scripts' '${root}/dist' && : > '${root}/dist/pair.mjs' && ` +
+    `printf '#!/bin/sh\\ne=$(basename "$1" .mjs); shift; echo "$e $*" >> "%s"\\n' '${root}/calls.log' > '${root}/scripts/run.sh' && ` +
+    `chmod +x '${root}/scripts/run.sh'`;
 }
 
 async function plan(home: string): Promise<string> {
@@ -258,6 +267,36 @@ describe("commands: pair / status / reset / uninstall", () => {
     expect(await readFile(log2, "utf8")).toBe("pair \n");
   });
 
+  test("pair with Codex installed also wires Codex's notify backstop; not without Codex, not after a failed pair", async () => {
+    const h = await home();
+    const log = join(h, "calls.log");
+    await plugin(join(h, ".nomo", "plugin"), log);
+    await mkdir(join(h, ".codex", "plugins", "cache", "nomo", "nomo"), { recursive: true });
+    expect((await cli(h, ["pair"])).code).toBe(0);
+    expect(await readFile(log, "utf8")).toBe("pair \npair wait\npair wire-notify\n");
+    const noCodex = await home();
+    await plugin(join(noCodex, ".nomo", "plugin"), join(noCodex, "calls.log"));
+    await cli(noCodex, ["pair"]);
+    expect(await readFile(join(noCodex, "calls.log"), "utf8")).toBe("pair \npair wait\n");
+    const failed = await home();
+    await plugin(join(failed, ".nomo", "plugin"), join(failed, "calls.log"), 1);
+    await mkdir(join(failed, ".codex", "plugins", "cache", "nomo", "nomo"), { recursive: true });
+    await cli(failed, ["pair"]);
+    expect(await readFile(join(failed, "calls.log"), "utf8")).toBe("pair \n");
+  });
+
+  test("a failed wire-notify is one quiet line and the pairing still exits 0", async () => {
+    const h = await home();
+    const log = join(h, "calls.log");
+    await plugin(join(h, ".nomo", "plugin"), log);
+    // run.sh: everything succeeds except wire-notify.
+    await writeFile(join(h, ".nomo", "plugin", "scripts", "run.sh"), `#!/bin/sh\ne=$(basename "$1" .mjs); shift\necho "$e $*" >> '${log}'\n[ "$1" = wire-notify ] && exit 1\nexit 0\n`, { mode: 0o755 });
+    await mkdir(join(h, ".codex", "plugins", "cache", "nomo", "nomo"), { recursive: true });
+    const r = await cli(h, ["pair"]);
+    expect(r.code).toBe(0);
+    expect(r.out.trim()).toBe("Codex's notify backstop was not wired — $nomo-pair in Codex retries it.");
+  });
+
   test("the copy hooks last ran (the shim stamp) wins over ~/.nomo", async () => {
     const h = await home();
     const log = join(h, "calls.log");
@@ -384,15 +423,17 @@ describe("the short `nomo` command", () => {
     const gbin = join(h, "gbin");
     await mkdir(bin, { recursive: true });
     await mkdir(gbin, { recursive: true });
-    await writeFile(join(bin, "claude"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    // Like the real one, `claude plugin install` leaves a copy in the plugin cache — the copy
+    // `nomo pair` runs, so the summary can name that command.
+    await writeFile(join(bin, "claude"), `#!/bin/sh\ncase "$*" in *"plugin install"*) ${fakeCopySh(join(h, ".claude", "plugins", "cache", "nomo", "nomo-cc", "2.5.0"))} ;; esac\nexit 0\n`, { mode: 0o755 });
     const log = join(h, "npm.log");
     const install = npm === "ok" ? `ln -s '${NOMO_AI}' '${gbin}/nomo'; exit 0` : npm === "fail" ? "echo npm ERR! boom >&2; exit 1" : "exit 0";
     await writeFile(join(bin, "npm"), `#!/bin/sh\necho "$*" >> '${log}'\ncase "$1" in\n  prefix) echo '${h}/elsewhere'; exit 0 ;;\n  install) ${install} ;;\nesac\nexit 0\n`, { mode: 0o755 });
     if (opts.foreign) await writeFile(join(bin, "nomo"), "#!/bin/sh\necho not ours\n", { mode: 0o755 });
     return { h, log, path: `${bin}:${gbin}:/usr/bin:/bin` };
   }
-  async function cli(b: { h: string; path: string }, flags: string[]) {
-    const env = isolatedTestEnv(b.h, { NO_COLOR: "1", PATH: b.path, npm_config_user_agent: "", NOMO_CC_DIR: join(b.h, "cc") });
+  async function cli(b: { h: string; path: string }, flags: string[], ua = "") {
+    const env = isolatedTestEnv(b.h, { NO_COLOR: "1", PATH: b.path, npm_config_user_agent: ua, NOMO_CC_DIR: join(b.h, "cc") });
     const proc = spawnTestProcess({
       cmd: [Bun.which("node")!, NOMO_AI, ...flags], cwd: b.h, env, stdin: "ignore", stdout: "pipe", stderr: "pipe",
     });
@@ -420,6 +461,21 @@ describe("the short `nomo` command", () => {
     expect(help).toContain("  nomo pair");
     expect(help).not.toContain("bunx nomo-ai pair");
     expect(help).not.toMatch(/(bunx|npx) nomo (pair|status|reset|unpair|uninstall)/);
+  });
+
+  test("without the short command, hints name the runner this came through: npx (npm) or bunx", async () => {
+    const b = await box("ok");
+    const npm = await cli(b, ["--claude", "--no-global"], "npm/11.6.0 node/v22.23.4 darwin arm64 workspaces/false");
+    expect(npm.out).toContain("run `npx nomo-ai pair` from any folder");
+    expect(npm.out).not.toContain("bunx");
+    const npmHelp = (await cli(b, ["--help"], "npm/11.6.0 node/v22.23.4 darwin arm64 workspaces/false")).out;
+    expect(npmHelp).toContain("  npx nomo-ai pair");
+    expect(npmHelp).not.toContain("bunx nomo-ai");
+    const bun = await cli(b, ["--claude", "--no-global"], "bun/1.4.4 npm/? node/v24.3.0 darwin arm64");
+    expect(bun.out).toContain("run `bunx nomo-ai pair` from any folder");
+    const bunHelp = (await cli(b, ["--help"], "bun/1.4.4 npm/? node/v24.3.0 darwin arm64")).out;
+    expect(bunHelp).toContain("  bunx nomo-ai pair");
+    expect(bunHelp).toContain("  npx nomo-ai              same, without bun");
   });
 
   test("-y installs it too", async () => {
@@ -511,5 +567,258 @@ describe("the short `nomo` command", () => {
     expect(r.code).toBe(0);
     expect(r.out).toContain("The short `nomo` command stays. To remove it too: npm uninstall -g nomo-ai");
     expect(await npmCalls(b.log)).toBe("");
+  });
+});
+
+describe("bunx nomo-ai --devin", () => {
+  async function nomoAi(flags: string[], setup: (home: string, bin: string) => Promise<void> = async () => {}): Promise<{ code: number; out: string }> {
+    const home = await mkdtemp(join(tmpdir(), "nomo-ai-devin-"));
+    homes.push(home);
+    const bin = join(home, "bin");
+    await mkdir(bin, { recursive: true });
+    for (const name of ["claude", "codex"]) await writeFile(join(bin, name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await setup(home, bin);
+    const proc = spawnTestProcess({
+      cmd: [Bun.which("node")!, NOMO_AI, ...flags],
+      cwd: home,
+      env: isolatedTestEnv(home, { NO_COLOR: "1", PATH: `${bin}:/usr/bin:/bin` }),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    return { code: await proc.exited, out: `${out}${err}` };
+  }
+
+  test("--devin is a known flag and appears in --help with its uninstall line", async () => {
+    const help = await nomoAi(["--help"]);
+    expect(help.out).toContain("--devin");
+    expect(help.out).toContain("bunx nomo-ai uninstall --devin");
+    const r = await nomoAi(["--dry-run", "--devin"]);
+    expect(r.out).not.toContain("unknown");
+    expect(r.code).toBe(0);
+  });
+
+  test("--dry-run plan names the clone + devin-install.mjs, and the pair command for Devin-only users", async () => {
+    const r = await nomoAi(["--dry-run", "--devin"]);
+    expect(r.out).toContain("git clone --depth 1 https://github.com/KarrixLee/nomo.git");
+    expect(r.out).toContain(".nomo/plugin/scripts/devin-install.mjs");
+    expect(r.out).not.toContain("claude plugin");
+  });
+
+  test("detect: devin on PATH or ~/.config/devin exists; skipped under --all when undetected", async () => {
+    const none = await nomoAi(["--dry-run", "--all"]);
+    expect(none.out).toContain("Devin was not found on this machine — skipped");
+    expect(none.out).not.toContain("devin-install.mjs");
+    expect(none.code).toBe(0);
+    const onPath = await nomoAi(["--dry-run", "--all"], async (_h, bin) => { await writeFile(join(bin, "devin"), "#!/bin/sh\nexit 0\n", { mode: 0o755 }); });
+    expect(onPath.out).toContain("devin-install.mjs");
+    const dir = await nomoAi(["--dry-run", "--all"], async (home) => { await mkdir(join(home, ".config", "devin"), { recursive: true }); });
+    expect(dir.out).toContain("devin-install.mjs");
+  });
+
+  test("installed() reads the devin-status.mjs marker from ~/.config/devin/config.json", async () => {
+    const r = await nomoAi(["--dry-run", "--devin"], async (home) => {
+      await mkdir(join(home, ".config", "devin"), { recursive: true });
+      await writeFile(join(home, ".config", "devin", "config.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "'/r/scripts/run.sh' '/r/dist/devin-status.mjs'" }] }] } }));
+    });
+    expect(r.out).toContain("already installed");
+    expect(r.out).toContain("config.json");
+  });
+
+  test("the native Devin plugin already installed: reported as installed, nothing cloned, /nomo:pair (not /nomo-pair)", async () => {
+    const pluginInstall = async (home: string) => {
+      const dir = join(home, ".local", "share", "devin", "cli", "plugins");
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "lock.json"), JSON.stringify({ resolved: [{ name: "nomo", source: "KarrixLee/nomo" }] }));
+    };
+    const dry = await nomoAi(["--dry-run", "--devin"], pluginInstall);
+    expect(dry.out).toContain("already installed as a Devin plugin");
+    expect(dry.out).not.toContain("devin-install.mjs");
+    let home = "";
+    const real = await nomoAi(["--devin", "-y", "--no-global"], async (h) => { home = h; await pluginInstall(h); });
+    expect(real.code).toBe(0);
+    expect(real.out).toContain("already installed as a Devin plugin");
+    expect(real.out).toContain("/nomo:pair");
+    expect(real.out).not.toContain("/nomo-pair");
+    expect(existsSync(join(home, ".nomo"))).toBe(false);
+  });
+
+  test("--uninstall needs an agent flag: no picker, nothing run", async () => {
+    const r = await nomoAi(["--uninstall"]);
+    expect(r.code).toBe(2);
+    expect(r.out).toContain("--uninstall needs to know which agent");
+    expect((await nomoAi(["--uninstall", "-y"])).code).toBe(2);
+  });
+
+  test("--uninstall --devin runs ~/.nomo's devin-install.mjs --uninstall; -y is accepted", async () => {
+    let log = "";
+    const r = await nomoAi(["--uninstall", "--devin", "-y"], async (home) => {
+      const scripts = join(home, ".nomo", "plugin", "scripts");
+      await mkdir(scripts, { recursive: true });
+      log = join(home, "argv.log");
+      await writeFile(join(scripts, "devin-install.mjs"), `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(log)}, process.argv.slice(2).join(" "));\n`);
+    });
+    expect(r.code).toBe(0);
+    expect(await readFile(log, "utf8")).toBe("--uninstall");
+    expect(r.out).not.toContain("claude plugin");
+  });
+
+  test("--uninstall with no ~/.nomo checkout fails loudly and names the long form", async () => {
+    const r = await nomoAi(["--uninstall", "--cursor"]);
+    expect(r.code).toBe(1);
+    expect(r.out).toContain("cursor-install.mjs --uninstall");
+  });
+
+  test("--uninstall for a host-owned install prints the host's command and runs nothing", async () => {
+    const r = await nomoAi(["--uninstall", "--claude", "--codex"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("claude plugin uninstall nomo-cc@nomo");
+    expect(r.out).toContain("codex plugin remove nomo@nomo");
+    expect(r.out).not.toContain("$ claude");
+  });
+
+  test("--ref note lists Devin among the pinned agents", async () => {
+    const r = await nomoAi(["--dry-run", "--devin", "--ref", "dev"]);
+    expect(r.out).toContain("(OpenCode, Cursor, Antigravity, Devin) only");
+    expect(r.out).not.toContain("None of them is selected");
+  });
+});
+
+// Driven through a REAL pseudo-terminal (Bun.spawn's `terminal`), because the picker and the pair
+// question only exist when stdin AND stdout are TTYs. The pair entry is the fake copy's run.sh, which
+// only logs — no browser, no network.
+describe("one step: detected agents open ticked, then `Pair your phone now?`", () => {
+  const QUESTION = "Pair your phone now? [Y/n]";
+  async function session(flags: string[], opts: { paired?: boolean; env?: Record<string, string | undefined>; tty?: boolean; codex?: boolean } = {}) {
+    const h = await mkdtemp(join(tmpdir(), "nomo-ai-tty-"));
+    homes.push(h);
+    const bin = join(h, "bin");
+    const copy = join(h, ".claude", "plugins", "cache", "nomo", "nomo-cc", "2.5.0");
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(bin, "claude"), `#!/bin/sh\ncase "$*" in *"plugin install"*) ${fakeCopySh(copy)} ;; esac\nexit 0\n`, { mode: 0o755 });
+    // A fake `codex` whose `plugin add` leaves Codex's cache entry, the way installed() detects it.
+    if (opts.codex) await writeFile(join(bin, "codex"), `#!/bin/sh\ncase "$*" in *"plugin add"*) mkdir -p '${join(h, ".codex", "plugins", "cache", "nomo", "nomo")}' ;; esac\nexit 0\n`, { mode: 0o755 });
+    const cc = join(h, "cc");
+    const pair = async () => {
+      await mkdir(cc, { recursive: true });
+      await writeFile(join(cc, "config.json"), JSON.stringify({ url: "https://x", pairingId: "p", pcSecret: "s", e2eKeyB64: "k" }));
+    };
+    if (opts.paired) await pair();
+    let out = "";
+    const decoder = new TextDecoder();
+    const env = isolatedTestEnv(h, { NO_COLOR: "1", PATH: `${bin}:/usr/bin:/bin`, NOMO_CC_DIR: cc, CI: undefined, ...opts.env });
+    const cmd = [Bun.which("node")!, NOMO_AI, "--no-global", ...flags];
+    const proc = opts.tty === false
+      ? spawnTestProcess({ cmd, cwd: h, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" })
+      : spawnTestProcess({ cmd, cwd: h, env, terminal: { cols: 160, rows: 50, data: (_t, d) => { out += decoder.decode(d); } } });
+    if (opts.tty === false) {
+      void Promise.all([new Response(proc.stdout as ReadableStream).text(), new Response(proc.stderr as ReadableStream).text()]).then(([o, e]) => { out = o + e; });
+    }
+    let exited = false;
+    const code = proc.exited.then(async (c) => { await Bun.sleep(100); exited = true; return c; });
+    const waitFor = async (text: string) => {
+      for (const end = Date.now() + 10_000; !out.includes(text);) {
+        if (exited || Date.now() > end) throw new Error(`never saw ${JSON.stringify(text)} in:\n${out}`);
+        await Bun.sleep(20);
+      }
+    };
+    return {
+      waitFor,
+      type: (s: string) => proc.terminal!.write(s),
+      done: async () => ({ code: await code, out }),
+      calls: async () => (await readFile(join(copy, "calls.log"), "utf8").catch(() => "")),
+      pair,
+    };
+  }
+
+  test("the picker opens with detected agents ticked and undetected ones not; Enter installs them", async () => {
+    const s = await session(["--dry-run"]);
+    await s.waitFor("enter install the ticked agents · space tick/untick");
+    s.type("\r");
+    const r = await s.done();
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("[*] Claude Code  (detected)");
+    expect(r.out).toContain("[ ] OpenAI Codex  (not detected)");
+    expect(r.out).toContain("would run: claude plugin install nomo-cc@nomo -y");
+    expect(r.out).not.toContain("would run: codex");
+    expect(r.out).not.toContain(QUESTION); // --dry-run never asks
+    expect(await s.calls()).toBe("");
+  });
+
+  test("a terminal install asks once; Enter runs exactly `nomo pair` (start, then wait); the list is restarts only", async () => {
+    const s = await session([]);
+    await s.waitFor("enter install");
+    s.type("\r");
+    await s.waitFor(QUESTION);
+    await s.pair(); // what a successful scan leaves behind
+    s.type("\r");
+    const r = await s.done();
+    expect(r.code).toBe(0);
+    expect(await s.calls()).toBe("pair \npair wait\n");
+    expect(r.out).toContain("What's left:\r\n  1. Restart Claude Code so Nomo's hooks load.");
+    expect(r.out).not.toContain("Pair your phone: run");
+    expect(r.out).not.toContain("already paired");
+  });
+
+  test("Codex installed in this run: yes pairs, then wires Codex's notify backstop; declining wires nothing", async () => {
+    const yes = await session([], { codex: true });
+    await yes.waitFor("enter install");
+    yes.type("\r");
+    await yes.waitFor(QUESTION);
+    yes.type("\r");
+    await yes.done();
+    expect(await yes.calls()).toBe("pair \npair wait\npair wire-notify\n");
+    const no = await session([], { codex: true });
+    await no.waitFor("enter install");
+    no.type("\r");
+    await no.waitFor(QUESTION);
+    no.type("n\r");
+    await no.done();
+    expect(await no.calls()).toBe("");
+  });
+
+  test("named agent flags still get the question on a terminal", async () => {
+    const s = await session(["--claude"]);
+    await s.waitFor(QUESTION);
+    s.type("y\r");
+    await s.done();
+    expect(await s.calls()).toBe("pair \npair wait\n");
+  });
+
+  test("declining pairs nothing and leads the list with the later command (pair before the restart)", async () => {
+    const s = await session([]);
+    await s.waitFor("enter install");
+    s.type("\r");
+    await s.waitFor(QUESTION);
+    s.type("n\r");
+    const r = await s.done();
+    expect(r.code).toBe(0);
+    expect(await s.calls()).toBe("");
+    expect(r.out).toContain("1. Pair your phone: run `bunx nomo-ai pair` from any folder, then scan the QR code with the Nomo app.");
+    expect(r.out).toContain("2. Restart Claude Code so Nomo's hooks load.");
+  });
+
+  test("already paired: no question, no pair step, one line saying so", async () => {
+    const s = await session(["--claude"], { paired: true });
+    const r = await s.done();
+    expect(r.out).not.toContain(QUESTION);
+    expect(r.out).toContain("This computer is already paired with your phone.");
+    expect(r.out).not.toContain("Pair your phone:");
+    expect(await s.calls()).toBe("");
+  });
+
+  test("--yes, CI and a non-terminal run never ask and never pair", async () => {
+    for (const [flags, opts] of [
+      [["-y"], {}],
+      [["--claude"], { env: { CI: "true" } }],
+      [["--claude"], { tty: false }],
+    ] as const) {
+      const s = await session([...flags], opts);
+      const r = await s.done();
+      expect(r.code).toBe(0);
+      expect(r.out).not.toContain(QUESTION);
+      expect(r.out).toContain("1. Pair your phone: run `bunx nomo-ai pair`");
+      expect(await s.calls()).toBe("");
+    }
   });
 });

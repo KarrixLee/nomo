@@ -4,7 +4,7 @@ var __require = /* @__PURE__ */ createRequire(import.meta.url);
 // src/core/antigravity-approval.ts
 import { createHash as createHash2 } from "node:crypto";
 import { readFileSync as readFileSync3 } from "node:fs";
-import { mkdir as mkdir2, readdir as readdir6, readFile as readFile7, unlink as unlink6, writeFile as writeFile2 } from "node:fs/promises";
+import { mkdir as mkdir2, readdir as readdir7, readFile as readFile7, unlink as unlink6, writeFile as writeFile2 } from "node:fs/promises";
 import { dirname as dirname2, isAbsolute as isAbsolute5, resolve as resolve4 } from "node:path";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 
@@ -21,7 +21,7 @@ var SKILL_COMMANDS = {
   "pair-code": ["pair.mjs", "--show-code"],
   "pair-wait": ["pair.mjs", "wait --timeout 60"]
 };
-var SAFE_SKILL_COMMANDS = ["status", "status-verbose", "approvals-status", "approvals-on", "reset", "pair", "pair-wait"];
+var SAFE_SKILL_COMMANDS = ["status", "status-verbose", "approvals-status", "approvals-on"];
 function skillCommand(root, key) {
   const entry = SKILL_COMMANDS[key];
   if (!entry)
@@ -33,13 +33,13 @@ function skillCommand(root, key) {
 // src/core/adapter.ts
 import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
 import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
-import { readdir, readFile as readFile2, stat as stat2 } from "node:fs/promises";
+import { readdir as readdir2, readFile as readFile2, stat as stat2 } from "node:fs/promises";
 import { devNull, tmpdir } from "node:os";
 import { promisify as promisify2 } from "node:util";
 import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
 
 // src/core/shared.ts
-import { access, chmod, open, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
 import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -131,7 +131,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.4.2";
+var PLUGIN_VERSION = "2.5.0";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -195,6 +195,49 @@ var SEND_FAIL_PATH = `${CC_DIR}/last-send-fail`;
 var GONE_STRIKES_PATH = `${CC_DIR}/gone-strikes`;
 var GONE_STRIKE_LIMIT = 2;
 var NO_HOLD_PATH = `${CC_DIR}/no-hold`;
+var FREE_MODE_PATH = `${CC_DIR}/free-mode`;
+var FREE_MODE_TTL_MS = 15 * 60000;
+async function isFreeMode(now = Date.now(), path = FREE_MODE_PATH) {
+  return isFreeModeSync(now, path);
+}
+function isFreeModeSync(now = Date.now(), path = FREE_MODE_PATH) {
+  try {
+    const at = Number(readFileSync(path, "utf8").trim());
+    return Number.isFinite(at) && at > 0 && now - at >= 0 && now - at < FREE_MODE_TTL_MS;
+  } catch {
+    return false;
+  }
+}
+function lanBlockedByFreeMode(path = FREE_MODE_PATH) {
+  try {
+    statSync(path);
+    return true;
+  } catch (e) {
+    return e?.code !== "ENOENT";
+  }
+}
+function freeModePathBeside(configPath) {
+  return join(dirname(configPath), "free-mode");
+}
+async function markFreeMode(path = FREE_MODE_PATH, now = Date.now()) {
+  await atomicWrite(path, String(now)).catch(() => {});
+}
+async function clearFreeMode(path = FREE_MODE_PATH) {
+  await unlink(path).catch(() => {});
+}
+function isNotProResponse(status, body) {
+  return status === 403 && body.includes("entitlement suspended");
+}
+async function applyTierFromResponse(res, path = FREE_MODE_PATH) {
+  if (res.ok)
+    return clearFreeMode(path);
+  if (res.status !== 403)
+    return;
+  try {
+    if (isNotProResponse(res.status, await res.text()))
+      await markFreeMode(path);
+  } catch {}
+}
 var BLOB_FIT_CHARS = 3008;
 function sealedBlobChars(plaintextBytes) {
   return Math.ceil((12 + plaintextBytes + 16) / 3) * 4;
@@ -261,6 +304,8 @@ var FULL_TEXT_POST_TIMEOUT_MS = 5000;
 async function postFullText(config, sessionId, what, content, fetchFn = fetch, trace, requestId) {
   if (content === undefined)
     return;
+  if (isFreeModeSync())
+    return;
   try {
     const blob = await encryptBlob(config.e2eKey, {
       sessionId,
@@ -281,6 +326,7 @@ async function postFullText(config, sessionId, what, content, fetchFn = fetch, t
       signal: AbortSignal.timeout(FULL_TEXT_POST_TIMEOUT_MS)
     });
     trace?.({ event: "full-text", what, chars: content.length, status: res.status });
+    await applyTierFromResponse(res);
   } catch (e) {
     trace?.({ event: "full-text", what, chars: content.length, status: 0, error: e?.name ?? "Error" });
   }
@@ -315,6 +361,10 @@ function antigravityConfigDir() {
   return `${process.env.HOME}/.gemini/config`;
 }
 var ANTIGRAVITY_HOOK_MARKER = "antigravity-hook.sh";
+function devinConfigDir() {
+  return `${process.env.HOME}/.config/devin`;
+}
+var DEVIN_HOOK_MARKER = "devin-status.mjs";
 var CODEX_HOOK_MARKER = "codex-status.mjs";
 function codexAppServerSocketPath() {
   return `${codexHome()}/app-server-control/app-server-control.sock`;
@@ -669,7 +719,8 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
   try {
     const blob = await encryptBlob(e2eKey, stash.blob);
     const envelope = { v: 2, sessionId: stash.sessionId, op: stash.op, prio: stash.prio, ts: now, blob };
-    for (let attempt = 0;attempt < attempts; attempt++) {
+    const free = await isFreeMode();
+    for (let attempt = 0;attempt < attempts && !free; attempt++) {
       try {
         const res = await fetchFn(`${url}/v1/cc/event`, {
           method: "POST",
@@ -677,7 +728,10 @@ async function flushPendingStash(stashPath, url, pairingId, pcSecret, e2eKey, no
           body: JSON.stringify(envelope),
           signal: AbortSignal.timeout(fetchTimeoutMs)
         });
+        await applyTierFromResponse(res);
         if (res.ok)
+          break;
+        if (await isFreeMode())
           break;
       } catch {}
       if (attempt < attempts - 1)
@@ -748,6 +802,11 @@ async function completePendingPairing(pending, configPath, opts = {}) {
   } catch {
     return { state: "tampered" };
   }
+  const freeModePath = freeModePathBeside(configPath);
+  if (body.suspended === true)
+    await markFreeMode(freeModePath);
+  else
+    await clearFreeMode(freeModePath);
   try {
     await chmod(configPath, CONFIG_MODE);
   } catch {}
@@ -758,6 +817,7 @@ async function completePendingPairing(pending, configPath, opts = {}) {
     e2eKeyB64: b64url(e2eKey),
     ...pending.machineName ? { machineName: pending.machineName } : {}
   }), CONFIG_MODE);
+  await forgetAllDevinGrants(opts.sessionsDir ?? join(dirname(configPath), "sessions"));
   for (let attempt = 0;attempt < ackAttempts; attempt++) {
     try {
       await fetchFn(`${pending.url}/v1/cc/pair/ack`, {
@@ -986,6 +1046,18 @@ async function interruptFlagSetAt(sessionsDir, sessionId, now, maxAgeMs = INTERR
 async function clearInterruptFlagAt(sessionsDir, sessionId, suffix = INTERRUPT_FLAG_SUFFIX) {
   await unlink(`${sessionsDir}/${interruptFlagFileName(sessionId, suffix)}`).catch(() => {});
 }
+var DEVIN_GRANTS_SUFFIX = ".devin-allow";
+function devinGrantsPath(sessionsDir, sessionId) {
+  return `${sessionsDir}/${sessionId}${DEVIN_GRANTS_SUFFIX}`;
+}
+async function forgetDevinGrants(recordPath) {
+  if (recordPath.endsWith(".json"))
+    await unlink(`${recordPath.slice(0, -5)}${DEVIN_GRANTS_SUFFIX}`).catch(() => {});
+}
+async function forgetAllDevinGrants(sessionsDir = SESSIONS_DIR) {
+  const files = await readdir(sessionsDir).catch(() => []);
+  await Promise.all(files.filter((f) => f.endsWith(DEVIN_GRANTS_SUFFIX)).map((f) => unlink(`${sessionsDir}/${f}`).catch(() => {})));
+}
 async function settleDecisionHoldRecord(sessionId, patch, heldSince) {
   return settleDecisionHoldRecordAt(SESSIONS_DIR, sessionId, patch, heldSince);
 }
@@ -1020,10 +1092,11 @@ async function atomicWrite(path, data, mode) {
   await writeFile(tmp, data, mode !== undefined ? { mode } : undefined);
   await rename(tmp, path);
 }
-async function removeRevokedConfig(configPath = `${CC_DIR}/config.json`, lastSendPath = LAST_SEND_PATH, goneStrikesPath = GONE_STRIKES_PATH) {
+async function removeRevokedConfig(configPath = `${CC_DIR}/config.json`, lastSendPath = LAST_SEND_PATH, goneStrikesPath = GONE_STRIKES_PATH, freeModePath = freeModePathBeside(configPath)) {
   await unlink(configPath).catch(() => {});
   await unlink(lastSendPath).catch(() => {});
   await unlink(goneStrikesPath).catch(() => {});
+  await clearFreeMode(freeModePath);
 }
 async function readGoneStrikes(goneStrikesPath = GONE_STRIKES_PATH) {
   try {
@@ -2111,6 +2184,9 @@ var CLAUDE_DESKTOP_LAUNCHER = "Claude.app/Contents/Helpers/disclaimer";
 function cursorHostInvocation(input, env = process.env) {
   return env.CURSOR_VERSION !== undefined || typeof input === "object" && input !== null && "cursor_version" in input;
 }
+function devinHostInvocation(input, env = process.env) {
+  return env.DEVIN_PROJECT_DIR !== undefined && typeof input === "object" && input !== null && !Array.isArray(input) && !("transcript_path" in input);
+}
 function claudeDesktopInvocation(selfArgs, ancestorArgs, entrypoint) {
   if (entrypoint === CLAUDE_DESKTOP_ENTRYPOINT)
     return true;
@@ -2218,7 +2294,7 @@ var ROLLOUT_SCAN_MAX_HEADS = 40;
 var ROLLOUT_META_HEAD_BYTES = 64 * 1024;
 async function listNumericDirsDesc(path) {
   try {
-    return (await readdir(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+    return (await readdir2(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
   } catch {
     return [];
   }
@@ -2234,7 +2310,7 @@ async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
           const dir = join2(sessions, y, m, d);
           let names;
           try {
-            names = await readdir(dir);
+            names = await readdir2(dir);
           } catch {
             continue;
           }
@@ -2613,7 +2689,7 @@ async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
       for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
         let names;
         try {
-          names = await readdir(join2(sessions, y, m, d));
+          names = await readdir2(join2(sessions, y, m, d));
         } catch {
           names = [];
         }
@@ -3071,6 +3147,46 @@ var antigravityAdapter = {
   interrupt: "hook-flag",
   interruptFlagSuffix: ".agy-interrupt"
 };
+function devinSessionsDb() {
+  return `${process.env.HOME ?? ""}/.local/share/devin/cli/sessions.db`;
+}
+function devinSessionMeta(sessionId, db = devinSessionsDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return {};
+  const cell = sqliteOne(db, `select json_object('t',title,'m',model,'w',working_directory) from sessions where id='${sessionId}'`, env, true);
+  if (!cell)
+    return {};
+  try {
+    const row = JSON.parse(cell);
+    const s = (v) => typeof v === "string" && v.trim().length > 0 ? v.trim() : undefined;
+    const title = s(row.t)?.endsWith("...") ? undefined : s(row.t), model = s(row.m), cwd = s(row.w);
+    return {
+      ...title ? { title: truncateOnWord(title.replace(/\s+/g, " ")) } : {},
+      ...model ? { model: model.slice(0, 80) } : {},
+      ...cwd ? { cwd } : {}
+    };
+  } catch {
+    return {};
+  }
+}
+var devinAdapter = {
+  kind: "devin",
+  title: async ({ input }) => typeof input.prompt === "string" ? displayTitleFromUserText(input.prompt) : undefined,
+  model: async ({ sessionId }) => devinSessionMeta(sessionId).model,
+  detectInterrupt: () => false,
+  sessionsDir: () => `${process.env.HOME ?? ""}/.local/share/devin/cli`,
+  sessionMatch: () => false,
+  hookStampPath: () => lastHookPath("devin"),
+  hooksNotFiringHint: "  run `bunx nomo-ai --devin` again, then restart devin (`/hooks` shows what it loaded)",
+  titleRepair: {
+    due: (record, now) => record.lastEvent === "done" && typeof record.ts === "number" && now - record.ts < CURSOR_TITLE_REPAIR_MS,
+    resolve: (sessionId) => devinSessionMeta(sessionId).title
+  },
+  toolDetail: {},
+  blobAgentFields: { agent: "devin" },
+  interrupt: "hook-flag",
+  answerExtras: true
+};
 function unknownAgentAdapter(kind) {
   return {
     kind,
@@ -3096,6 +3212,8 @@ function adapterFor(agent) {
       return cursorAdapter;
     case "antigravity":
       return antigravityAdapter;
+    case "devin":
+      return devinAdapter;
     case "claude":
       return claudeAdapter;
     default:
@@ -3105,14 +3223,14 @@ function adapterFor(agent) {
 var allAdapters = [claudeAdapter, codexAdapter];
 
 // src/core/antigravity.ts
-import { readdir as readdir5 } from "node:fs/promises";
+import { readdir as readdir6 } from "node:fs/promises";
 import { hostname as hostname3 } from "node:os";
 import { basename as basename5 } from "node:path";
 
 // src/core/antigravity-inbox.ts
 import { spawn as spawn2 } from "node:child_process";
 import { existsSync as existsSync3 } from "node:fs";
-import { readdir as readdir2, readFile as readFile3, rename as rename2, stat as stat3, unlink as unlink2 } from "node:fs/promises";
+import { readdir as readdir3, readFile as readFile3, rename as rename2, stat as stat3, unlink as unlink2 } from "node:fs/promises";
 import { delimiter, isAbsolute as isAbsolute3, join as join3 } from "node:path";
 var ANTIGRAVITY_INBOX_SUFFIX = ".agy-inbox";
 var ANTIGRAVITY_RECEIPT_SUFFIX = ".agy-reply";
@@ -3136,7 +3254,7 @@ var fileFor = (dir, conv, mid, suffix) => join3(dir, `${conv}.${mid}${suffix}`);
 async function midsOf(dir, conv, suffix) {
   let names = [];
   try {
-    names = await readdir2(dir);
+    names = await readdir3(dir);
   } catch {
     return [];
   }
@@ -3232,7 +3350,7 @@ async function cancelReply(dir, conv, mid) {
 async function pruneStaleReplies(dir, now = Date.now()) {
   let names = [];
   try {
-    names = await readdir2(dir);
+    names = await readdir3(dir);
   } catch {
     return;
   }
@@ -3404,10 +3522,10 @@ async function handleReplyCommand(kind, conv, record, payload, deps) {
 // src/core/cursor.ts
 import { hostname as hostname2 } from "node:os";
 import { realpathSync } from "node:fs";
-import { readdir as readdir4, stat as stat5, unlink as unlink4 } from "node:fs/promises";
+import { readdir as readdir5, stat as stat5, unlink as unlink4 } from "node:fs/promises";
 
 // src/core/hook.ts
-import { readdir as readdir3, readFile as readFile5, unlink as unlink3 } from "node:fs/promises";
+import { readdir as readdir4, readFile as readFile5, unlink as unlink3 } from "node:fs/promises";
 import { hostname } from "node:os";
 import { basename as basename3 } from "node:path";
 
@@ -4049,7 +4167,7 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
 }
 async function reconcileProvisional(config, hookPid) {
   try {
-    const files = await readdir3(SESSIONS_DIR).catch(() => []);
+    const files = await readdir4(SESSIONS_DIR).catch(() => []);
     const provisionals = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
@@ -4070,29 +4188,30 @@ async function reconcileProvisional(config, hookPid) {
       traceSession({ event: "provisional-miss", hookPid, provisionals: provisionals.map((p) => `${p.sessionId}@${p.pid}`) });
       return;
     }
-    let delivered = false;
+    let delivered = await isFreeMode();
     const started = Date.now();
     let status;
     let error;
-    try {
-      const res = await fetch(`${config.url}/v1/cc/event`, {
-        method: "POST",
-        headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
-        body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
-        signal: AbortSignal.timeout(2000)
-      });
-      status = res.status;
-      delivered = res.ok;
-    } catch (e) {
-      error = e?.name === "TimeoutError" ? "timeout" : "network";
-    }
+    if (!delivered)
+      try {
+        const res = await fetch(`${config.url}/v1/cc/event`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION, "x-cc-approvals": await localApprovalsState() },
+          body: JSON.stringify({ v: 2, sessionId: sentinel, op: "end", prio: 0, ts: Date.now() }),
+          signal: AbortSignal.timeout(2000)
+        });
+        status = res.status;
+        delivered = res.ok;
+      } catch (e) {
+        error = e?.name === "TimeoutError" ? "timeout" : "network";
+      }
     traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered)
       await unlink3(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {}
 }
 async function readTrackedSessions() {
-  const files = await readdir3(SESSIONS_DIR).catch(() => []);
+  const files = await readdir4(SESSIONS_DIR).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
@@ -4106,21 +4225,22 @@ async function readTrackedSessions() {
 }
 async function retireLineageSession(config, sessionId, agent, input, reason) {
   let delivered = false;
-  try {
-    const res = await fetch(`${config.url}/v1/cc/event`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-cc-pairing": config.pairingId,
-        "x-cc-auth": config.pcSecret,
-        "x-cc-version": PLUGIN_VERSION,
-        "x-cc-approvals": await localApprovalsState()
-      },
-      body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
-      signal: AbortSignal.timeout(2000)
-    });
-    delivered = res.ok;
-  } catch {}
+  if (!await isFreeMode())
+    try {
+      const res = await fetch(`${config.url}/v1/cc/event`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-cc-pairing": config.pairingId,
+          "x-cc-auth": config.pcSecret,
+          "x-cc-version": PLUGIN_VERSION,
+          "x-cc-approvals": await localApprovalsState()
+        },
+        body: JSON.stringify({ v: 2, sessionId, op: "end", prio: 0, ts: Date.now() }),
+        signal: AbortSignal.timeout(2000)
+      });
+      delivered = res.ok;
+    } catch {}
   await unlink3(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
   traceSession({
     event: "retire",
@@ -4144,6 +4264,8 @@ async function runHook(agent) {
     const [config, raw] = await Promise.all([loadConfig(), readStdin()]);
     const input = JSON.parse(raw);
     if (agent === "claude" && cursorHostInvocation(input))
+      return;
+    if (agent === "claude" && devinHostInvocation(input))
       return;
     if (typeof input.session_id !== "string" || input.session_id.length === 0)
       return;
@@ -4416,6 +4538,11 @@ async function runHook(agent) {
     ensureWatchdog();
     if (agent === "codex")
       await reconcileProvisional(config, hookPid);
+    if (await isFreeMode()) {
+      if (plan.op === "done")
+        await markDoneDelivered(sessionId);
+      return;
+    }
     const failure = { sessionId, agent, hook_event_name: hookName, op: plan.op };
     const postStarted = Date.now();
     let res;
@@ -4444,6 +4571,7 @@ async function runHook(agent) {
     }
     if (!res.ok)
       await traceSendFailure({ ...failure, status: res.status, ms: Date.now() - postStarted });
+    await applyTierFromResponse(res);
     if (res.ok) {
       await atomicWrite(LAST_SEND_PATH, String(Date.now()));
       await resetGoneStrikes();
@@ -4458,6 +4586,8 @@ async function runHook(agent) {
       }
     } else {
       await resetGoneStrikes();
+      if (res.status === 409 && plan.op !== "done" && plan.op !== "end")
+        await markUpdatePendingAt(SESSIONS_DIR, sessionId, envelope.blob);
     }
   } catch {} finally {
     await fullUpload;
@@ -4466,6 +4596,8 @@ async function runHook(agent) {
 
 // src/opencode/state.ts
 async function postOcEvent(config, envelope) {
+  if (await isFreeMode())
+    return true;
   try {
     const res = await fetch(`${config.url}/v1/cc/event`, {
       method: "POST",
@@ -4479,6 +4611,7 @@ async function postOcEvent(config, envelope) {
       body: JSON.stringify(envelope),
       signal: AbortSignal.timeout(2000)
     });
+    await applyTierFromResponse(res);
     if (!res.ok)
       return false;
     await atomicWrite(LAST_SEND_PATH, String(Date.now())).catch(() => {});
@@ -4610,7 +4743,7 @@ var IGNORED_TTL_MS = 86400000;
 async function markIgnored(dir, ids, now) {
   for (const id of ids)
     await atomicWrite(`${dir}/${id}`, "", 384);
-  for (const name of await readdir4(dir).catch(() => [])) {
+  for (const name of await readdir5(dir).catch(() => [])) {
     const path = `${dir}/${name}`;
     const s = await stat5(path).catch(() => null);
     if (s && now - s.mtimeMs > IGNORED_TTL_MS)
@@ -4787,7 +4920,7 @@ var clearStop = (sessionsDir, sessionId) => clearInterruptFlagAt(sessionsDir, se
 async function pruneStaleAntigravityStops(sessionsDir, now) {
   let names = [];
   try {
-    names = await readdir5(sessionsDir);
+    names = await readdir6(sessionsDir);
   } catch {
     return;
   }
@@ -4946,7 +5079,7 @@ async function runAntigravityHook(raw, eventName, deps = {}) {
 // src/core/permission.ts
 import { readFile as readFile6, realpath, unlink as unlink5 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, closeSync, constants as fsConstants, fstatSync, openSync, readFileSync as readFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
-import { hostname as hostname4 } from "node:os";
+import { homedir, hostname as hostname4 } from "node:os";
 import { basename as basename6, isAbsolute as isAbsolute4, relative, resolve as resolve3 } from "node:path";
 
 // src/core/decision-poll.ts
@@ -5071,7 +5204,8 @@ var HOLD_BLOCKS_DIALOG = {
   codex: true,
   opencode: false,
   cursor: false,
-  antigravity: true
+  antigravity: true,
+  devin: true
 };
 var LOCAL_ANSWER_TOOLS = new Set(["AskUserQuestion", "ExitPlanMode"]);
 var LOCAL_ANSWER_TAIL_BYTES = 64000;
@@ -5274,6 +5408,63 @@ function sessionScopedSuggestions(suggestions) {
       return typeof s.mode === "string" && s.mode !== "bypassPermissions" && s.mode !== "dontAsk";
     return false;
   }).map((s) => ({ ...s, destination: "session" }));
+}
+var GRANT_LITERAL_MAX = 80;
+var GRANT_MAX = 240;
+function grantEntry(kind, literal) {
+  if (literal === undefined)
+    return kind;
+  const clean = literal.replace(/[\u0000-\u001f\u007f]/g, " ");
+  if (clean.length === 0)
+    return "similar";
+  return `${kind}:${clean.length <= GRANT_LITERAL_MAX ? clean : `${clean.slice(0, GRANT_LITERAL_MAX - 1)}…`}`;
+}
+function joinGrant(entries) {
+  const uniq = [...new Set(entries.filter((e) => e.length > 0))];
+  if (uniq.includes("similar"))
+    return "similar";
+  const out = uniq.join(`
+`);
+  return out.length <= GRANT_MAX ? out : "similar";
+}
+function tildePath(path, home = homedir()) {
+  return home && (path === home || path.startsWith(`${home}/`)) ? `~${path.slice(home.length)}` : path;
+}
+function foldersGrant(dirs, home) {
+  if (dirs.length === 0)
+    return "";
+  return dirs.length === 1 ? grantEntry("dir", tildePath(dirs[0], home)) : grantEntry("dirs", String(dirs.length));
+}
+var SHELL_TOOLS = new Set(["Bash", "shell", "local_shell"]);
+var EDIT_TOOLS = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+function ruleGrant(rule) {
+  const tool = typeof rule.toolName === "string" ? rule.toolName : "";
+  const content = typeof rule.ruleContent === "string" ? rule.ruleContent : "";
+  if (!content)
+    return tool === "ExitPlanMode" ? "plans" : grantEntry("tool", tool);
+  if (SHELL_TOOLS.has(tool)) {
+    if (content.endsWith(":*"))
+      return grantEntry("cmd", content.slice(0, -2));
+    return content.includes("*") ? grantEntry("cmd", content) : "exact";
+  }
+  if (tool === "WebFetch" && content.startsWith("domain:"))
+    return grantEntry("domain", content.slice("domain:".length));
+  if (EDIT_TOOLS.has(tool))
+    return grantEntry("edit", content);
+  return "similar";
+}
+var MODE_GRANT = { acceptEdits: "edits", plan: "planmode", auto: "automode" };
+function claudeGrantText(toolName, suggestions, home) {
+  if (!Array.isArray(suggestions) || suggestions.length === 0) {
+    return toolName === "ExitPlanMode" ? "plans" : grantEntry("tool", toolName);
+  }
+  return joinGrant(sessionScopedSuggestions(suggestions).flatMap((s) => {
+    if (s.type === "addRules")
+      return s.rules.filter((r) => !!r && typeof r === "object").map(ruleGrant);
+    if (s.type === "addDirectories")
+      return [foldersGrant(s.directories.filter((d) => typeof d === "string"), home)];
+    return [MODE_GRANT[s.mode] ?? "similar"];
+  }));
 }
 function allowWithPermissionsLine(agent, toolName, toolInput, updatedPermissions) {
   const decision = toolName === "ExitPlanMode" ? { behavior: "allow", updatedInput: toolInput, updatedPermissions } : { behavior: "allow", updatedPermissions };
@@ -5972,12 +6163,14 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions 
   return { detail: shortest, omitted: all.length - lo, ...tail };
 }
 function permissionFrame(base, detail, omitted, questions = [], tail = {}) {
+  const { permissionGrant, ...rest } = base;
   return {
-    ...base,
+    ...rest,
     ...detail.length > 0 ? { permissionDetail: detail } : {},
     ...omitted > 0 ? { permissionDetailOmitted: omitted } : {},
     ...questions.length > 0 ? { permissionQuestions: questions } : {},
-    ...tail
+    ...tail,
+    ...typeof permissionGrant === "string" ? { permissionGrant } : {}
   };
 }
 function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
@@ -6220,7 +6413,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
   try {
     if (agent === "claude" && cursorHostInvocation(undefined))
       return;
-    if (await flagExists(noHoldPath)) {
+    if (await flagExists(noHoldPath) || await isFreeMode(Date.now(), deps.freeModePath)) {
       await (deps.delegate ?? (() => runHook(agent)))();
       return;
     }
@@ -6241,6 +6434,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       return;
     }
     if (agent === "claude" && cursorHostInvocation(input))
+      return;
+    if (agent === "claude" && devinHostInvocation(input))
       return;
     const sessionId = typeof input.session_id === "string" ? input.session_id : "";
     if (sessionId.length === 0) {
@@ -6284,6 +6479,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       return;
     }
     const suggestions = input.permission_suggestions;
+    const grant = isAnswerTool(toolName, agent) ? undefined : deps.grant !== undefined ? deps.grant : agent === "claude" ? claudeGrantText(toolName, suggestions) : undefined;
     const requestId = (deps.randomUUID ?? (() => crypto.randomUUID()))();
     const summary = buildPermissionSummary(toolName, toolInput);
     const now = (deps.now ?? Date.now)();
@@ -6298,7 +6494,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       status: "decisionPending",
       permissionSummary: summary,
       permissionRequestId: requestId,
-      permissionToolName: toolName
+      permissionToolName: toolName,
+      ...grant !== undefined ? { permissionGrant: grant } : {}
     };
     const diffFiles = buildPermissionDiff(toolName, toolInput);
     const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput, diffFiles);
@@ -6347,6 +6544,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
             if (typeof body.reason === "string")
               reason = body.reason;
           }
+          await applyTierFromResponse(res);
           trace({
             event: "posted",
             requestId,
@@ -6472,7 +6670,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
         attentionStalledAt: undefined,
         blob: await encryptBlob(config.e2eKey, { ...base, status: "working", at: Math.floor(settledAt / 1000) })
       } : attentionStalled ? await stalledPatch(settledAt) : { ts: settledAt, blob: fallbackBlob, attentionStalledAt: undefined };
-      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch, settleAsWorking && agent === "antigravity" ? holdAt : undefined);
+      await (deps.settleHoldRecordFn ?? defaultSettleHoldRecord())(sessionId, patch, settleAsWorking && (agent === "antigravity" || agent === "devin") ? holdAt : undefined);
     };
     const jitter = deps.jitter ?? (() => Math.floor(Math.random() * POLL_JITTER_MAX_MS));
     const interval = deps.pollIntervalMs ?? POLL_INTERVAL_MS;
@@ -6506,6 +6704,12 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     let unknownBlob;
     let unknownReads = 0;
     let seq = 0;
+    const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
+      method: "POST",
+      headers: { ...pcHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ requestId }),
+      signal: AbortSignal.timeout(3000)
+    }).then(() => {}, () => {});
     for (;; ) {
       seq += 1;
       if (deps.deadlineAt !== undefined && clock() >= deps.deadlineAt) {
@@ -6515,15 +6719,10 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       if (await answeredAtTheMac()) {
         settleAsWorking = true;
         trace({ event: "local-answer", seq });
-        trace({ event: "exit", reason: "local-answer" });
+        await withdrawCard();
+        trace({ event: "exit", reason: "local-answer", resolveSent: true });
         return;
       }
-      const withdrawCard = () => fetchFn(`${config.url}/v1/cc/decision/resolve`, {
-        method: "POST",
-        headers: { ...pcHeaders, "content-type": "application/json" },
-        body: JSON.stringify({ requestId }),
-        signal: AbortSignal.timeout(3000)
-      }).then(() => {}, () => {});
       if (deps.abandoned?.()) {
         settleAsWorking = true;
         trace({ event: "exit", reason: "abandoned", seq });
@@ -6823,7 +7022,7 @@ var retryFile = (dir, sessionId, key) => `${dir}/${RETRY_PREFIX}${createHash2("s
 async function rememberAntigravityAllow(dir, sessionId, key, now) {
   try {
     await mkdir2(dir, { recursive: true, mode: 448 });
-    for (const name of await readdir6(dir)) {
+    for (const name of await readdir7(dir)) {
       if (!name.startsWith(RETRY_PREFIX))
         continue;
       const at = Number(await readFile7(`${dir}/${name}`, "utf8").catch(() => "0"));

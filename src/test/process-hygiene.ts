@@ -78,6 +78,11 @@ export function isolatedTestEnv(
     // Dropped, not inherited, for the same reason: a suite run from inside Cursor would otherwise trip
     // the Claude entries' Cursor import guard and silence every spawned hook.
     CURSOR_VERSION: undefined,
+    // …and from inside Devin, whose DEVIN_PROJECT_DIR trips the Devin import guard the same way.
+    DEVIN_PROJECT_DIR: undefined,
+    // Dropped: the test preload points the RUN's CC dir at a temp dir; a spawned hook must derive its
+    // state dir from the temp HOME above (tests that want a specific dir pass it in `overrides`).
+    NOMO_CC_DIR: undefined,
     ...overrides,
   };
 }

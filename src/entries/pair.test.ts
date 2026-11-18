@@ -9,10 +9,10 @@ import {
   buildPairURL, bytesToHex, decryptDeviceName, DEFAULT_WORKER_URL, pairStart, pairWait, wireNotify,
 } from "./pair";
 import { parseNotifyFromToml } from "../core/notify-wire";
-import { completePendingPairing, PAIR_HTML_FILE, parsePendingConfig, PENDING_STASH_FILE, PLUGIN_VERSION } from "../core/shared";
+import { completePendingPairing, isFreeMode, markFreeMode, PAIR_HTML_FILE, parsePendingConfig, PENDING_STASH_FILE, PLUGIN_VERSION } from "../core/shared";
 import { deriveCodeIkm } from "../core/pair-code";
 import { unpair } from "./unpair";
-import { humanAge, statusCmd as realStatusCmd } from "./status-cmd";
+import { humanAge, parseAudience, statusCmd as realStatusCmd } from "./status-cmd";
 
 // ---------- shared test plumbing -----------------------------------------------------------------
 
@@ -724,6 +724,21 @@ describe("pairStart (re-pairing over an existing config)", () => {
     expect(written.e2eKeyB64).toBeUndefined();
   });
 
+  test("drops the OLD pairing's free-mode marker: the new one starts on no cached tier", async () => {
+    const freeModePath = join(dir, "free-mode");
+    await writeFile(configPath, JSON.stringify({
+      url: WORKER, pairingId: "f".repeat(32), pcSecret: "old-secret", e2eKeyB64: b64url(new Uint8Array(32).fill(3)),
+    }));
+    await markFreeMode(freeModePath);
+    const { fn } = scriptedFetch([() => json({ ok: true }, 201), () => json({ ok: true })]);
+    expect(await pairStart({
+      fetchFn: fn, print, configPath, workerUrl: WORKER, spawnWatchdog: () => {},
+      randomBytes: scriptedRandom([PAIRING_BYTES, PC_SECRET_BYTES, QR_SECRET]),
+      htmlPath: join(dir, PAIR_HTML_FILE), openFile: () => true,
+    })).toBe(0);
+    await expect(stat(freeModePath)).rejects.toBeDefined();
+  });
+
   test("revokes the OLD *pending* pairing too (after starting fresh) — an abandoned mid-pairing record still owns a claimable server-side record", async () => {
     // writePending's default pcSecret (EXPECTED_PC_SECRET) is the auth material revoke presents.
     await writePending({ pairingId: "c".repeat(32), qrSecretB64: b64url(new Uint8Array(16).fill(7)) });
@@ -873,6 +888,54 @@ describe("completePendingPairing", () => {
       url: WORKER, pairingId: EXPECTED_PAIRING_ID, pcSecret: EXPECTED_PC_SECRET, e2eKeyB64: b64url(phoneKey),
     });
     expect((await stat(configPath)).mode & 0o777).toBe(0o600);
+  });
+
+  test("the claim's tier sets the free-mode marker: suspended → free; Pro or no flag → cleared (never inherited)", async () => {
+    const freeModePath = join(dir, "free-mode"); // beside config.json, like the live FREE_MODE_PATH
+    const phoneKey = await ratchetK1(QR_SECRET);
+    const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("P")));
+    const claim = (extra: Record<string, unknown>) => scriptedFetch([
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64(), ...extra }),
+      () => json({ ok: true }),
+    ]).fn;
+
+    // A free claim with no marker yet (nothing cached) → free from the first hook.
+    expect((await completePendingPairing(pending(), configPath, { fetchFn: claim({ suspended: true }), ackAttempts: 1 })).state).toBe("completed");
+    expect(await isFreeMode(Date.now(), freeModePath)).toBe(true);
+
+    // A Pro claim over an old free pairing's fresh marker → cleared at once.
+    expect((await completePendingPairing(pending(), configPath, { fetchFn: claim({ suspended: false }), ackAttempts: 1 })).state).toBe("completed");
+    await expect(stat(freeModePath)).rejects.toBeDefined();
+
+    // A server that doesn't send the flag → cleared too (fail open, like an absent marker).
+    await markFreeMode(freeModePath);
+    expect((await completePendingPairing(pending(), configPath, { fetchFn: claim({}), ackAttempts: 1 })).state).toBe("completed");
+    await expect(stat(freeModePath)).rejects.toBeDefined();
+
+    // A claim that doesn't complete leaves the marker alone.
+    await markFreeMode(freeModePath);
+    expect((await completePendingPairing(pending(), configPath, { fetchFn: scriptedFetch([() => json({ state: "pending" })]).fn })).state).toBe("pending");
+    expect(await isFreeMode(Date.now(), freeModePath)).toBe(true);
+  });
+
+  test("a new pairing forgets every Devin Always-allow grant; a failed pairing keeps them", async () => {
+    const sessionsDir = join(dir, "sessions");
+    await mkdir(sessionsDir, { recursive: true });
+    const grant = join(sessionsDir, "old-devin.devin-allow");
+    await writeFile(grant, JSON.stringify(["exec:git"])); // granted under the OLD pairing
+
+    const failed = scriptedFetch([() => json({ error: "not found" }, 404)]);
+    expect((await completePendingPairing(pending(), configPath, { fetchFn: failed.fn })).state).toBe("gone");
+    expect(await readFile(grant, "utf8")).toContain("exec:git"); // failed pair → grants kept
+
+    const phoneKey = await ratchetK1(QR_SECRET);
+    const deviceNameEnc = await seal(phoneKey, new TextEncoder().encode(JSON.stringify("P")));
+    const { fn } = scriptedFetch([
+      () => json({ state: "claimed", phoneNonce: b64url(PHONE_NONCE), deviceNameEnc, phoneEphPub: phoneEphPubB64() }),
+      () => json({ ok: true }),
+    ]);
+    expect((await completePendingPairing(pending(), configPath, { fetchFn: fn, ackAttempts: 1 })).state).toBe("completed");
+    await expect(stat(grant)).rejects.toBeDefined(); // new pairing → grants gone
   });
 
   test("deletes the transient pairing page on completion (covers the watchdog self-heal path)", async () => {
@@ -1129,10 +1192,14 @@ describe("unpair", () => {
       },
     ]);
 
+    const freeModePath = join(dir, "free-mode");
+    await markFreeMode(freeModePath); // a free pairing's tier must not outlive it
+
     expect(await unpair({ fetchFn: fn, print, configPath, lastSendPath })).toBe(0);
     expect(calls.length).toBe(1);
     await expect(stat(configPath)).rejects.toBeDefined();
     await expect(stat(lastSendPath)).rejects.toBeDefined();
+    await expect(stat(freeModePath)).rejects.toBeDefined();
     expect(lines.join("\n")).toContain("Revoked the pairing on the server.");
     expect(lines.at(-1)).toBe("Unpaired ✓");
   });
@@ -1180,6 +1247,8 @@ describe("statusCmd", () => {
     noHoldPath: join(dir, "no-hold"), cursorHooksPath: join(dir, "cursor-hooks.json"),
     cursorProjectsDir: join(dir, "cursor-projects"), lastHookCursorPath: join(dir, "lh-cursor"),
     antigravityHooksPath: join(dir, "agy-hooks.json"), lastHookAntigravityPath: join(dir, "lh-agy"),
+    devinConfigPath: join(dir, "devin-config.json"), lastHookDevinPath: join(dir, "lh-devin"),
+    devinPluginLockPath: join(dir, "devin-lock.json"),
     shortCommandPath: join(dir, "short-command"), // absent unless a test writes it: "not known"
     ...deps,
   });
@@ -1250,6 +1319,55 @@ describe("statusCmd", () => {
     expect(out).toContain("2 tracked");
     // `ignore.tmp` is not a session record and must not be counted.
     expect(out).not.toContain("3 tracked");
+  });
+
+  test("status devin: a Devin block, Hooks installed when config.json names our hook, terminal commands", async () => {
+    await writeFile(configPath, JSON.stringify({
+      url: WORKER, pairingId: "abcdef0123456789".repeat(2), pcSecret: "s", e2eKeyB64: b64url(new Uint8Array(32)),
+    }));
+    const now = 1_800_000_000_000;
+    await writeFile(join(dir, "devin-config.json"), JSON.stringify({ version: 1, hooks: { Stop: [{ hooks: [{ type: "command", command: "'/r/scripts/run.sh' '/r/dist/devin-status.mjs'" }] }] } }));
+    await writeFile(join(dir, "lh-devin"), String(now - 60_000));
+    const { mkdir } = await import("node:fs/promises");
+    await mkdir(join(dir, "sessions"), { recursive: true });
+    await writeFile(join(dir, "sessions", "brawny-shirt.json"), JSON.stringify({ agent: "devin" }));
+    expect(parseAudience(["devin"])).toBe("devin");
+    expect(await statusCmd({
+      print, audience: "devin", configPath, lastSendPath: join(dir, "last-send"), sessionsDir: join(dir, "sessions"),
+      watchdogPidPath: join(dir, "watchdog.pid"), isAlive: () => false, now: () => now,
+    })).toBe(0);
+    const out = lines.join("\n");
+    expect(out).toContain("Devin — you are here");
+    expect(out).toContain("firing");
+    expect(out).toContain("1 tracked");
+    expect(out).toContain("answer its prompts and questions, or interrupt it");
+    expect(out).not.toContain("not set up here");
+  });
+
+  test("status devin: the Install row says plugin / hooks / both — plugin idle; plugin-only names /nomo:pair, hooks /nomo-pair", async () => {
+    const root = join(dir, "checkout", "plugin");
+    await mkdir(join(root, "scripts"), { recursive: true });
+    await writeFile(join(root, "scripts", "run.sh"), "#!/bin/sh\n");
+    const hooks = JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: `'${root}/scripts/run.sh' '${root}/dist/devin-status.mjs'` }] }] } });
+    const lock = JSON.stringify({ resolved: [{ name: "nomo" }] });
+    const run = async (config: string | null, lockText: string | null): Promise<string> => {
+      lines.length = 0;
+      await rm(join(dir, "devin-config.json"), { force: true });
+      await rm(join(dir, "devin-lock.json"), { force: true });
+      if (config !== null) await writeFile(join(dir, "devin-config.json"), config);
+      if (lockText !== null) await writeFile(join(dir, "devin-lock.json"), lockText);
+      await statusCmd({ print, audience: "devin", configPath, lastSendPath: join(dir, "last-send"), sessionsDir: join(dir, "sessions"), watchdogPidPath: join(dir, "watchdog.pid"), isAlive: () => false });
+      return lines.join("\n");
+    };
+    const plugin = await run(null, lock);
+    expect(plugin).toMatch(/Install\s+plugin\n/);
+    expect(plugin).toContain("/nomo:pair"); // unpaired → the fix is the plugin's own skill
+    const viaHooks = await run(hooks, null);
+    expect(viaHooks).toMatch(/Install\s+hooks \(nomo-ai --devin\)/);
+    expect(viaHooks).toContain("→ run /nomo-pair"); // installer → the user-level /nomo-* skills it wrote
+    expect(viaHooks).not.toContain("pair.mjs");
+    expect(await run(hooks, lock)).toMatch(/Install\s+both installed — plugin idle/);
+    expect(await run(null, null)).not.toContain("Install");
   });
 
   test("a PENDING config → reports pairing-in-progress, not a flat 'not paired'", async () => {

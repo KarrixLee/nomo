@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   buildPermissionDiff, codexPromptUserRuleMatches, fitPermissionDiff, parseV4APatch,
   buildPermissionSummary, buildPermissionDetail, buildPermissionQuestions, fitPermissionDetail,
-  sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
+  sealedBlobChars, BLOB_FIT_CHARS, runPermissionHook, claudeGrantText, grantEntry, joinGrant, approvalsCommand, NO_HOLD_PATH, TRACE_PATH,
   codexRolloutSessionId, codexTurnPolicyFromRollout, loadCodexTurnPolicy,
   POST_FIRST_CONTACT_TIMEOUT_MS, OPENCODE_QUESTION_TOOL, localAnswerProbe, answerExtrasAccepted,
   OVERWRITE_DIFF_MAX_BYTES,
@@ -18,7 +18,7 @@ import { encryptBlob, decryptBlob } from "./crypto";
 import { createLanAnswerStore, createLanListener } from "./lan-listener";
 import type { LanAnswerStore, LanListener } from "./lan-listener";
 import type { Config } from "./shared";
-import { folderIdentity, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS, RECORD_FULL_TEXT_TRUNCATION_MARKER } from "./shared";
+import { CC_DIR, folderIdentity, PLUGIN_VERSION, RECORD_FULL_TEXT_MAX_CHARS, RECORD_FULL_TEXT_TRUNCATION_MARKER } from "./shared";
 import { startCodexRemoteInput } from "./codex-remote-input";
 
 // ---- summary builder (pure) ---------------------------------------------------------------
@@ -512,6 +512,7 @@ function scriptFetch(
       return new Response(JSON.stringify({ ok: full === 200 }), { status: full });
     }
     if (url.endsWith("/v1/cc/decision")) return new Response(JSON.stringify({ hold: holdFor() }), { status: 200 });
+    if (url.endsWith("/v1/cc/decision/resolve")) return new Response(JSON.stringify({ ok: true, status: "superseded" }), { status: 200 });
     // GET /v1/cc/decision/<id>
     const next = gets[Math.min(g++, gets.length - 1)];
     if (next === "throw") throw new Error("network");
@@ -531,6 +532,7 @@ const baseDeps = (over: Record<string, unknown>) => ({
   randomUUID: () => "req-fixed",
   jitter: () => 0,
   noHoldPath: "/does/not/exist/no-hold",
+  freeModePath: "/does/not/exist/free-mode",
   codexRequirementsPath: "/does/not/exist/requirements.toml",
   delegate: async () => { throw new Error("delegate must not run"); },
   trace: () => {}, // noop by default — tests must not touch the real trace file or install signal handlers
@@ -538,6 +540,33 @@ const baseDeps = (over: Record<string, unknown>) => ({
 });
 
 describe("runPermissionHook — hold state machine", () => {
+  // 2.5.0 free pairing: a free pairing never holds for the phone. The prompt falls through to the
+  // agent's own terminal dialog at once (no decision line), and the delegate tracks it locally.
+  test("free mode never opens a hold", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "perm-free-"));
+    try {
+      const freeModePath = join(dir, "free-mode");
+      await writeFile(freeModePath, String(Date.now()));
+      const emitted: string[] = [];
+      let delegated = 0;
+      let read = false;
+      // hold:false so a regression fails fast (2 POSTs) instead of polling forever on the no-op sleep.
+      const { fn, calls } = scriptFetch(false, []);
+      await runPermissionHook(baseDeps({
+        freeModePath, fetchFn: fn, emit: (l: string) => emitted.push(l),
+        readInput: async () => { read = true; return INPUT; },
+        delegate: async () => { delegated += 1; },
+      }) as never);
+      expect(calls.filter((c) => c.url.includes("/v1/cc/decision"))).toEqual([]);
+      expect(calls).toEqual([]);
+      expect(emitted).toEqual([]);
+      expect(delegated).toBe(1);
+      expect(read).toBe(false); // stdin is the delegate's (runHook reads it itself)
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   // NOM-67. Cursor imports the Claude plugin and runs THIS hook with a Cursor-shaped payload. It must
   // print no decision (so Cursor falls back to its own prompt) and touch neither disk nor network. The
   // control is the very next test: the same input without the fingerprint POSTs twice.
@@ -548,6 +577,27 @@ describe("runPermissionHook — hold state machine", () => {
     await runPermissionHook(baseDeps({ readInput: async () => input, fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
     expect(calls).toEqual([]);
     expect(emitted).toEqual([]);
+  });
+
+  // NOM-158. Devin runs ~/.claude hooks too (DEVIN_PROJECT_DIR set, no transcript_path): no decision,
+  // no network — Devin's own prompt (or Nomo's Devin hold) answers.
+  test("runPermissionHook claude stands down under Devin", async () => {
+    const emitted: string[] = [];
+    const { fn, calls } = scriptFetch(true, [{ decision: "allow" }]);
+    const { transcript_path: _t, ...devinShaped } = JSON.parse(INPUT) as Record<string, unknown>;
+    const previous = process.env.DEVIN_PROJECT_DIR;
+    process.env.DEVIN_PROJECT_DIR = "/w";
+    try {
+      await runPermissionHook(baseDeps({ readInput: async () => JSON.stringify(devinShaped), fetchFn: fn, emit: (l: string) => emitted.push(l) }) as never);
+      expect(calls).toEqual([]);
+      expect(emitted).toEqual([]);
+      // CONTROL: a real claude under an inherited Devin env (transcript_path present) still holds.
+      const control = scriptFetch(false, []);
+      await runPermissionHook(baseDeps({ readInput: async () => INPUT, fetchFn: control.fn, emit: (l: string) => emitted.push(l) }) as never);
+      expect(control.calls.filter((c) => c.method === "POST").length).toBeGreaterThan(0);
+    } finally {
+      if (previous === undefined) delete process.env.DEVIN_PROJECT_DIR; else process.env.DEVIN_PROJECT_DIR = previous;
+    }
   });
 
   test("CURSOR_VERSION in the environment (even empty) → exits before stdin is read", async () => {
@@ -1080,15 +1130,18 @@ describe("runPermissionHook — hold state machine", () => {
     expect(blob.permissionToolName).toBe("Bash");
     expect(blob.permissionDetail).toBe("rm -rf build"); // full command (single-line here)
     // appended LAST inside the sealed JSON (append-last discipline for the iOS decoder):
-    // permissionSummary, permissionRequestId, permissionToolName, then permissionDetail (Bash → present).
-    expect(Object.keys(blob).slice(-4)).toEqual(
-      ["permissionSummary", "permissionRequestId", "permissionToolName", "permissionDetail"]);
+    // permissionSummary, permissionRequestId, permissionToolName, then permissionDetail (Bash → present),
+    // then permissionGrant (no suggestions → the whole tool).
+    expect(Object.keys(blob).slice(-5)).toEqual(
+      ["permissionSummary", "permissionRequestId", "permissionToolName", "permissionDetail", "permissionGrant"]);
+    expect(blob.permissionGrant).toBe("tool:Bash");
     const fb = (await decryptBlob(KEY, body.fallbackBlob)) as Record<string, unknown>;
     expect(fb.status).toBe("needsAttention");
     expect("permissionSummary" in fb).toBe(false);
     expect("permissionRequestId" in fb).toBe(false);
     expect("permissionToolName" in fb).toBe(false);
     expect("permissionDetail" in fb).toBe(false);
+    expect("permissionGrant" in fb).toBe(false);
   });
 
   // `at` — the sort/age key every OTHER frame has carried since v1.1.6 (epoch SECONDS, not the envelope's
@@ -2174,7 +2227,8 @@ describe("runPermissionHook — decision blob detail fields", () => {
   test("Bash: a long description never crowds out the command", async () => {
     for (const description of ["d".repeat(2000), "\u0001".repeat(2000)]) {
       const { body, blob } = await postedBlob({
-        readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(1950), ts: 1000, model: "claude-opus-5" }),
+        // 1920, not 1950: the base now also carries `permissionGrant` (~33 sealed chars).
+        readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(1920), ts: 1000, model: "claude-opus-5" }),
         readInput: async () => inputWith({ tool_input: { command: "rm -rf build", description } }),
       });
       expect(body.blob.length).toBeLessThanOrEqual(BLOB_FIT_CHARS);
@@ -2203,10 +2257,33 @@ describe("runPermissionHook — decision blob detail fields", () => {
     const { blob } = await postedBlob({
       readInput: async () => inputWith({ tool_name: "ExitPlanMode", tool_input: { plan: "p".repeat(9000) } }),
     });
-    expect(Object.keys(blob).slice(-5)).toEqual([
+    expect(Object.keys(blob).slice(-6)).toEqual([
       "permissionSummary", "permissionRequestId", "permissionToolName",
-      "permissionDetail", "permissionDetailOmitted",
+      "permissionDetail", "permissionDetailOmitted", "permissionGrant",
     ]);
+    expect(blob.permissionGrant).toBe("plans");
+  });
+
+  // permissionGrant — what Always allow really grants, sealed so the phone's label is one source of truth.
+  test("permissionGrant: Claude's suggestions name the real rule; none surviving the filter seals \"\"", async () => {
+    const sugg = [{ type: "addRules", rules: [{ toolName: "Bash", ruleContent: "bun test:*" }], behavior: "allow", destination: "localSettings" }];
+    expect((await postedBlob({ readInput: async () => inputWith({ permission_suggestions: sugg }) })).blob.permissionGrant)
+      .toBe("cmd:bun test");
+    const dropped = [{ type: "setMode", mode: "bypassPermissions", destination: "session" }];
+    const { blob } = await postedBlob({ readInput: async () => inputWith({ permission_suggestions: dropped }) });
+    expect(blob.permissionGrant).toBe(""); // the tap would be a plain one-time allow → the phone hides it
+    expect(Object.keys(blob).at(-1)).toBe("permissionGrant");
+  });
+
+  test("permissionGrant: absent for Codex (no Always allow) and for questions; a caller's grant wins", async () => {
+    expect("permissionGrant" in (await postedBlob({})).blob).toBe(true);
+    const { fn, calls } = scriptFetch(false, []);
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {} }) as never, "codex");
+    const codexBody = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
+    expect("permissionGrant" in (await decryptBlob(KEY, codexBody.blob) as Record<string, unknown>)).toBe(false);
+    const q = await postedBlob({ readInput: async () => inputWith({ tool_name: "AskUserQuestion", tool_input: { questions: [{ question: "Q?", options: [{ label: "A" }] }] } }) });
+    expect("permissionGrant" in q.blob).toBe(false);
+    expect((await postedBlob({ grant: "cmd:touch" })).blob.permissionGrant).toBe("cmd:touch");
   });
 });
 
@@ -3189,12 +3266,14 @@ describe("runPermissionHook — LAN loopback answer poll", () => {
   });
 });
 
+// CC_DIR is the run's temp dir under the test preload; the production default ($HOME/.config/cc-status)
+// is proven by shared.test.ts's isolation test, whose no-preload control reads it.
 test("NO_HOLD_PATH sits under the cc-status config dir", () => {
-  expect(NO_HOLD_PATH.endsWith("/.config/cc-status/no-hold")).toBe(true);
+  expect(NO_HOLD_PATH).toBe(`${CC_DIR}/no-hold`);
 });
 
 test("TRACE_PATH sits under the cc-status config dir", () => {
-  expect(TRACE_PATH.endsWith("/.config/cc-status/permission-trace.log")).toBe(true);
+  expect(TRACE_PATH).toBe(`${CC_DIR}/permission-trace.log`);
 });
 
 // ---- NOM-44 phase 4: the unabridged permission detail teed onto the session record --------------
@@ -3459,7 +3538,44 @@ describe("runPermissionHook — answered at the Mac", () => {
     expect(patches[0]!.lastEvent).toBe("working");
     expect(patches[0]!.prio).toBe(0);
     expect(patches[0]!.attentionKind).toBeUndefined();
+    // …and the worker hears it NOW: the clean exit leaves no dead-pid marker for the watchdog prune,
+    // so without this the record sat `pending` until the silence sweep (30-90 s of stale purple).
+    const resolves = calls.filter((c) => c.url.endsWith("/v1/cc/decision/resolve"));
+    expect(resolves).toHaveLength(1);
+    expect(resolves[0]!.method).toBe("POST");
+    expect(JSON.parse(resolves[0]!.body!)).toEqual({ requestId: "req-fixed" }); // this hold's own id only
+    expect(resolves[0]!.headers?.["x-cc-pairing"]).toBe("p1");
+    expect(resolves[0]!.headers?.["x-cc-auth"]).toBe("s1");
+    expect(resolves[0]!.headers?.["x-cc-version"]).toBeTruthy();
+    expect(traced.find((e) => e.event === "exit")?.resolveSent).toBe(true);
   });
+
+  for (const failure of ["throw", "timeout"] as const) {
+    test(`a ${failure} on the resolve POST still exits local-answer and settles as WORKING`, async () => {
+      const { fn: base } = scriptFetch(true, [{ status: "pending" }]);
+      const fn = (async (url: string, init?: { signal?: AbortSignal }) => {
+        if (!url.endsWith("/v1/cc/decision/resolve")) return (base as Function)(url, init);
+        if (failure === "throw") throw new Error("network");
+        // Hangs until the hook's own 3 s AbortSignal fires — the exit must not wait any longer.
+        return new Promise((_, reject) => init?.signal?.addEventListener("abort", () => reject(init.signal!.reason)));
+      }) as unknown as typeof fetch;
+      const traced: Array<Record<string, unknown>> = [];
+      const patches: Array<Record<string, unknown>> = [];
+      let reads = 0;
+      const started = Date.now();
+      await runPermissionHook(baseDeps({
+        fetchFn: fn, readInput: async () => questionInput,
+        trace: (e: Record<string, unknown>) => traced.push(e),
+        settleHoldRecordFn: async (_id: string, patch: Record<string, unknown>) => { patches.push(patch); },
+        readTailFn: async () => (reads++ === 0 ? TAIL_PENDING : TAIL_ANSWERED),
+      }) as never);
+      expect(traced.find((e) => e.event === "exit")?.reason).toBe("local-answer");
+      expect(traced.some((e) => e.reason === "exception")).toBe(false);
+      expect(patches).toHaveLength(1);
+      expect(patches[0]!.lastEvent).toBe("working");
+      expect(Date.now() - started).toBeLessThan(4_500);
+    }, 10_000);
+  }
 
   test("an UNANSWERED question is untouched — the phone still gets its answer", async () => {
     // A bare allow is a deliberate RELEASE for a question (CC drops it), so the phone's real verb here
@@ -3467,12 +3583,13 @@ describe("runPermissionHook — answered at the Mac", () => {
     const answerBlob = await encryptBlob(KEY, {
       requestId: "req-fixed", decision: "answer", answers: ["Unit tests only"], ts: 5,
     });
-    const { fn } = scriptFetch(true, [{ status: "pending" }, { status: "answered", answerBlob }]);
+    const { fn, calls } = scriptFetch(true, [{ status: "pending" }, { status: "answered", answerBlob }]);
     const emitted: string[] = [];
     await runPermissionHook(baseDeps({
       fetchFn: fn, emit: (l: string) => emitted.push(l), readInput: async () => questionInput,
       readTailFn: async () => TAIL_PENDING,                        // still parked on the user
     }) as never);
+    expect(calls.some((c) => c.url.endsWith("/v1/cc/decision/resolve"))).toBe(false); // phone answered: worker already terminal
     expect(emitted).toHaveLength(1);
     expect(JSON.parse(emitted[0]!).hookSpecificOutput.decision.updatedInput.answers).toEqual({
       "Which testing approach should I use for the new parser?": "Unit tests only",
@@ -3684,6 +3801,55 @@ describe("NOM-63 answerExtrasAccepted + x wire key", () => {
       options: [{ label: "A", description: "d".repeat(600) }] }] });
     const fit = fitPermissionDetail({ title: "t" }, "", 900, qs);
     expect(fit.questions?.[0].x).toBe(true);
+  });
+});
+
+describe("claudeGrantText — mirrors allowAlwaysLine (structured permissionGrant)", () => {
+  const HOME = "/Users/me";
+  const g = (tool: string, s: unknown) => claudeGrantText(tool, s, HOME);
+  test("no suggestions → the whole tool (raw id; the phone makes it readable); ExitPlanMode → plans", () => {
+    expect(g("Write", undefined)).toBe("tool:Write");
+    expect(g("Write", [])).toBe("tool:Write");
+    expect(g("ExitPlanMode", undefined)).toBe("plans");
+    expect(g("mcp__github__create_issue", undefined)).toBe("tool:mcp__github__create_issue");
+  });
+  test("each kept suggestion shape → one kind", () => {
+    const rule = (toolName: string, ruleContent?: string) => [{ type: "addRules", behavior: "allow", destination: "localSettings", rules: [{ toolName, ...(ruleContent ? { ruleContent } : {}) }] }];
+    expect(g("Bash", rule("Bash", "bun test:*"))).toBe("cmd:bun test");
+    expect(g("Bash", rule("Bash", "git status"))).toBe("exact");
+    expect(g("WebFetch", rule("WebFetch", "domain:example.com"))).toBe("domain:example.com");
+    expect(g("Edit", rule("Edit", "src/**"))).toBe("edit:src/**");
+    expect(g("Read", rule("Read", "src/**"))).toBe("similar");
+    expect(g("Read", [{ type: "addDirectories", directories: ["/Users/me/other"], destination: "session" }])).toBe("dir:~/other");
+    expect(g("Read", [{ type: "addDirectories", directories: ["/a", "/b"], destination: "session" }])).toBe("dirs:2");
+    expect(g("Edit", [{ type: "setMode", mode: "acceptEdits", destination: "session" }])).toBe("edits");
+    expect(g("Edit", [{ type: "setMode", mode: "plan" }])).toBe("planmode");
+    expect(g("Edit", [{ type: "setMode", mode: "auto" }])).toBe("automode");
+    expect(g("Edit", [{ type: "setMode", mode: "someNewMode" }])).toBe("similar");
+    expect(g("ExitPlanMode", rule("ExitPlanMode"))).toBe("plans");
+  });
+  test("a Bash rule with a `*` anywhere is never \"exact\": the phone shows the rule itself", () => {
+    const rule = (ruleContent: string) => [{ type: "addRules", behavior: "allow", rules: [{ toolName: "Bash", ruleContent }] }];
+    expect(g("Bash", rule("npm run *"))).toBe("cmd:npm run *");
+    expect(g("Bash", rule("git * --force"))).toBe("cmd:git * --force");
+    expect(g("Bash", rule("npm run *:*"))).toBe("cmd:npm run *");
+    expect(g("Bash", rule("npm run test"))).toBe("exact");
+  });
+  test("several → \n-joined entries, deduped; any unnamed one collapses the whole grant to similar", () => {
+    const rules = [{ type: "addRules", behavior: "allow", rules: [{ toolName: "Bash", ruleContent: "git add:*" }, { toolName: "Bash", ruleContent: "git commit:*" }, { toolName: "Bash", ruleContent: "git add:*" }] }];
+    expect(g("Bash", [...rules, { type: "addDirectories", directories: ["/Users/me/x"] }])).toBe("cmd:git add\ncmd:git commit\ndir:~/x");
+    expect(g("Bash", [...rules, { type: "setMode", mode: "someNewMode" }])).toBe("similar");
+  });
+  test("nothing survives the filter → \"\" (a one-time allow)", () => {
+    expect(g("Bash", [{ type: "setMode", mode: "bypassPermissions" }, { type: "addRules", behavior: "deny", rules: [{ toolName: "Bash" }] }])).toBe("");
+  });
+  test("literals: first \":\" splits, control chars cannot forge an entry, long ones are capped", () => {
+    expect(g("Bash", [{ type: "addRules", behavior: "allow", rules: [{ toolName: "Bash", ruleContent: "echo a:b *x* `y` [z]:*" }] }])).toBe("cmd:echo a:b *x* `y` [z]");
+    expect(grantEntry("cmd", "a\ntool:Bash")).toBe("cmd:a tool:Bash");
+    const out = g("Bash", [{ type: "addRules", behavior: "allow", rules: [{ toolName: "Bash", ruleContent: `${"x".repeat(200)}:*` }] }]);
+    expect(out.length).toBe("cmd:".length + 80);
+    expect(out.endsWith("…")).toBe(true);
+    expect(joinGrant(Array.from({ length: 10 }, (_, i) => grantEntry("cmd", `${i}${"y".repeat(60)}`)))).toBe("similar");
   });
 });
 
