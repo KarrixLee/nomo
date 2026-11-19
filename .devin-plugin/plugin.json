@@ -1,7 +1,7 @@
 {
   "name": "nomo",
   "displayName": "Nomo",
-  "version": "2.5.0",
+  "version": "2.5.1",
   "description": "Mirror Devin sessions to the Nomo iPhone app as an end-to-end-encrypted Live Activity, and answer Devin permission prompts from your phone.",
   "author": { "name": "Nomo" },
   "homepage": "https://nomo.gg",

@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.5.0";
+var PLUGIN_VERSION = "2.5.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3437,6 +3437,13 @@ function devinSessionMeta(sessionId, db = devinSessionsDb(), env = process.env) 
   } catch {
     return {};
   }
+}
+function devinRejectedAt(sessionId, db = devinSessionsDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return;
+  const cell = sqliteOne(db, "select m.created_at from sessions s join message_nodes m on m.session_id=s.id and m.node_id=s.main_chain_id" + ` where s.id='${sessionId}' and json_extract(m.chat_message,'$.role')='tool'` + ` and json_extract(m.chat_message,'$.metadata.extensions."chisel/tool_failure".reason.Rejected.interactive')=1`, env, true);
+  const at = Number(cell);
+  return cell && Number.isFinite(at) ? at : undefined;
 }
 var devinAdapter = {
   kind: "devin",
@@ -11298,6 +11305,26 @@ function shouldInterruptCheck(record, now) {
   }
   return false;
 }
+function devinDbMtimeMs() {
+  const db = devinSessionsDb();
+  let m = 0;
+  for (const p of [db, `${db}-wal`]) {
+    try {
+      m = Math.max(m, statSync4(p).mtimeMs);
+    } catch {}
+  }
+  return m;
+}
+function devinTurnRejected(sessionId, record, now, rejectedAt = devinRejectedAt, dbMtimeMs = devinDbMtimeMs) {
+  if (record.lastEvent !== "needsAttention" && record.lastEvent !== "working")
+    return false;
+  if (typeof record.ts !== "number" || now - record.ts < WORKING_STALE_MS)
+    return false;
+  if (dbMtimeMs() < record.ts)
+    return false;
+  const at = rejectedAt(sessionId);
+  return at !== undefined && at >= Math.floor(record.ts / 1000);
+}
 function doneSettledRecord(record) {
   return { ...record, lastEvent: "done", sentDone: true, op: "done", prio: 0, doneAttempts: undefined };
 }
@@ -11307,17 +11334,22 @@ async function correctInterrupt(config, path, sessionId, record, now, deps = {})
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const clock = deps.now ?? Date.now;
   try {
-    if (!shouldInterruptCheck(record, now))
-      return "uncorrected";
-    let tail;
-    try {
-      tail = await readTail(record.transcript, INTERRUPT_TAIL_BYTES);
-    } catch {
-      return "uncorrected";
-    }
     const agent = recordAgent(record);
-    if (!tailShowsInterrupt(tail, agent))
-      return "uncorrected";
+    if (agent === "devin") {
+      if (!devinTurnRejected(sessionId, record, now, deps.devinRejectedAt, deps.devinDbMtimeMs))
+        return "uncorrected";
+    } else {
+      if (!shouldInterruptCheck(record, now))
+        return "uncorrected";
+      let tail;
+      try {
+        tail = await readTail(record.transcript, INTERRUPT_TAIL_BYTES);
+      } catch {
+        return "uncorrected";
+      }
+      if (!tailShowsInterrupt(tail, agent))
+        return "uncorrected";
+    }
     if (await decisionHoldIsLive(sessionId, now, deps)) {
       traceFocus(deps, { event: "interrupt", sessionId, outcome: "held", delivered: false, held: true });
       return "uncorrected";
@@ -12805,6 +12837,7 @@ export {
   correlateCodexTuiPid,
   createBridgeSupervisor,
   decisionHoldIsLive,
+  devinTurnRejected,
   discoverLiveSessions,
   drainCommands,
   effectiveDoneAttempts,

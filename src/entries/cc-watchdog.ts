@@ -36,7 +36,7 @@ import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import {
   antigravitySurface, handleReplyCommand, nudgedRecently, readReceipts, ReplyCommandDeps, ReplyCommandResult, sweepStrandedReplies,
 } from "../core/antigravity-inbox";
-import { adapterFor, AgentAdapter, allAdapters, antigravityRunStatus, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, DiscoveredSession } from "../core/adapter";
+import { adapterFor, AgentAdapter, allAdapters, antigravityRunStatus, codexAdapter, codexTurnActiveFromTail, CodexPlanPickerEvidence, devinRejectedAt, devinSessionsDb, DiscoveredSession } from "../core/adapter";
 import type { AntigravityRunState, LocateTuiReason } from "../core/adapter";
 import { antigravityStopRequested } from "../core/antigravity";
 import { focusTerminalForPid } from "../core/terminal-focus";
@@ -2139,6 +2139,35 @@ export interface InterruptDeps extends DecisionHoldGateDeps {
    *  net emitted NOTHING for its whole life, which is why attributing the 2026-08-09 P0 to it needed
    *  inference from the record's shape rather than a log line. */
   trace?: (event: object) => void;
+  /** See devinTurnRejected (tests). */
+  devinRejectedAt?: (sessionId: string) => number | undefined;
+  devinDbMtimeMs?: () => number;
+}
+
+/** sessions.db's last write (epoch ms, the db or its WAL, whichever is newer); 0 when unreadable. */
+function devinDbMtimeMs(): number {
+  const db = devinSessionsDb();
+  let m = 0;
+  for (const p of [db, `${db}-wal`]) { try { m = Math.max(m, statSync(p).mtimeMs); } catch { /* absent */ } }
+  return m;
+}
+
+/** Did this Devin turn end on a tool the user rejected at Devin's own prompt (devinRejectedAt)? Devin
+ *  fires NO Stop after that — the deny-without-Stop case the transcript net covers for Claude. Gated like
+ *  shouldInterruptCheck (needsAttention or working, hook-quiet past WORKING_STALE_MS so a new prompt's
+ *  own write lands first) and to a sessions.db written since the row's last event: an idle Devin writes
+ *  nothing, so a long-open prompt costs a stat per sweep, not a query. The rejection must postdate that
+ *  event (Devin stores whole seconds) — an older one belongs to a previous turn. */
+export function devinTurnRejected(
+  sessionId: string, record: SessionRecord, now: number,
+  rejectedAt: (sessionId: string) => number | undefined = devinRejectedAt,
+  dbMtimeMs: () => number = devinDbMtimeMs,
+): boolean {
+  if (record.lastEvent !== "needsAttention" && record.lastEvent !== "working") return false;
+  if (typeof record.ts !== "number" || now - record.ts < WORKING_STALE_MS) return false;
+  if (dbMtimeMs() < record.ts) return false;
+  const at = rejectedAt(sessionId);
+  return at !== undefined && at >= Math.floor(record.ts / 1000);
 }
 
 /** The record the interrupt net pins when its corrective done is settled (delivered, or capped locally).
@@ -2188,18 +2217,23 @@ export async function correctInterrupt(
     ?? ((p: string, rec: SessionRecord) => atomicWrite(p, JSON.stringify(rec), 0o600));
   const clock = deps.now ?? Date.now;
   try {
-    if (!shouldInterruptCheck(record, now)) return "uncorrected";
-    let tail: string;
-    try {
-      tail = await readTail(record.transcript as string, INTERRUPT_TAIL_BYTES);
-    } catch {
-      // Transcript missing / unreadable → nothing to check. For codex this also covers a cold rollout
-      // that was compressed to `.jsonl.zst` (the plain path is deleted): readSuffix's stat() ENOENTs,
-      // we land here, and the session is simply left for its dead-pid reap / staleness eviction.
-      return "uncorrected";
-    }
     const agent: AgentKindWire = recordAgent(record);
-    if (!tailShowsInterrupt(tail, agent)) return "uncorrected"; // live turn or no interrupt → leave it
+    if (agent === "devin") {
+      // Devin keeps no transcript: its sessions.db says whether the turn ended on a rejected tool.
+      if (!devinTurnRejected(sessionId, record, now, deps.devinRejectedAt, deps.devinDbMtimeMs)) return "uncorrected";
+    } else {
+      if (!shouldInterruptCheck(record, now)) return "uncorrected";
+      let tail: string;
+      try {
+        tail = await readTail(record.transcript as string, INTERRUPT_TAIL_BYTES);
+      } catch {
+        // Transcript missing / unreadable → nothing to check. For codex this also covers a cold rollout
+        // that was compressed to `.jsonl.zst` (the plain path is deleted): readSuffix's stat() ENOENTs,
+        // we land here, and the session is simply left for its dead-pid reap / staleness eviction.
+        return "uncorrected";
+      }
+      if (!tailShowsInterrupt(tail, agent)) return "uncorrected"; // live turn or no interrupt → leave it
+    }
     // THE LIVE-HOLD GATE (see decisionHoldIsLive). A remote approval is open on THIS session, so the
     // interrupt marker in the tail describes an earlier abort, not the prompt the user is looking at —
     // and a done now would overwrite the only frame that carries Allow/Deny. Read here rather than at the
