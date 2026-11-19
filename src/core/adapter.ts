@@ -2909,7 +2909,9 @@ export function devinSessionMeta(
  *  still the head of the session's main chain — i.e. the turn ended there. Devin fires NO Stop after it
  *  (field case lumbar-accordion, devin 3000.12.17), so this is the only trace. The tool message carries
  *  `chisel/tool_failure.reason.Rejected.interactive: true`; a hook's block is `interactive: false` and
- *  the model carries on (verified), so it never matches. Any failure is undefined. */
+ *  the model carries on (verified), so it never matches. Only the PLAIN rejection text counts: Devin also
+ *  has "Tool execution was rejected by the user: <feedback>", after which the model may well reply.
+ *  Any failure is undefined. */
 export function devinRejectedAt(
   sessionId: string, db: string = devinSessionsDb(), env: NodeJS.ProcessEnv = process.env,
 ): number | undefined {
@@ -2917,6 +2919,7 @@ export function devinRejectedAt(
   const cell = sqliteOne(db,
     "select m.created_at from sessions s join message_nodes m on m.session_id=s.id and m.node_id=s.main_chain_id" +
     ` where s.id='${sessionId}' and json_extract(m.chat_message,'$.role')='tool'` +
+    " and json_extract(m.chat_message,'$.content')='Tool execution was rejected by the user'" +
     ` and json_extract(m.chat_message,'$.metadata.extensions."chisel/tool_failure".reason.Rejected.interactive')=1`, env, true);
   const at = Number(cell);
   return cell && Number.isFinite(at) ? at : undefined;

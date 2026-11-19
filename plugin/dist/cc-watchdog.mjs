@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.5.1";
+var PLUGIN_VERSION = "2.5.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3441,7 +3441,7 @@ function devinSessionMeta(sessionId, db = devinSessionsDb(), env = process.env) 
 function devinRejectedAt(sessionId, db = devinSessionsDb(), env = process.env) {
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
     return;
-  const cell = sqliteOne(db, "select m.created_at from sessions s join message_nodes m on m.session_id=s.id and m.node_id=s.main_chain_id" + ` where s.id='${sessionId}' and json_extract(m.chat_message,'$.role')='tool'` + ` and json_extract(m.chat_message,'$.metadata.extensions."chisel/tool_failure".reason.Rejected.interactive')=1`, env, true);
+  const cell = sqliteOne(db, "select m.created_at from sessions s join message_nodes m on m.session_id=s.id and m.node_id=s.main_chain_id" + ` where s.id='${sessionId}' and json_extract(m.chat_message,'$.role')='tool'` + " and json_extract(m.chat_message,'$.content')='Tool execution was rejected by the user'" + ` and json_extract(m.chat_message,'$.metadata.extensions."chisel/tool_failure".reason.Rejected.interactive')=1`, env, true);
   const at = Number(cell);
   return cell && Number.isFinite(at) ? at : undefined;
 }
@@ -11315,15 +11315,14 @@ function devinDbMtimeMs() {
   }
   return m;
 }
+var DEVIN_REJECT_SETTLE_S = 3;
 function devinTurnRejected(sessionId, record, now, rejectedAt = devinRejectedAt, dbMtimeMs = devinDbMtimeMs) {
   if (record.lastEvent !== "needsAttention" && record.lastEvent !== "working")
     return false;
-  if (typeof record.ts !== "number" || now - record.ts < WORKING_STALE_MS)
-    return false;
-  if (dbMtimeMs() < record.ts)
+  if (typeof record.ts !== "number" || dbMtimeMs() < record.ts)
     return false;
   const at = rejectedAt(sessionId);
-  return at !== undefined && at >= Math.floor(record.ts / 1000);
+  return at !== undefined && at >= Math.floor(record.ts / 1000) && Math.floor(now / 1000) - at >= DEVIN_REJECT_SETTLE_S;
 }
 function doneSettledRecord(record) {
   return { ...record, lastEvent: "done", sentDone: true, op: "done", prio: 0, doneAttempts: undefined };
@@ -12790,6 +12789,7 @@ export {
   CODEX_TUI_SESSION_START_SKEW_MS,
   COMMAND_FUTURE_SKEW_MS,
   COMMAND_TTL_MS,
+  DEVIN_REJECT_SETTLE_S,
   IDLE_GRACE_MS,
   LAN_ANSWER_ECHO_DELAY_MS,
   LAN_COMMAND_ID_PREFIX,

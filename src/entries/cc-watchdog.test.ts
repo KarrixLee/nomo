@@ -2732,23 +2732,26 @@ describe("correctInterrupt (settle an interrupted session — the done pin stick
   // Field case lumbar-accordion: the hold failed open, the user rejected the tool at Devin's own prompt,
   // and Devin went idle with NO Stop — the row read needsAttention until SessionEnd.
   test("devin: a tool rejected at Devin's prompt after the row's last event → one done; an older rejection → nothing", async () => {
-    const devin = attn({ agent: "devin", transcript: undefined, ts: NOW - 60_000 });
+    // 10 s after the row's last hook: no 20 s quiet window for Devin.
+    const devin = attn({ agent: "devin", transcript: undefined, ts: NOW - 10_000 });
     const run = async (rejectedAtSec: number | undefined) => {
       const posts: object[] = [];
       const v = await correctInterrupt(cfg(), "/tmp/s.json", "devin-reject-test", devin, NOW, {
         post: async (b) => { posts.push(b); return "delivered" as PostOutcome; },
         writeRecord: async () => {},
         devinRejectedAt: () => rejectedAtSec,
-        devinDbMtimeMs: () => NOW - 30_000,
+        devinDbMtimeMs: () => NOW - 5_000,
       });
       return { v, posts };
     };
-    const rejected = await run(Math.floor((NOW - 30_000) / 1000));
+    const rejected = await run(Math.floor((NOW - 5_000) / 1000));
     expect(rejected.v).toBe("corrected");
     expect(rejected.posts).toHaveLength(1);
     expect(rejected.posts[0]).toMatchObject({ op: "done" });
     // A previous turn's rejection (or a hook block, which never matches) leaves the row alone.
     expect((await run(Math.floor((NOW - 120_000) / 1000))).posts).toHaveLength(0);
+    // A rejection under DEVIN_REJECT_SETTLE_S old waits a sweep: a model that carries on replies first.
+    expect((await run(Math.floor((NOW - 1_000) / 1000))).posts).toHaveLength(0);
     expect((await run(undefined)).posts).toHaveLength(0);
   });
 

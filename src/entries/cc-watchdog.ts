@@ -2152,22 +2152,26 @@ function devinDbMtimeMs(): number {
   return m;
 }
 
+/** How long (whole seconds — Devin's created_at) a rejection must stay the chain head before it counts:
+ *  room for a model that did carry on to write its reply (one came 1.1 s after a hook block, verified). */
+export const DEVIN_REJECT_SETTLE_S = 3;
+
 /** Did this Devin turn end on a tool the user rejected at Devin's own prompt (devinRejectedAt)? Devin
- *  fires NO Stop after that — the deny-without-Stop case the transcript net covers for Claude. Gated like
- *  shouldInterruptCheck (needsAttention or working, hook-quiet past WORKING_STALE_MS so a new prompt's
- *  own write lands first) and to a sessions.db written since the row's last event: an idle Devin writes
- *  nothing, so a long-open prompt costs a stat per sweep, not a query. The rejection must postdate that
- *  event (Devin stores whole seconds) — an older one belongs to a previous turn. */
+ *  fires NO Stop after that — the deny-without-Stop case the transcript net covers for Claude. No
+ *  quiet window (WORKING_STALE_MS is a transcript heuristic): the chain head is definitive, so the next
+ *  sweep settles it once the rejection is DEVIN_REJECT_SETTLE_S old. Gated to needsAttention/working and
+ *  to a sessions.db written since the row's last event: an idle Devin writes nothing, so a long-open
+ *  prompt costs a stat per sweep, not a query. The rejection must postdate that event (whole seconds) —
+ *  an older one belongs to a previous turn, and a new prompt's hook always postdates it. */
 export function devinTurnRejected(
   sessionId: string, record: SessionRecord, now: number,
   rejectedAt: (sessionId: string) => number | undefined = devinRejectedAt,
   dbMtimeMs: () => number = devinDbMtimeMs,
 ): boolean {
   if (record.lastEvent !== "needsAttention" && record.lastEvent !== "working") return false;
-  if (typeof record.ts !== "number" || now - record.ts < WORKING_STALE_MS) return false;
-  if (dbMtimeMs() < record.ts) return false;
+  if (typeof record.ts !== "number" || dbMtimeMs() < record.ts) return false;
   const at = rejectedAt(sessionId);
-  return at !== undefined && at >= Math.floor(record.ts / 1000);
+  return at !== undefined && at >= Math.floor(record.ts / 1000) && Math.floor(now / 1000) - at >= DEVIN_REJECT_SETTLE_S;
 }
 
 /** The record the interrupt net pins when its corrective done is settled (delivered, or capped locally).
