@@ -30,11 +30,12 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import * as zlib from "node:zlib";
+import { readAntigravity } from "./activity-antigravity";
 import { readDevin } from "./activity-devin";
 import { encryptBlob } from "./crypto";
 import { atomicWrite, CC_DIR, codexHome, Config, loadConfig, PLUGIN_VERSION } from "./shared";
 
-export type ActivityAgent = "claude" | "codex" | "opencode" | "devin";
+export type ActivityAgent = "claude" | "codex" | "opencode" | "devin" | "antigravity";
 export interface Tokens { i: number; o: number; cw: number; cr: number; r?: number }
 export interface ActivityEvent {
   ts: number; agent: ActivityAgent; sessionId: string; kind: "turn" | "assistant"; id: string;
@@ -355,12 +356,13 @@ export async function openReadOnly(path: string): Promise<RoDb | null> {
 
 // --- per-agent readers -------------------------------------------------------------------------
 
-export interface Roots { claude: string; codex: string; opencode: string; devin?: string }
+export interface Roots { claude: string; codex: string; opencode: string; devin?: string; antigravity?: string /* ~/.gemini */ }
 export const defaultRoots = (): Roots => ({
   claude: `${process.env.HOME}/.claude/projects`,
   codex: codexHome(),
   opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`,
   devin: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/devin/cli/sessions.db`,
+  antigravity: `${process.env.HOME}/.gemini`,
 });
 
 type Sink = (ev: ActivityEvent) => void;
@@ -477,6 +479,7 @@ export async function scanAll(state: State, cursor: Cursor, roots: Roots, now: n
   try { await readCodex(roots.codex, cursor, sink, progress, seen, since("codex"), state); } catch { /* skip agent */ }
   try { await readOpenCode(roots.opencode, sink, since("opencode")); } catch { /* skip agent */ }
   if (roots.devin) try { await readDevin(roots.devin, sink, since("devin")); } catch { /* skip agent */ }
+  if (roots.antigravity) try { await readAntigravity(roots.antigravity, cursor, sink, seen, openReadOnly); } catch { /* skip agent */ }
   for (const p of Object.keys(cursor)) if (!seen.has(p)) delete cursor[p];
 }
 
