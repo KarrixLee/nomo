@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir10, readFile as readFile11, unlink as unlink6 } from "node:fs/promises";
+import { readdir as readdir11, readFile as readFile11, unlink as unlink6 } from "node:fs/promises";
 import { readFileSync as readFileSync3, statSync as statSync4, unlinkSync } from "node:fs";
 import { hostname as hostname6 } from "node:os";
 import { basename as basename8 } from "node:path";
@@ -9463,10 +9463,192 @@ class CodexRemoteInputBridge {
 // src/core/activity.ts
 import { createHash as createHash3, randomUUID } from "node:crypto";
 import { copyFileSync as copyFileSync2, createReadStream, existsSync as existsSync5, mkdtempSync as mkdtempSync2, rmSync as rmSync2 } from "node:fs";
-import { readdir as readdir8, readFile as readFile9, stat as stat6 } from "node:fs/promises";
+import { readdir as readdir9, readFile as readFile9, stat as stat7 } from "node:fs/promises";
 import { tmpdir as tmpdir2 } from "node:os";
 import { dirname as dirname2, join as join4 } from "node:path";
 import * as zlib from "node:zlib";
+
+// src/core/activity-antigravity.ts
+import { readdir as readdir8, stat as stat6 } from "node:fs/promises";
+function varint(b, p) {
+  let v = 0;
+  let m = 1;
+  for (let i = 0;i < 10; i++) {
+    if (p >= b.length)
+      throw new Error("truncated varint");
+    const x = b[p++];
+    v += (x & 127) * m;
+    if (!(x & 128))
+      return [v, p];
+    m *= 128;
+  }
+  throw new Error("varint too long");
+}
+function decode(b) {
+  const out = [];
+  let p = 0;
+  while (p < b.length) {
+    let tag;
+    [tag, p] = varint(b, p);
+    const n = Math.floor(tag / 8);
+    const w = tag % 8;
+    if (n === 0)
+      throw new Error("field 0");
+    if (w === 0) {
+      let v;
+      [v, p] = varint(b, p);
+      out.push([n, v]);
+    } else if (w === 2) {
+      let len;
+      [len, p] = varint(b, p);
+      if (p + len > b.length)
+        throw new Error("truncated bytes");
+      out.push([n, b.subarray(p, p + len)]);
+      p += len;
+    } else if (w === 1 || w === 5) {
+      p += w === 1 ? 8 : 4;
+      if (p > b.length)
+        throw new Error("truncated fixed");
+    } else
+      throw new Error(`wire type ${w}`);
+  }
+  return out;
+}
+var bytes = (f, n) => f.find((x) => x[0] === n && x[1] instanceof Uint8Array)?.[1];
+var int = (f, n) => {
+  for (let i = f.length - 1;i >= 0; i--)
+    if (f[i][0] === n && typeof f[i][1] === "number")
+      return f[i][1];
+  return 0;
+};
+var text = (f, n) => {
+  const b = bytes(f, n);
+  return b ? new TextDecoder().decode(b).trim() || undefined : undefined;
+};
+var asBytes = (x) => x instanceof Uint8Array ? x : x ? new Uint8Array(x) : undefined;
+function tsMs(b) {
+  if (!b)
+    return;
+  const f = decode(b);
+  const s = int(f, 1);
+  return s > 0 ? s * 1000 + Math.floor(Math.min(int(f, 2), 999999999) / 1e6) : undefined;
+}
+var PLACEHOLDERS = {
+  318: "gemini-3.8-flash-high",
+  319: "gemini-3.8-flash-medium",
+  320: "gemini-3.8-flash-low",
+  298: "gemini-3.7-flash-high",
+  299: "gemini-3.7-flash-medium",
+  300: "gemini-3.7-flash-low",
+  71: "gemini-3.6-flash-high",
+  72: "gemini-3.6-flash-medium",
+  73: "gemini-3.6-flash-low",
+  16: "gemini-3.1-pro",
+  36: "gemini-3.1-pro",
+  37: "gemini-3.1-pro",
+  35: "claude-sonnet-4-6",
+  26: "claude-opus-4-6"
+};
+function agModel(label, enumId) {
+  if (label)
+    return label.toLowerCase().replace(/[()]/g, " ").trim().split(/\s+/).join("-");
+  if (enumId >= 1000)
+    return PLACEHOLDERS[enumId - 1000] ?? `model_placeholder_m${enumId - 1000}`;
+  return enumId > 0 ? `antigravity-model-${enumId}` : undefined;
+}
+function readAntigravityDb(db, uuid, sink) {
+  const stepTs = new Map;
+  for (const r of db.all("select idx, step_type, metadata from steps")) {
+    try {
+      const t = tsMs(bytes(decode(asBytes(r.metadata) ?? new Uint8Array), 1));
+      if (t === undefined)
+        continue;
+      stepTs.set(Number(r.idx), t);
+      if (Number(r.step_type) === 14)
+        sink({ ts: t, agent: "antigravity", sessionId: uuid, kind: "turn", id: `ag:t:${uuid}:${r.idx}` });
+    } catch {}
+  }
+  let trajTs;
+  try {
+    for (const r of db.all("select data from trajectory_metadata_blob")) {
+      trajTs ??= tsMs(bytes(decode(asBytes(r.data)), 2));
+    }
+  } catch {}
+  for (const r of db.all("select idx, data from gen_metadata")) {
+    try {
+      const root = decode(asBytes(r.data));
+      const cm = decode(bytes(root, 1));
+      const usage = bytes(cm, 4);
+      if (!usage)
+        continue;
+      const u = decode(usage);
+      const r9 = int(u, 9);
+      const has10 = u.some((x) => x[0] === 10);
+      const tokens = { i: int(u, 2), o: has10 ? int(u, 10) : Math.max(0, int(u, 3) - r9), cw: int(u, 4), cr: int(u, 5), ...r9 ? { r: r9 } : {} };
+      if (!tokens.i && !tokens.o && !tokens.cw && !tokens.cr && !r9)
+        continue;
+      let ts;
+      const gi = bytes(cm, 9);
+      if (gi)
+        ts = tsMs(bytes(decode(gi), 4));
+      if (ts === undefined) {
+        for (const [n, v] of root) {
+          if (n !== 2)
+            continue;
+          const idxs = [];
+          if (typeof v === "number")
+            idxs.push(v);
+          else
+            for (let p = 0, x;p < v.length; ) {
+              [x, p] = varint(v, p);
+              idxs.push(x);
+            }
+          for (const i of idxs) {
+            const t = stepTs.get(i);
+            if (t !== undefined && (ts === undefined || t < ts))
+              ts = t;
+          }
+        }
+      }
+      ts ??= trajTs;
+      if (ts === undefined)
+        continue;
+      sink({ ts, agent: "antigravity", sessionId: uuid, kind: "assistant", id: `ag:${uuid}:${r.idx}`, model: agModel(text(cm, 21), int(u, 1)), tokens });
+    } catch {}
+  }
+}
+var AG_APPS = ["antigravity", "antigravity-cli", "antigravity-ide"];
+var UUID_DB = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.db$/;
+async function readAntigravity(gemini, cursor, sink, seen, open) {
+  for (const app of AG_APPS) {
+    const dir = `${gemini}/${app}/conversations`;
+    const names = await readdir8(dir).catch(() => []);
+    for (const name of names) {
+      const uuid = name.match(UUID_DB)?.[1];
+      if (!uuid)
+        continue;
+      const path = `${dir}/${name}`;
+      seen.add(path);
+      try {
+        const st = await stat6(path);
+        const wal = await stat6(`${path}-wal`).catch(() => null);
+        const fp = `${st.size}:${st.mtimeMs}:${wal?.size ?? 0}:${wal?.mtimeMs ?? 0}`;
+        const prev = cursor[path];
+        if (prev?.fp === fp)
+          continue;
+        const db = await open(path);
+        if (!db)
+          continue;
+        try {
+          readAntigravityDb(db, uuid, sink);
+        } finally {
+          db.close();
+        }
+        cursor[path] = { ino: st.ino, offset: 0, fp };
+      } catch {}
+    }
+  }
+}
 
 // src/core/activity-devin.ts
 var num = (x) => typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0;
@@ -9778,7 +9960,7 @@ function parseCodexLine(line, st) {
 var breathe = () => new Promise((r) => setTimeout(r, 5));
 var hasZstd = typeof zlib.zstdDecompressSync === "function";
 async function scanFile(path, cursor, onLine) {
-  const st = await stat6(path);
+  const st = await stat7(path);
   const prev = cursor[path];
   const same = prev && prev.ino === st.ino && st.size >= prev.offset;
   const entry = same ? prev : { ino: st.ino, offset: 0, ...prev?.cx ? { cx: { sid: prev.cx.sid } } : {} };
@@ -9823,7 +10005,7 @@ async function scanFile(path, cursor, onLine) {
 }
 async function listFiles(dir, match) {
   try {
-    const names = await readdir8(dir, { recursive: true });
+    const names = await readdir9(dir, { recursive: true });
     return names.filter(match).map((n) => `${dir}/${n}`);
   } catch {
     return [];
@@ -9876,7 +10058,8 @@ var defaultRoots = () => ({
   claude: `${process.env.HOME}/.claude/projects`,
   codex: codexHome(),
   opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`,
-  devin: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/devin/cli/sessions.db`
+  devin: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/devin/cli/sessions.db`,
+  antigravity: `${process.env.HOME}/.gemini`
 });
 async function readClaude(root, cursor, sink, progress, seen) {
   for (const f of await listFiles(root, (n) => n.endsWith(".jsonl"))) {
@@ -10017,6 +10200,10 @@ async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
     try {
       await readDevin(roots.devin, sink, since("devin"));
     } catch {}
+  if (roots.antigravity)
+    try {
+      await readAntigravity(roots.antigravity, cursor, sink, seen, openReadOnly);
+    } catch {}
   for (const p of Object.keys(cursor))
     if (!seen.has(p))
       delete cursor[p];
@@ -10117,7 +10304,7 @@ function startActivityLoop(load = loadConfig, cycle = runActivityCycle) {
 }
 
 // src/core/presence.ts
-import { readdir as readdir9, readFile as readFile10 } from "node:fs/promises";
+import { readdir as readdir10, readFile as readFile10 } from "node:fs/promises";
 var PRESENCE_EVERY_MS = 60000;
 var PRESENCE_CHECK_MS = 5000;
 var PRESENCE_MIN_GAP_MS = 27000;
@@ -10137,7 +10324,7 @@ function buildPresence(records) {
   return { coding: [...coding].slice(0, MAX_CODING), waiting };
 }
 async function readRecords(dir) {
-  const files = await readdir9(dir).catch(() => []);
+  const files = await readdir10(dir).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
@@ -11230,7 +11417,7 @@ function machineName(config) {
 }
 async function readAllRecordEntries() {
   try {
-    const files = await readdir10(SESSIONS_DIR);
+    const files = await readdir11(SESSIONS_DIR);
     const out = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
@@ -11598,7 +11785,7 @@ async function antigravitySettleTick(config, deps = {}) {
   const dir = deps.dir ?? SESSIONS_DIR;
   let files = [];
   try {
-    files = await readdir10(dir);
+    files = await readdir11(dir);
   } catch {
     return 0;
   }
@@ -12238,7 +12425,7 @@ var waitingBeatAt;
 async function sweep(config, deps = {}) {
   let files;
   try {
-    files = await readdir10(SESSIONS_DIR);
+    files = await readdir11(SESSIONS_DIR);
   } catch {
     return { revoked: false, remaining: 0, delivered: false };
   }
