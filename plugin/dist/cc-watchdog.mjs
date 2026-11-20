@@ -9462,10 +9462,73 @@ class CodexRemoteInputBridge {
 
 // src/core/activity.ts
 import { createHash as createHash3, randomUUID } from "node:crypto";
-import { createReadStream, existsSync as existsSync5 } from "node:fs";
+import { copyFileSync as copyFileSync2, createReadStream, existsSync as existsSync5, mkdtempSync as mkdtempSync2, rmSync as rmSync2 } from "node:fs";
 import { readdir as readdir8, readFile as readFile9, stat as stat6 } from "node:fs/promises";
-import { dirname as dirname2 } from "node:path";
+import { tmpdir as tmpdir2 } from "node:os";
+import { dirname as dirname2, join as join4 } from "node:path";
 import * as zlib from "node:zlib";
+
+// src/core/activity-devin.ts
+var num = (x) => typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0;
+var j = (path) => `json_extract(n.chat_message, '$.${path}')`;
+var SQL = `select n.row_id, n.session_id, n.created_at, s.model as sm,
+  ${j("role")} as role, ${j("message_id")} as mid, ${j("metadata.is_user_input")} as inp,
+  ${j("metadata.request_id")} as req, ${j("metadata.generation_model")} as gm,
+  ${j("metadata.started_generation_at")} as sg, ${j("metadata.created_at")} as ca,
+  ${j("metadata.metrics.input_tokens")} as i, ${j("metadata.metrics.output_tokens")} as o,
+  ${j("metadata.metrics.cache_read_tokens")} as cr, ${j("metadata.metrics.cache_creation_tokens")} as cw
+from message_nodes n join sessions s on s.id = n.session_id
+where s.hidden = 0 and n.created_at >= ?
+  and (case when json_valid(n.chat_message) then ${j("role")} end) in ('user', 'assistant')
+order by n.row_id`;
+async function readDevin(dbPath, sink, sinceMs) {
+  const db = await openReadOnly(dbPath);
+  if (!db)
+    return;
+  let rows;
+  try {
+    rows = db.all(SQL, Math.floor(sinceMs / 1000));
+  } catch {
+    return;
+  } finally {
+    db.close();
+  }
+  const seen = new Set;
+  for (const r of rows) {
+    const sessionId = String(r.session_id);
+    if (r.role === "user") {
+      if (r.inp !== 1)
+        continue;
+      const id = `dv:u:${r.mid ?? `${sessionId}:${r.row_id}`}`;
+      if (seen.has(id))
+        continue;
+      seen.add(id);
+      sink({ ts: Number(r.created_at) * 1000, agent: "devin", sessionId, kind: "turn", id });
+      continue;
+    }
+    if (typeof r.req !== "string" || !r.req || r.i == null && r.o == null)
+      continue;
+    const id = `dv:${r.req}`;
+    if (seen.has(id))
+      continue;
+    const ts = Date.parse(r.sg ?? "") || Date.parse(r.ca ?? "");
+    if (!Number.isFinite(ts))
+      continue;
+    seen.add(id);
+    const model = typeof r.gm === "string" && r.gm ? r.gm : typeof r.sm === "string" && r.sm && r.sm !== "adaptive" ? r.sm : undefined;
+    sink({
+      ts,
+      agent: "devin",
+      sessionId,
+      kind: "assistant",
+      id,
+      model,
+      tokens: { i: num(r.i), o: num(r.o), cw: num(r.cw), cr: num(r.cr) }
+    });
+  }
+}
+
+// src/core/activity.ts
 var HOT_DAYS = 40;
 var MAX_DAYS = 400;
 var HOUR_MS = 3600000;
@@ -9601,7 +9664,7 @@ function buildPayload(state, now, mid) {
     days.shift();
   return { v: 1, gen: now, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, days, ...mid ? { mid } : {} };
 }
-var num = (x) => typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0;
+var num2 = (x) => typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0;
 var NON_PROMPT = ["<task-notification>", "<bash-stdout>", "<bash-stderr>", "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>"];
 function parseClaudeLine(line) {
   const isA = line.includes('"type":"assistant"');
@@ -9622,7 +9685,7 @@ function parseClaudeLine(line) {
     const model = o.message?.model;
     if (!u || typeof u !== "object" || model === "<synthetic>")
       return null;
-    const r = num(u.output_tokens_details?.thinking_tokens);
+    const r = num2(u.output_tokens_details?.thinking_tokens);
     return {
       ts,
       agent: "claude",
@@ -9631,10 +9694,10 @@ function parseClaudeLine(line) {
       id: o.message?.id && o.requestId ? `cc:${o.message.id}:${o.requestId}` : `cc:${sid}:${o.timestamp}`,
       model: typeof model === "string" ? model : undefined,
       tokens: {
-        i: num(u.input_tokens),
-        o: Math.max(0, num(u.output_tokens) - r),
-        cw: num(u.cache_creation_input_tokens),
-        cr: num(u.cache_read_input_tokens),
+        i: num2(u.input_tokens),
+        o: Math.max(0, num2(u.output_tokens) - r),
+        cw: num2(u.cache_creation_input_tokens),
+        cr: num2(u.cache_read_input_tokens),
         ...r ? { r } : {}
       }
     };
@@ -9692,8 +9755,8 @@ function parseCodexLine(line, st) {
     const total = p.info?.total_token_usage?.total_tokens;
     if (!last || typeof total !== "number")
       return null;
-    const cached = num(last.cached_input_tokens);
-    const r = num(last.reasoning_output_tokens);
+    const cached = num2(last.cached_input_tokens);
+    const r = num2(last.reasoning_output_tokens);
     return {
       ts,
       agent: "codex",
@@ -9702,9 +9765,9 @@ function parseCodexLine(line, st) {
       id: `cx:u:${st.sid}:${total}`,
       model: st.m,
       tokens: {
-        i: Math.max(0, num(last.input_tokens) - cached),
-        o: Math.max(0, num(last.output_tokens) - r),
-        cw: num(last.cache_write_input_tokens),
+        i: Math.max(0, num2(last.input_tokens) - cached),
+        o: Math.max(0, num2(last.output_tokens) - r),
+        cw: num2(last.cache_write_input_tokens),
         cr: cached,
         ...r ? { r } : {}
       }
@@ -9777,19 +9840,43 @@ async function openReadOnly(path) {
   } catch {
     return null;
   }
-  for (const opt of ["mode=ro", "immutable=1"]) {
+  const wrap = (db, cleanup = () => {}) => {
+    db.prepare("select 1").all();
+    return { all: (sql, ...params) => db.prepare(sql).all(...params), close: () => {
+      try {
+        db.close();
+      } finally {
+        cleanup();
+      }
+    } };
+  };
+  const wal = existsSync5(`${path}-wal`);
+  for (const opt of wal ? ["mode=ro"] : ["mode=ro", "immutable=1"]) {
     try {
-      const db = isBun ? new mod.Database(`file:${path}?${opt}`, { readonly: true }) : new mod.DatabaseSync(new URL(`file://${path}?${opt}`), { readOnly: true });
-      db.prepare("select 1").all();
-      return { all: (sql, ...params) => db.prepare(sql).all(...params), close: () => db.close() };
+      return wrap(isBun ? new mod.Database(`file:${path}?${opt}`, { readonly: true }) : new mod.DatabaseSync(new URL(`file://${path}?${opt}`), { readOnly: true }));
     } catch {}
   }
-  return null;
+  if (!wal)
+    return null;
+  let tmp = "";
+  const drop = () => rmSync2(tmp, { recursive: true, force: true });
+  try {
+    tmp = mkdtempSync2(join4(tmpdir2(), "nomo-ro-"));
+    const copy = join4(tmp, "db.sqlite");
+    copyFileSync2(path, copy);
+    copyFileSync2(`${path}-wal`, `${copy}-wal`);
+    return wrap(isBun ? new mod.Database(copy) : new mod.DatabaseSync(copy), drop);
+  } catch {
+    if (tmp)
+      drop();
+    return null;
+  }
 }
 var defaultRoots = () => ({
   claude: `${process.env.HOME}/.claude/projects`,
   codex: codexHome(),
-  opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`
+  opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`,
+  devin: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/devin/cli/sessions.db`
 });
 async function readClaude(root, cursor, sink, progress, seen) {
   for (const f of await listFiles(root, (n) => n.endsWith(".jsonl"))) {
@@ -9847,7 +9934,7 @@ async function readCodex(home, cursor, sink, progress, seen, sinceMs, days) {
         kind: "assistant",
         id: `cx:th:${t.id}`,
         model: t.model ?? undefined,
-        tokens: { i: num(t.tokens_used), o: 0, cw: 0, cr: 0 }
+        tokens: { i: num2(t.tokens_used), o: 0, cw: 0, cr: 0 }
       });
     }
     if (orphans.size === 0)
@@ -9895,7 +9982,7 @@ async function readOpenCode(dbPath, sink, sinceMs) {
           kind: "assistant",
           id: `oc:${r.id}`,
           model: typeof o.modelID === "string" ? o.modelID : undefined,
-          tokens: { i: num(k.input), o: num(k.output), cw: num(k.cache?.write), cr: num(k.cache?.read), ...num(k.reasoning) ? { r: num(k.reasoning) } : {} }
+          tokens: { i: num2(k.input), o: num2(k.output), cw: num2(k.cache?.write), cr: num2(k.cache?.read), ...num2(k.reasoning) ? { r: num2(k.reasoning) } : {} }
         });
       }
     }
@@ -9926,6 +10013,10 @@ async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
   try {
     await readOpenCode(roots.opencode, sink, since("opencode"));
   } catch {}
+  if (roots.devin)
+    try {
+      await readDevin(roots.devin, sink, since("devin"));
+    } catch {}
   for (const p of Object.keys(cursor))
     if (!seen.has(p))
       delete cursor[p];
