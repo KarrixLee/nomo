@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 var __require = /* @__PURE__ */ createRequire(import.meta.url);
 
 // src/entries/cc-watchdog.ts
-import { readdir as readdir10, readFile as readFile11, unlink as unlink6 } from "node:fs/promises";
+import { readdir as readdir11, readFile as readFile11, unlink as unlink6 } from "node:fs/promises";
 import { readFileSync as readFileSync3, statSync as statSync4, unlinkSync } from "node:fs";
 import { hostname as hostname6 } from "node:os";
 import { basename as basename8 } from "node:path";
@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.5.0";
+var PLUGIN_VERSION = "2.5.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3437,6 +3437,13 @@ function devinSessionMeta(sessionId, db = devinSessionsDb(), env = process.env) 
   } catch {
     return {};
   }
+}
+function devinRejectedAt(sessionId, db = devinSessionsDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return;
+  const cell = sqliteOne(db, "select m.created_at from sessions s join message_nodes m on m.session_id=s.id and m.node_id=s.main_chain_id" + ` where s.id='${sessionId}' and json_extract(m.chat_message,'$.role')='tool'` + " and json_extract(m.chat_message,'$.content')='Tool execution was rejected by the user'" + ` and json_extract(m.chat_message,'$.metadata.extensions."chisel/tool_failure".reason.Rejected.interactive')=1`, env, true);
+  const at = Number(cell);
+  return cell && Number.isFinite(at) ? at : undefined;
 }
 var devinAdapter = {
   kind: "devin",
@@ -9462,10 +9469,255 @@ class CodexRemoteInputBridge {
 
 // src/core/activity.ts
 import { createHash as createHash3, randomUUID } from "node:crypto";
-import { createReadStream, existsSync as existsSync5 } from "node:fs";
-import { readdir as readdir8, readFile as readFile9, stat as stat6 } from "node:fs/promises";
-import { dirname as dirname2 } from "node:path";
+import { copyFileSync as copyFileSync2, createReadStream, existsSync as existsSync5, mkdtempSync as mkdtempSync2, rmSync as rmSync2 } from "node:fs";
+import { readdir as readdir9, readFile as readFile9, stat as stat7 } from "node:fs/promises";
+import { tmpdir as tmpdir2 } from "node:os";
+import { dirname as dirname2, join as join4 } from "node:path";
 import * as zlib from "node:zlib";
+
+// src/core/activity-antigravity.ts
+import { readdir as readdir8, stat as stat6 } from "node:fs/promises";
+function varint(b, p) {
+  let v = 0;
+  let m = 1;
+  for (let i = 0;i < 10; i++) {
+    if (p >= b.length)
+      throw new Error("truncated varint");
+    const x = b[p++];
+    v += (x & 127) * m;
+    if (!(x & 128))
+      return [v, p];
+    m *= 128;
+  }
+  throw new Error("varint too long");
+}
+function decode(b) {
+  const out = [];
+  let p = 0;
+  while (p < b.length) {
+    let tag;
+    [tag, p] = varint(b, p);
+    const n = Math.floor(tag / 8);
+    const w = tag % 8;
+    if (n === 0)
+      throw new Error("field 0");
+    if (w === 0) {
+      let v;
+      [v, p] = varint(b, p);
+      out.push([n, v]);
+    } else if (w === 2) {
+      let len;
+      [len, p] = varint(b, p);
+      if (p + len > b.length)
+        throw new Error("truncated bytes");
+      out.push([n, b.subarray(p, p + len)]);
+      p += len;
+    } else if (w === 1 || w === 5) {
+      p += w === 1 ? 8 : 4;
+      if (p > b.length)
+        throw new Error("truncated fixed");
+    } else
+      throw new Error(`wire type ${w}`);
+  }
+  return out;
+}
+var bytes = (f, n) => f.find((x) => x[0] === n && x[1] instanceof Uint8Array)?.[1];
+var int = (f, n) => {
+  for (let i = f.length - 1;i >= 0; i--)
+    if (f[i][0] === n && typeof f[i][1] === "number")
+      return f[i][1];
+  return 0;
+};
+var text = (f, n) => {
+  const b = bytes(f, n);
+  return b ? new TextDecoder().decode(b).trim() || undefined : undefined;
+};
+var asBytes = (x) => x instanceof Uint8Array ? x : x ? new Uint8Array(x) : undefined;
+function tsMs(b) {
+  if (!b)
+    return;
+  const f = decode(b);
+  const s = int(f, 1);
+  return s > 0 ? s * 1000 + Math.floor(Math.min(int(f, 2), 999999999) / 1e6) : undefined;
+}
+var PLACEHOLDERS = {
+  318: "gemini-3.8-flash-high",
+  319: "gemini-3.8-flash-medium",
+  320: "gemini-3.8-flash-low",
+  298: "gemini-3.7-flash-high",
+  299: "gemini-3.7-flash-medium",
+  300: "gemini-3.7-flash-low",
+  71: "gemini-3.6-flash-high",
+  72: "gemini-3.6-flash-medium",
+  73: "gemini-3.6-flash-low",
+  16: "gemini-3.1-pro",
+  36: "gemini-3.1-pro",
+  37: "gemini-3.1-pro",
+  35: "claude-sonnet-4-6",
+  26: "claude-opus-4-6"
+};
+function agModel(label, enumId) {
+  if (label)
+    return label.toLowerCase().replace(/[()]/g, " ").trim().split(/\s+/).join("-");
+  if (enumId >= 1000)
+    return PLACEHOLDERS[enumId - 1000] ?? `model_placeholder_m${enumId - 1000}`;
+  return enumId > 0 ? `antigravity-model-${enumId}` : undefined;
+}
+function readAntigravityDb(db, uuid, sink) {
+  const stepTs = new Map;
+  for (const r of db.all("select idx, step_type, metadata from steps")) {
+    try {
+      const t = tsMs(bytes(decode(asBytes(r.metadata) ?? new Uint8Array), 1));
+      if (t === undefined)
+        continue;
+      stepTs.set(Number(r.idx), t);
+      if (Number(r.step_type) === 14)
+        sink({ ts: t, agent: "antigravity", sessionId: uuid, kind: "turn", id: `ag:t:${uuid}:${r.idx}` });
+    } catch {}
+  }
+  let trajTs;
+  try {
+    for (const r of db.all("select data from trajectory_metadata_blob")) {
+      trajTs ??= tsMs(bytes(decode(asBytes(r.data)), 2));
+    }
+  } catch {}
+  for (const r of db.all("select idx, data from gen_metadata")) {
+    try {
+      const root = decode(asBytes(r.data));
+      const cm = decode(bytes(root, 1));
+      const usage = bytes(cm, 4);
+      if (!usage)
+        continue;
+      const u = decode(usage);
+      const r9 = int(u, 9);
+      const has10 = u.some((x) => x[0] === 10);
+      const tokens = { i: int(u, 2), o: has10 ? int(u, 10) : Math.max(0, int(u, 3) - r9), cw: int(u, 4), cr: int(u, 5), ...r9 ? { r: r9 } : {} };
+      if (!tokens.i && !tokens.o && !tokens.cw && !tokens.cr && !r9)
+        continue;
+      let ts;
+      const gi = bytes(cm, 9);
+      if (gi)
+        ts = tsMs(bytes(decode(gi), 4));
+      if (ts === undefined) {
+        for (const [n, v] of root) {
+          if (n !== 2)
+            continue;
+          const idxs = [];
+          if (typeof v === "number")
+            idxs.push(v);
+          else
+            for (let p = 0, x;p < v.length; ) {
+              [x, p] = varint(v, p);
+              idxs.push(x);
+            }
+          for (const i of idxs) {
+            const t = stepTs.get(i);
+            if (t !== undefined && (ts === undefined || t < ts))
+              ts = t;
+          }
+        }
+      }
+      ts ??= trajTs;
+      if (ts === undefined)
+        continue;
+      sink({ ts, agent: "antigravity", sessionId: uuid, kind: "assistant", id: `ag:${uuid}:${r.idx}`, model: agModel(text(cm, 21), int(u, 1)), tokens });
+    } catch {}
+  }
+}
+var AG_APPS = ["antigravity", "antigravity-cli", "antigravity-ide"];
+var UUID_DB = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.db$/;
+async function readAntigravity(gemini, cursor, sink, seen, open) {
+  for (const app of AG_APPS) {
+    const dir = `${gemini}/${app}/conversations`;
+    const names = await readdir8(dir).catch(() => []);
+    for (const name of names) {
+      const uuid = name.match(UUID_DB)?.[1];
+      if (!uuid)
+        continue;
+      const path = `${dir}/${name}`;
+      seen.add(path);
+      try {
+        const st = await stat6(path);
+        const wal = await stat6(`${path}-wal`).catch(() => null);
+        const fp = `${st.size}:${st.mtimeMs}:${wal?.size ?? 0}:${wal?.mtimeMs ?? 0}`;
+        const prev = cursor[path];
+        if (prev?.fp === fp)
+          continue;
+        const db = await open(path);
+        if (!db)
+          continue;
+        try {
+          readAntigravityDb(db, uuid, sink);
+        } finally {
+          db.close();
+        }
+        cursor[path] = { ino: st.ino, offset: 0, fp };
+      } catch {}
+    }
+  }
+}
+
+// src/core/activity-devin.ts
+var num = (x) => typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0;
+var j = (path) => `json_extract(n.chat_message, '$.${path}')`;
+var SQL = `select n.row_id, n.session_id, n.created_at, s.model as sm,
+  ${j("role")} as role, ${j("message_id")} as mid, ${j("metadata.is_user_input")} as inp,
+  ${j("metadata.request_id")} as req, ${j("metadata.generation_model")} as gm,
+  ${j("metadata.started_generation_at")} as sg, ${j("metadata.created_at")} as ca,
+  ${j("metadata.metrics.input_tokens")} as i, ${j("metadata.metrics.output_tokens")} as o,
+  ${j("metadata.metrics.cache_read_tokens")} as cr, ${j("metadata.metrics.cache_creation_tokens")} as cw
+from message_nodes n join sessions s on s.id = n.session_id
+where s.hidden = 0 and n.created_at >= ?
+  and (case when json_valid(n.chat_message) then ${j("role")} end) in ('user', 'assistant')
+order by n.row_id`;
+async function readDevin(dbPath, sink, sinceMs) {
+  const db = await openReadOnly(dbPath);
+  if (!db)
+    return;
+  let rows;
+  try {
+    rows = db.all(SQL, Math.floor(sinceMs / 1000));
+  } catch {
+    return;
+  } finally {
+    db.close();
+  }
+  const seen = new Set;
+  for (const r of rows) {
+    const sessionId = String(r.session_id);
+    if (r.role === "user") {
+      if (r.inp !== 1)
+        continue;
+      const id = `dv:u:${r.mid ?? `${sessionId}:${r.row_id}`}`;
+      if (seen.has(id))
+        continue;
+      seen.add(id);
+      sink({ ts: Number(r.created_at) * 1000, agent: "devin", sessionId, kind: "turn", id });
+      continue;
+    }
+    if (typeof r.req !== "string" || !r.req || r.i == null && r.o == null)
+      continue;
+    const id = `dv:${r.req}`;
+    if (seen.has(id))
+      continue;
+    const ts = Date.parse(r.sg ?? "") || Date.parse(r.ca ?? "");
+    if (!Number.isFinite(ts))
+      continue;
+    seen.add(id);
+    const model = typeof r.gm === "string" && r.gm ? r.gm : typeof r.sm === "string" && r.sm && r.sm !== "adaptive" ? r.sm : undefined;
+    sink({
+      ts,
+      agent: "devin",
+      sessionId,
+      kind: "assistant",
+      id,
+      model,
+      tokens: { i: num(r.i), o: num(r.o), cw: num(r.cw), cr: num(r.cr) }
+    });
+  }
+}
+
+// src/core/activity.ts
 var HOT_DAYS = 40;
 var MAX_DAYS = 400;
 var HOUR_MS = 3600000;
@@ -9601,7 +9853,7 @@ function buildPayload(state, now, mid) {
     days.shift();
   return { v: 1, gen: now, tz: Intl.DateTimeFormat().resolvedOptions().timeZone, days, ...mid ? { mid } : {} };
 }
-var num = (x) => typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0;
+var num2 = (x) => typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0;
 var NON_PROMPT = ["<task-notification>", "<bash-stdout>", "<bash-stderr>", "<local-command-stdout>", "<local-command-stderr>", "<local-command-caveat>"];
 function parseClaudeLine(line) {
   const isA = line.includes('"type":"assistant"');
@@ -9622,7 +9874,7 @@ function parseClaudeLine(line) {
     const model = o.message?.model;
     if (!u || typeof u !== "object" || model === "<synthetic>")
       return null;
-    const r = num(u.output_tokens_details?.thinking_tokens);
+    const r = num2(u.output_tokens_details?.thinking_tokens);
     return {
       ts,
       agent: "claude",
@@ -9631,10 +9883,10 @@ function parseClaudeLine(line) {
       id: o.message?.id && o.requestId ? `cc:${o.message.id}:${o.requestId}` : `cc:${sid}:${o.timestamp}`,
       model: typeof model === "string" ? model : undefined,
       tokens: {
-        i: num(u.input_tokens),
-        o: Math.max(0, num(u.output_tokens) - r),
-        cw: num(u.cache_creation_input_tokens),
-        cr: num(u.cache_read_input_tokens),
+        i: num2(u.input_tokens),
+        o: Math.max(0, num2(u.output_tokens) - r),
+        cw: num2(u.cache_creation_input_tokens),
+        cr: num2(u.cache_read_input_tokens),
         ...r ? { r } : {}
       }
     };
@@ -9692,8 +9944,8 @@ function parseCodexLine(line, st) {
     const total = p.info?.total_token_usage?.total_tokens;
     if (!last || typeof total !== "number")
       return null;
-    const cached = num(last.cached_input_tokens);
-    const r = num(last.reasoning_output_tokens);
+    const cached = num2(last.cached_input_tokens);
+    const r = num2(last.reasoning_output_tokens);
     return {
       ts,
       agent: "codex",
@@ -9702,9 +9954,9 @@ function parseCodexLine(line, st) {
       id: `cx:u:${st.sid}:${total}`,
       model: st.m,
       tokens: {
-        i: Math.max(0, num(last.input_tokens) - cached),
-        o: Math.max(0, num(last.output_tokens) - r),
-        cw: num(last.cache_write_input_tokens),
+        i: Math.max(0, num2(last.input_tokens) - cached),
+        o: Math.max(0, num2(last.output_tokens) - r),
+        cw: num2(last.cache_write_input_tokens),
         cr: cached,
         ...r ? { r } : {}
       }
@@ -9715,7 +9967,7 @@ function parseCodexLine(line, st) {
 var breathe = () => new Promise((r) => setTimeout(r, 5));
 var hasZstd = typeof zlib.zstdDecompressSync === "function";
 async function scanFile(path, cursor, onLine) {
-  const st = await stat6(path);
+  const st = await stat7(path);
   const prev = cursor[path];
   const same = prev && prev.ino === st.ino && st.size >= prev.offset;
   const entry = same ? prev : { ino: st.ino, offset: 0, ...prev?.cx ? { cx: { sid: prev.cx.sid } } : {} };
@@ -9760,7 +10012,7 @@ async function scanFile(path, cursor, onLine) {
 }
 async function listFiles(dir, match) {
   try {
-    const names = await readdir8(dir, { recursive: true });
+    const names = await readdir9(dir, { recursive: true });
     return names.filter(match).map((n) => `${dir}/${n}`);
   } catch {
     return [];
@@ -9777,19 +10029,44 @@ async function openReadOnly(path) {
   } catch {
     return null;
   }
-  for (const opt of ["mode=ro", "immutable=1"]) {
+  const wrap = (db, cleanup = () => {}) => {
+    db.prepare("select 1").all();
+    return { all: (sql, ...params) => db.prepare(sql).all(...params), close: () => {
+      try {
+        db.close();
+      } finally {
+        cleanup();
+      }
+    } };
+  };
+  const wal = existsSync5(`${path}-wal`);
+  for (const opt of wal ? ["mode=ro"] : ["mode=ro", "immutable=1"]) {
     try {
-      const db = isBun ? new mod.Database(`file:${path}?${opt}`, { readonly: true }) : new mod.DatabaseSync(new URL(`file://${path}?${opt}`), { readOnly: true });
-      db.prepare("select 1").all();
-      return { all: (sql, ...params) => db.prepare(sql).all(...params), close: () => db.close() };
+      return wrap(isBun ? new mod.Database(`file:${path}?${opt}`, { readonly: true }) : new mod.DatabaseSync(new URL(`file://${path}?${opt}`), { readOnly: true }));
     } catch {}
   }
-  return null;
+  if (!wal)
+    return null;
+  let tmp = "";
+  const drop = () => rmSync2(tmp, { recursive: true, force: true });
+  try {
+    tmp = mkdtempSync2(join4(tmpdir2(), "nomo-ro-"));
+    const copy = join4(tmp, "db.sqlite");
+    copyFileSync2(path, copy);
+    copyFileSync2(`${path}-wal`, `${copy}-wal`);
+    return wrap(isBun ? new mod.Database(copy) : new mod.DatabaseSync(copy), drop);
+  } catch {
+    if (tmp)
+      drop();
+    return null;
+  }
 }
 var defaultRoots = () => ({
   claude: `${process.env.HOME}/.claude/projects`,
   codex: codexHome(),
-  opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`
+  opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`,
+  devin: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/devin/cli/sessions.db`,
+  antigravity: `${process.env.HOME}/.gemini`
 });
 async function readClaude(root, cursor, sink, progress, seen) {
   for (const f of await listFiles(root, (n) => n.endsWith(".jsonl"))) {
@@ -9847,7 +10124,7 @@ async function readCodex(home, cursor, sink, progress, seen, sinceMs, days) {
         kind: "assistant",
         id: `cx:th:${t.id}`,
         model: t.model ?? undefined,
-        tokens: { i: num(t.tokens_used), o: 0, cw: 0, cr: 0 }
+        tokens: { i: num2(t.tokens_used), o: 0, cw: 0, cr: 0 }
       });
     }
     if (orphans.size === 0)
@@ -9895,7 +10172,7 @@ async function readOpenCode(dbPath, sink, sinceMs) {
           kind: "assistant",
           id: `oc:${r.id}`,
           model: typeof o.modelID === "string" ? o.modelID : undefined,
-          tokens: { i: num(k.input), o: num(k.output), cw: num(k.cache?.write), cr: num(k.cache?.read), ...num(k.reasoning) ? { r: num(k.reasoning) } : {} }
+          tokens: { i: num2(k.input), o: num2(k.output), cw: num2(k.cache?.write), cr: num2(k.cache?.read), ...num2(k.reasoning) ? { r: num2(k.reasoning) } : {} }
         });
       }
     }
@@ -9926,6 +10203,14 @@ async function scanAll(state, cursor, roots, now, checkpoint = async () => {}) {
   try {
     await readOpenCode(roots.opencode, sink, since("opencode"));
   } catch {}
+  if (roots.devin)
+    try {
+      await readDevin(roots.devin, sink, since("devin"));
+    } catch {}
+  if (roots.antigravity)
+    try {
+      await readAntigravity(roots.antigravity, cursor, sink, seen, openReadOnly);
+    } catch {}
   for (const p of Object.keys(cursor))
     if (!seen.has(p))
       delete cursor[p];
@@ -10026,7 +10311,7 @@ function startActivityLoop(load = loadConfig, cycle = runActivityCycle) {
 }
 
 // src/core/presence.ts
-import { readdir as readdir9, readFile as readFile10 } from "node:fs/promises";
+import { readdir as readdir10, readFile as readFile10 } from "node:fs/promises";
 var PRESENCE_EVERY_MS = 60000;
 var PRESENCE_CHECK_MS = 5000;
 var PRESENCE_MIN_GAP_MS = 27000;
@@ -10046,7 +10331,7 @@ function buildPresence(records) {
   return { coding: [...coding].slice(0, MAX_CODING), waiting };
 }
 async function readRecords(dir) {
-  const files = await readdir9(dir).catch(() => []);
+  const files = await readdir10(dir).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
@@ -11139,7 +11424,7 @@ function machineName(config) {
 }
 async function readAllRecordEntries() {
   try {
-    const files = await readdir10(SESSIONS_DIR);
+    const files = await readdir11(SESSIONS_DIR);
     const out = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
@@ -11298,6 +11583,25 @@ function shouldInterruptCheck(record, now) {
   }
   return false;
 }
+function devinDbMtimeMs() {
+  const db = devinSessionsDb();
+  let m = 0;
+  for (const p of [db, `${db}-wal`]) {
+    try {
+      m = Math.max(m, statSync4(p).mtimeMs);
+    } catch {}
+  }
+  return m;
+}
+var DEVIN_REJECT_SETTLE_S = 3;
+function devinTurnRejected(sessionId, record, now, rejectedAt = devinRejectedAt, dbMtimeMs = devinDbMtimeMs) {
+  if (record.lastEvent !== "needsAttention" && record.lastEvent !== "working")
+    return false;
+  if (typeof record.ts !== "number" || dbMtimeMs() < record.ts)
+    return false;
+  const at = rejectedAt(sessionId);
+  return at !== undefined && at >= Math.floor(record.ts / 1000) && Math.floor(now / 1000) - at >= DEVIN_REJECT_SETTLE_S;
+}
 function doneSettledRecord(record) {
   return { ...record, lastEvent: "done", sentDone: true, op: "done", prio: 0, doneAttempts: undefined };
 }
@@ -11307,17 +11611,22 @@ async function correctInterrupt(config, path, sessionId, record, now, deps = {})
   const writeRecord = deps.writeRecord ?? ((p, rec) => atomicWrite(p, JSON.stringify(rec), 384));
   const clock = deps.now ?? Date.now;
   try {
-    if (!shouldInterruptCheck(record, now))
-      return "uncorrected";
-    let tail;
-    try {
-      tail = await readTail(record.transcript, INTERRUPT_TAIL_BYTES);
-    } catch {
-      return "uncorrected";
-    }
     const agent = recordAgent(record);
-    if (!tailShowsInterrupt(tail, agent))
-      return "uncorrected";
+    if (agent === "devin") {
+      if (!devinTurnRejected(sessionId, record, now, deps.devinRejectedAt, deps.devinDbMtimeMs))
+        return "uncorrected";
+    } else {
+      if (!shouldInterruptCheck(record, now))
+        return "uncorrected";
+      let tail;
+      try {
+        tail = await readTail(record.transcript, INTERRUPT_TAIL_BYTES);
+      } catch {
+        return "uncorrected";
+      }
+      if (!tailShowsInterrupt(tail, agent))
+        return "uncorrected";
+    }
     if (await decisionHoldIsLive(sessionId, now, deps)) {
       traceFocus(deps, { event: "interrupt", sessionId, outcome: "held", delivered: false, held: true });
       return "uncorrected";
@@ -11507,7 +11816,7 @@ async function antigravitySettleTick(config, deps = {}) {
   const dir = deps.dir ?? SESSIONS_DIR;
   let files = [];
   try {
-    files = await readdir10(dir);
+    files = await readdir11(dir);
   } catch {
     return 0;
   }
@@ -12147,7 +12456,7 @@ var waitingBeatAt;
 async function sweep(config, deps = {}) {
   let files;
   try {
-    files = await readdir10(SESSIONS_DIR);
+    files = await readdir11(SESSIONS_DIR);
   } catch {
     return { revoked: false, remaining: 0, delivered: false };
   }
@@ -12758,6 +13067,7 @@ export {
   CODEX_TUI_SESSION_START_SKEW_MS,
   COMMAND_FUTURE_SKEW_MS,
   COMMAND_TTL_MS,
+  DEVIN_REJECT_SETTLE_S,
   IDLE_GRACE_MS,
   LAN_ANSWER_ECHO_DELAY_MS,
   LAN_COMMAND_ID_PREFIX,
@@ -12805,6 +13115,7 @@ export {
   correlateCodexTuiPid,
   createBridgeSupervisor,
   decisionHoldIsLive,
+  devinTurnRejected,
   discoverLiveSessions,
   drainCommands,
   effectiveDoneAttempts,

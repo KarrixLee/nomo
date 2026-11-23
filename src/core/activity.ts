@@ -25,14 +25,17 @@
 // skips that line/agent, never the watchdog. PORTABLE: runs under node or bun (no Bun.* globals).
 
 import { createHash, randomUUID } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
+import { copyFileSync, createReadStream, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
-import { dirname } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import * as zlib from "node:zlib";
+import { readAntigravity } from "./activity-antigravity";
+import { readDevin } from "./activity-devin";
 import { encryptBlob } from "./crypto";
 import { atomicWrite, CC_DIR, codexHome, Config, loadConfig, PLUGIN_VERSION } from "./shared";
 
-export type ActivityAgent = "claude" | "codex" | "opencode";
+export type ActivityAgent = "claude" | "codex" | "opencode" | "devin" | "antigravity";
 export interface Tokens { i: number; o: number; cw: number; cr: number; r?: number }
 export interface ActivityEvent {
   ts: number; agent: ActivityAgent; sessionId: string; kind: "turn" | "assistant"; id: string;
@@ -322,25 +325,44 @@ export async function openReadOnly(path: string): Promise<RoDb | null> {
   const spec = isBun ? "bun:sqlite" : "node:sqlite"; // computed: keep the bundler from resolving it
   let mod: any;
   try { mod = await import(spec); } catch { return null; }
-  for (const opt of ["mode=ro", "immutable=1"]) {
+  const wrap = (db: any, cleanup = () => {}): RoDb => {
+    db.prepare("select 1").all();
+    return { all: (sql, ...params) => db.prepare(sql).all(...params), close: () => { try { db.close(); } finally { cleanup(); } } };
+  };
+  // immutable=1 skips the WAL: with a `-wal` next to the db (the app is running) it reads a stale
+  // snapshot as if complete, so it is only a fallback for a WAL-free db. Plain ro sees the WAL rows.
+  const wal = existsSync(`${path}-wal`);
+  for (const opt of wal ? ["mode=ro"] : ["mode=ro", "immutable=1"]) {
     try {
-      const db = isBun
+      return wrap(isBun
         ? new mod.Database(`file:${path}?${opt}`, { readonly: true })
-        : new mod.DatabaseSync(new URL(`file://${path}?${opt}`), { readOnly: true });
-      db.prepare("select 1").all();
-      return { all: (sql, ...params) => db.prepare(sql).all(...params), close: () => db.close() };
+        : new mod.DatabaseSync(new URL(`file://${path}?${opt}`), { readOnly: true }));
     } catch { /* try the next open mode */ }
   }
-  return null;
+  if (!wal) return null;
+  // ro cannot open a WAL db it cannot build a -shm for (no -shm, or a read-only dir — Antigravity's dbs
+  // often sit like that). Read a private copy of db + -wal instead, deleted on close. No -shm is copied:
+  // as the only connection, SQLite rebuilds the wal-index from the -wal anyway.
+  let tmp = "";
+  const drop = () => rmSync(tmp, { recursive: true, force: true });
+  try {
+    tmp = mkdtempSync(join(tmpdir(), "nomo-ro-"));
+    const copy = join(tmp, "db.sqlite");
+    copyFileSync(path, copy);
+    copyFileSync(`${path}-wal`, `${copy}-wal`);
+    return wrap(isBun ? new mod.Database(copy) : new mod.DatabaseSync(copy), drop);
+  } catch { if (tmp) drop(); return null; }
 }
 
 // --- per-agent readers -------------------------------------------------------------------------
 
-export interface Roots { claude: string; codex: string; opencode: string }
+export interface Roots { claude: string; codex: string; opencode: string; devin?: string; antigravity?: string /* ~/.gemini */ }
 export const defaultRoots = (): Roots => ({
   claude: `${process.env.HOME}/.claude/projects`,
   codex: codexHome(),
   opencode: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/opencode/opencode.db`,
+  devin: `${process.env.XDG_DATA_HOME || `${process.env.HOME}/.local/share`}/devin/cli/sessions.db`,
+  antigravity: `${process.env.HOME}/.gemini`,
 });
 
 type Sink = (ev: ActivityEvent) => void;
@@ -456,6 +478,8 @@ export async function scanAll(state: State, cursor: Cursor, roots: Roots, now: n
   try { await readClaude(roots.claude, cursor, sink, progress, seen); } catch { /* skip agent */ }
   try { await readCodex(roots.codex, cursor, sink, progress, seen, since("codex"), state); } catch { /* skip agent */ }
   try { await readOpenCode(roots.opencode, sink, since("opencode")); } catch { /* skip agent */ }
+  if (roots.devin) try { await readDevin(roots.devin, sink, since("devin")); } catch { /* skip agent */ }
+  if (roots.antigravity) try { await readAntigravity(roots.antigravity, cursor, sink, seen, openReadOnly); } catch { /* skip agent */ }
   for (const p of Object.keys(cursor)) if (!seen.has(p)) delete cursor[p];
 }
 

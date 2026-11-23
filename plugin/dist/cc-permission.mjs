@@ -111,7 +111,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.5.0";
+var PLUGIN_VERSION = "2.5.1";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -3148,6 +3148,13 @@ function devinSessionMeta(sessionId, db = devinSessionsDb(), env = process.env) 
   } catch {
     return {};
   }
+}
+function devinRejectedAt(sessionId, db = devinSessionsDb(), env = process.env) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(sessionId))
+    return;
+  const cell = sqliteOne(db, "select m.created_at from sessions s join message_nodes m on m.session_id=s.id and m.node_id=s.main_chain_id" + ` where s.id='${sessionId}' and json_extract(m.chat_message,'$.role')='tool'` + " and json_extract(m.chat_message,'$.content')='Tool execution was rejected by the user'" + ` and json_extract(m.chat_message,'$.metadata.extensions."chisel/tool_failure".reason.Rejected.interactive')=1`, env, true);
+  const at = Number(cell);
+  return cell && Number.isFinite(at) ? at : undefined;
 }
 var devinAdapter = {
   kind: "devin",
