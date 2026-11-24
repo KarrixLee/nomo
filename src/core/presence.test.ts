@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "bun:test";
 import {
-  buildPresence, PRESENCE_EVERY_MS, PRESENCE_MIN_GAP_MS, presenceDue, sendPresence, startPresenceLoop,
+  buildPresence, PRESENCE_EVERY_MS, PRESENCE_MIN_GAP_MS, PRESENCE_VERSION_REPROBE_MS, presenceDue, presenceVersion,
+  resetPresenceVersionProbe, sendPresence, startPresenceLoop,
 } from "./presence";
 import type { Presence, PresenceResult } from "./presence";
 import { isFreeMode, markFreeMode } from "./shared";
@@ -203,5 +204,44 @@ describe("presence loop", () => {
     await takeover.flush();
     await takeover.stop(); // ownership loss / SIGTERM: the successor owns presence
     expect(takeover.sent).toHaveLength(1);
+  });
+});
+
+describe("per-agent plugin versions (2.5.3)", () => {
+  test("each agent's OWN integration version, taken in turn one per heartbeat minute; none when no record names one", () => {
+    const records = [
+      rec({ agent: "opencode", pluginVersion: "2.5.3" }), rec({ pluginVersion: "2.5.1" }),
+      rec({ pluginVersion: "2.5.0" }), rec({ agent: "codex" }),
+    ];
+    expect(presenceVersion(records, 0)).toEqual({ agent: "claude", pluginVersion: "2.5.1" });
+    expect(presenceVersion(records, PRESENCE_EVERY_MS)).toEqual({ agent: "opencode", pluginVersion: "2.5.3" });
+    expect(presenceVersion(records, 2 * PRESENCE_EVERY_MS)).toEqual({ agent: "claude", pluginVersion: "2.5.1" });
+    expect(presenceVersion([rec({ agent: "codex" })], 0)).toBeUndefined();
+  });
+
+  test("the POST carries `agent` + `pluginVersion` beside the unchanged coding/waiting", async () => {
+    resetPresenceVersionProbe();
+    const r = replying({ ok: true, tier: "pro" });
+    await withDirs((d) => sendPresence(CONFIG, r.fn, d, { coding: ["opencode"], waiting: false }, { agent: "opencode", pluginVersion: "2.5.3" }));
+    expect(JSON.parse(String(r.calls[0]!.init.body))).toEqual({ coding: ["opencode"], waiting: false, agent: "opencode", pluginVersion: "2.5.3" });
+  });
+
+  test("an older worker's 400 → resent at once without them, and left off until the re-probe", async () => {
+    resetPresenceVersionProbe();
+    const bodies: Record<string, unknown>[] = [];
+    const fn = (async (_url: string, init: RequestInit) => {
+      const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      bodies.push(body);
+      return "agent" in body ? new Response("{}", { status: 400 }) : Response.json({ ok: true, tier: "pro" });
+    }) as unknown as typeof fetch;
+    const v = { agent: "claude" as const, pluginVersion: "2.5.3" };
+    let now = 1_000;
+    await withDirs(async (d) => {
+      expect(await sendPresence(CONFIG, fn, d, { coding: [], waiting: false }, v, () => now)).toBe("pro");
+      expect(await sendPresence(CONFIG, fn, d, { coding: [], waiting: false }, v, () => now)).toBe("pro");
+      now += PRESENCE_VERSION_REPROBE_MS;
+      await sendPresence(CONFIG, fn, d, { coding: [], waiting: false }, v, () => now);
+    });
+    expect(bodies.map((b) => "agent" in b)).toEqual([true, false, false, true, false]);
   });
 });

@@ -54,7 +54,7 @@ import { LAN_SESSION_ID_RE, lanRunningUnderTest } from "./lan-wire";
 import type { LanReadWhat } from "./lan-wire";
 import { computeSessionState, parseCcSessionFile } from "./session-state";
 import type { CcSessionFile, SessionState } from "./session-state";
-import { DECISION_HOLD_SUFFIX, decisionHoldFileName, pidAlive, recordFullTextIsComplete, SESSIONS_DIR } from "./shared";
+import { DECISION_HOLD_SUFFIX, decisionHoldFileName, pickCarriedKeys, pidAlive, recordFullTextIsComplete, SESSIONS_DIR } from "./shared";
 import type { AgentKindWire, CCOp, DecisionHold, SessionRecord } from "./shared";
 
 const execFileP = promisify(execFile);
@@ -625,8 +625,10 @@ export function createLanFrameStore(deps: LanFrameStoreDeps = {}): LanFrameStore
       let value = blob.value;
       if (blob.carry) {
         try {
-          const { surface, replies } = await decryptBlob(e2eKey, blob.carry) as Record<string, unknown>;
-          value = { ...value, ...(surface !== undefined ? { surface } : {}), ...(replies !== undefined ? { replies } : {}) };
+          const c = await decryptBlob(e2eKey, blob.carry) as Record<string, unknown>;
+          // + OpenCode 2.x's keys (pickCarriedKeys): without them a LAN phone painted a failed or
+          // interrupted turn as a plain Done, flipping against the worker's frame.
+          value = { ...value, ...(c.surface !== undefined ? { surface: c.surface } : {}), ...pickCarriedKeys(c, value.status) };
         } catch { /* unreadable record blob: serve the authored state without receipts */ }
       }
       try { sealed = await encryptBlob(e2eKey, value); } catch { return false; }

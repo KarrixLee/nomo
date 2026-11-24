@@ -22,13 +22,13 @@
  */
 
 import { execFile, spawn } from "node:child_process";
-import { accessSync, constants, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { readReceipts } from "../core/antigravity-inbox";
 import { buildEnvelope, markDoneDelivered, trackSession } from "../core/hook";
 import {
-  atomicWrite, CC_DIR, Config, ensureWatchdog, folderIdentity, FolderIdentity, fullTextForRecord,
-  lastHookPath, loadConfig, postFullText, runtimeArgs, SessionOrigin, SESSIONS_DIR, WATCHDOG_PATH,
+  atomicWrite, Config, ensureWatchdog, folderIdentity, FolderIdentity, fullTextForRecord,
+  lastHookPath, loadConfig, postFullText, runtimeArgs, SessionOrigin, SESSIONS_DIR, WATCHDOG_PATH, WATCHDOG_PID_PATH,
 } from "../core/shared";
 import {
   ocDecisionRequest, OcDecisionRequest, ocPost, ocResolvedRequestId, ocResolveOnRelay, ocTrace, runOcApproval,
@@ -39,7 +39,7 @@ import {
   ocPromptResolved, ocPromptsEndedBy, ocRowHeld, OcState, ocUnattendedRoots, postOcEvent, reduceOcEvent,
 } from "./state";
 import {
-  OC_V2_EVENT_TYPES, ocClientCount, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope, ocWatchClients,
+  OC_V2_EVENT_TYPES, ocClientCount, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope, ocWatchClients, ocWatchdogServesUs, resolveRuntime,
 } from "./v2";
 
 /** The verified-live shape of OpenCode's `PluginInput` (1.18.15). Declared structurally rather than
@@ -86,22 +86,6 @@ interface OpenCodeHooks {
  *  Giving up is not cosmetic: the watchdog's `kill(pid,0)` sweep (~5s) is the ONLY thing that retires
  *  a row when the OpenCode server dies without a `dispose()` (a SIGKILL, a crash, a closed terminal).
  *  Without it the phone holds a working row until the worker's one-hour eviction. */
-function resolveRuntime(): string | undefined {
-  const env = process.env.NOMO_RUNTIME;
-  if (env && env.length > 0 && isExecutable(env)) return env;
-  try {
-    const cached = readFileSync(`${CC_DIR}/runtime`, "utf8").trim();
-    // run.sh writes a `NONE:<epoch>` sentinel when it found no runtime at all — that is a negative
-    // cache, not a path.
-    if (cached.length > 0 && !cached.startsWith("NONE:") && isExecutable(cached)) return cached;
-  } catch { /* no cache yet — a hook has never run on this machine */ }
-  return undefined;
-}
-
-function isExecutable(path: string): boolean {
-  try { accessSync(path, constants.X_OK); return true; } catch { return false; }
-}
-
 function spawnWatchdog(): void {
   const runtime = resolveRuntime();
   if (!runtime) return; // silence is the contract; the worker's eviction is the remaining backstop
@@ -122,7 +106,38 @@ let watchdogTrustedUntil = 0;
 /** The resident twin of a hook's bare `ensureWatchdog()` call — same guarantee, TTL'd. */
 function ensureWatchdogCached(now: number): void {
   if (now < watchdogTrustedUntil) return;
-  watchdogTrustedUntil = ensureWatchdog({ spawnWatchdog }) ? now + WATCHDOG_TRUST_MS : 0;
+  watchdogTrustedUntil = ensureWatchdogIfSpawnable() ? now + WATCHDOG_TRUST_MS : 0;
+}
+
+/** ensureWatchdog, but NEVER when this process could not start the replacement: its eviction SIGTERMs an
+ *  older daemon before spawning, and with no runtime that left no daemon at all until some hook started
+ *  the older one again — over and over (the 2.5.3 field churn, a new watchdog every ~20 s). */
+function ensureWatchdogIfSpawnable(): boolean {
+  return resolveRuntime() !== undefined && ensureWatchdog({ spawnWatchdog });
+}
+
+/** How often the idle guard looks. A phone command an OLDER daemon receives is dropped (it does not know
+ *  OpenCode's Reply/Interrupt), so this bounds that window; the phone re-sends a reply until it sees a
+ *  receipt, so a reply lands within about one interval of the older daemon being replaced. */
+const WATCHDOG_GUARD_MS = 15_000;
+
+/** NOM-213 field bug: an idle OpenCode 2.x session posts no frames, so the per-frame ensureWatchdog never
+ *  ran, and a watchdog spawned meanwhile by an OLDER plugin (Claude Code's marketplace copy often lags)
+ *  owned the command queue and dropped OpenCode-only commands. So while this plugin is resident, re-check
+ *  every WATCHDOG_GUARD_MS with the cheap test, and only when it fails pay for the full ensureWatchdog —
+ *  whose highest-version-wins rule evicts the older daemon (and an older plugin's hooks then leave this
+ *  one alone). Never throws. Returns `stop`. */
+function guardWatchdog(): () => void {
+  const timer = setInterval(() => {
+    try {
+      let raw: string | undefined;
+      try { raw = readFileSync(WATCHDOG_PID_PATH, "utf8"); } catch { /* no daemon */ }
+      if (ocWatchdogServesUs(raw)) return;
+      watchdogTrustedUntil = ensureWatchdogIfSpawnable() ? Date.now() + WATCHDOG_TRUST_MS : 0;
+    } catch { /* never into OpenCode */ }
+  }, WATCHDOG_GUARD_MS);
+  (timer as { unref?: () => void }).unref?.();
+  return () => clearInterval(timer);
 }
 
 /** How many OpenCode windows are attached to THIS server process — see ocClientCount. Async and
@@ -167,6 +182,7 @@ async function ocExtraFields(ctx: OcContext, frame: OcFrame): Promise<Record<str
     ...(frame.retryAt !== undefined ? { retryAt: frame.retryAt } : {}),
     ...(frame.retryReason ? { retryReason: frame.retryReason } : {}),
     ...(frame.outcome ? { outcome: frame.outcome } : {}),
+    ...(frame.outcomeReason ? { outcomeReason: frame.outcomeReason } : {}),
     ...(frame.bgAgents ? { bgAgents: frame.bgAgents } : {}),
     ...(Object.keys(replies).length > 0 ? { replies } : {}),
   };
@@ -383,6 +399,8 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
         close: () => void enqueue(async () => { for (const frame of ocCloseUnattended(ctx.state)) await send(ctx, frame); }),
       })
       : undefined;
+    // 2.x only (1.x has no OpenCode-only phone commands): keep a daemon that can serve them running.
+    const stopGuard = ctx.controls ? guardWatchdog() : undefined;
 
     return {
       event: async ({ event }) => {
@@ -410,6 +428,7 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
       dispose: async () => {
         try {
           stopWatching?.();
+          stopGuard?.();
           // Every pending question/permission is auto-rejected by OpenCode's own service finalizer at
           // shutdown, and it publishes no event for that — so the cards have to be retired from here or
           // they outlive the server that could have answered them.

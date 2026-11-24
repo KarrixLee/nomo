@@ -3,7 +3,10 @@ import { ocDecisionRequest, ocReplyFor, ocResolvedRequestId } from "./approvals"
 import plugin from "./plugin";
 import { newOcState, ocPromptAsked, ocPromptsEndedBy, reduceOcEvent } from "./state";
 import type { OcFrame, OcState } from "./state";
-import { OC_V2_EVENT_TYPES, ocClientCount, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope, ocWatchClients } from "./v2";
+import { OC_V2_EVENT_TYPES, ocClientCount, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope, ocErrorReason, ocWatchClients, ocWatchdogServesUs, resolveRuntime } from "./v2";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // -------------------------------------------------------------------------------------------------
 // THE FIXTURES ARE REAL. Each `data` below is a capture from a live OpenCode 2.4.1 TUI (`--standalone`,
@@ -485,5 +488,64 @@ describe("honest states (2.x only)", () => {
     for (const f of frames) {
       expect(f.retryAt ?? f.retryReason ?? f.phase ?? f.outcome ?? f.bgAgents).toBeUndefined();
     }
+  });
+});
+
+describe("ocWatchdogServesUs — the idle guard's cheap test (no ps, no hash)", () => {
+  const alive = (pid: number) => pid === 42;
+  test("a live daemon of this version, or a newer one, can serve our commands", () => {
+    expect(ocWatchdogServesUs("42 2.5.3 abc", alive, "2.5.3")).toBe(true);
+    expect(ocWatchdogServesUs("42 99.0.0 abc", alive, "2.5.3")).toBe(true);
+  });
+  test("an OLDER daemon (it drops OpenCode Reply/Interrupt), a dead one, none, or a pre-stamp one → full check", () => {
+    expect(ocWatchdogServesUs("42 2.5.1 abc", alive, "2.5.3")).toBe(false);
+    expect(ocWatchdogServesUs("7 2.5.3", alive, "2.5.3")).toBe(false);
+    expect(ocWatchdogServesUs(undefined, alive, "2.5.3")).toBe(false);
+    expect(ocWatchdogServesUs("42", alive, "2.5.3")).toBe(false);
+    expect(ocWatchdogServesUs("junk", alive, "2.5.3")).toBe(false);
+  });
+});
+
+describe("resolveRuntime — the resident plugin must be able to START the watchdog it evicts for", () => {
+  const exe = (path: string) => { mkdirSync(join(path, ".."), { recursive: true }); writeFileSync(path, "#!/bin/sh\n"); chmodSync(path, 0o755); };
+  test("no run.sh cache (its fast path never writes one): bun on PATH, then ~/.bun/bin", () => {
+    const root = mkdtempSync(join(tmpdir(), "oc-rt-"));
+    const cc = join(root, "cc");
+    exe(join(root, "pathbin", "bun"));
+    expect(resolveRuntime({ PATH: `relative:${join(root, "pathbin")}`, HOME: root }, cc)).toBe(join(root, "pathbin", "bun"));
+    exe(join(root, ".bun", "bin", "bun"));
+    expect(resolveRuntime({ PATH: "relative/only", HOME: root }, cc)).toBe(join(root, ".bun", "bin", "bun"));
+  });
+  test("NOMO_RUNTIME, then a positive cache, win over the probe; a NONE sentinel is not a path", () => {
+    const root = mkdtempSync(join(tmpdir(), "oc-rt-"));
+    const cc = join(root, "cc");
+    mkdirSync(cc);
+    exe(join(root, "forced"));
+    exe(join(root, "cached"));
+    writeFileSync(join(cc, "runtime"), join(root, "cached"));
+    expect(resolveRuntime({ NOMO_RUNTIME: join(root, "forced"), PATH: "", HOME: root }, cc)).toBe(join(root, "forced"));
+    expect(resolveRuntime({ PATH: "", HOME: root }, cc)).toBe(join(root, "cached"));
+    writeFileSync(join(cc, "runtime"), "NONE:1");
+    const fallback = resolveRuntime({ PATH: "", HOME: root }, cc);
+    expect(fallback === undefined || fallback.startsWith("/")).toBe(true); // only system candidates remain
+  });
+});
+
+describe("failed turns carry a short reason", () => {
+  test("execution.failed → outcome failed + outcomeReason; an interrupt has no reason", () => {
+    const state = newOcState(true);
+    fold(state, created(), started(), step());
+    const [failed] = fold(state, ev("session.execution.failed", { sessionID: S, error: { type: "ProviderAuthError", message: "Insufficient balance.\nSubscribe to OpenCode Go" } }, null));
+    expect(failed).toMatchObject({ outcome: "failed", outcomeReason: "Insufficient balance. Subscribe to OpenCode Go" });
+    fold(state, started(), step());
+    const [interrupted] = fold(state, ev("session.execution.interrupted", { sessionID: S, reason: "user" }, null));
+    expect(interrupted).toMatchObject({ outcome: "interrupted" });
+    expect(interrupted.outcomeReason).toBeUndefined();
+  });
+  test("ocErrorReason: message else type, one line, capped", () => {
+    expect(ocErrorReason({ type: "T", message: " a\n\tb " })).toBe("a b");
+    expect(ocErrorReason({ type: "OnlyType" })).toBe("OnlyType");
+    expect(ocErrorReason({})).toBeUndefined();
+    expect(ocErrorReason({ message: "x".repeat(400) })!.length).toBe(160);
   });
 });

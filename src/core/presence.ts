@@ -2,15 +2,16 @@
 //
 // Sent for EVERY pairing, Pro or free (status lines never depend on the tier being exactly right), from the
 // watchdog while it runs: at once when the state changes (an agent starts or stops coding, a prompt starts
-// or stops waiting), else every 60 s as a heartbeat. The body is exactly `{ coding, waiting }`: the agent
-// ids that have a turn open and one yes/no for "an agent is waiting for approval". No session ids, titles,
-// folders, commands or timing beyond the request itself. The reply carries the pairing's tier, which is
+// or stops waiting), else every 60 s as a heartbeat. The body is `{ coding, waiting }`: the agent ids that
+// have a turn open and one yes/no for "an agent is waiting for approval" — plus, since 2.5.3, one
+// `agent` + `pluginVersion` pair (see presenceVersion; dropped against a server that 400s them). No
+// session ids, titles, folders, commands or timing beyond the request itself. The reply carries the pairing's tier, which is
 // how the plugin learns a free → Pro flip (live sessions resume within a minute) or Pro → free.
 
 import { readdir, readFile } from "node:fs/promises";
 import {
   AgentKindWire, clearFreeMode, Config, FREE_MODE_PATH, isNotProResponse, loadConfig, markFreeMode,
-  PLUGIN_VERSION, SessionRecord, SESSIONS_DIR,
+  PLUGIN_VERSION, SessionRecord, SESSIONS_DIR, watchdogVersionOutranks,
 } from "./shared";
 
 /** Heartbeat while nothing changes (the server forgets a presence 180 s after the last one). */
@@ -41,6 +42,37 @@ export function buildPresence(records: SessionRecord[]): Presence {
   return { coding: [...coding].slice(0, MAX_CODING), waiting };
 }
 
+/** One agent's integration version for this POST (docs/plugin-versions-contract.md). */
+export interface PresenceVersion { agent: AgentKindWire; pluginVersion: string }
+
+/** Pure. Which agent's version this POST reports. The server takes ONE `agent` + `pluginVersion` per
+ *  presence POST and keeps each agent's for 7 days, so the watchdog — posting for every agent on this
+ *  computer — takes them in turn, one per heartbeat minute (all of them within a few minutes). The
+ *  version is the one each session's OWN integration stamped on its record (the highest, if two
+ *  sessions disagree), never this watchdog's. Undefined when no record names one (older integrations). */
+export function presenceVersion(records: SessionRecord[], now: number): PresenceVersion | undefined {
+  const best = new Map<AgentKindWire, string>();
+  for (const r of records) {
+    const v = r.pluginVersion;
+    if (typeof v !== "string" || v.length === 0) continue;
+    const agent = r.agent ?? "claude";
+    const held = best.get(agent);
+    if (held === undefined || watchdogVersionOutranks(v, held)) best.set(agent, v);
+  }
+  const agents = [...best.keys()].sort();
+  if (agents.length === 0) return undefined;
+  const agent = agents[Math.floor(now / PRESENCE_EVERY_MS) % agents.length]!;
+  return { agent, pluginVersion: best.get(agent)! };
+}
+
+/** A worker that predates per-agent versions answers a presence POST carrying them with 400 (its key
+ *  set is closed). Then: resend without them at once (a 400 stored nothing, so the 25 s gate does not
+ *  apply), and leave them off until this time (in-memory) before probing again. */
+let versionKeysRefusedUntil = 0;
+export const PRESENCE_VERSION_REPROBE_MS = 6 * 60 * 60_000;
+/** Test-only reset of the remembered refusal. */
+export function resetPresenceVersionProbe(): void { versionKeysRefusedUntil = 0; }
+
 async function readRecords(dir: string): Promise<SessionRecord[]> {
   const files = await readdir(dir).catch(() => [] as string[]);
   const out: SessionRecord[] = [];
@@ -69,19 +101,30 @@ export async function sendPresence(
   config: Config, fetchFn: typeof fetch = fetch,
   paths: { sessionsDir?: string; freeModePath?: string } = {},
   presence?: Presence,
+  version?: PresenceVersion,
+  now: () => number = Date.now,
 ): Promise<PresenceResult> {
   const freeModePath = paths.freeModePath ?? FREE_MODE_PATH;
   try {
     const p = presence ?? buildPresence(await readRecords(paths.sessionsDir ?? SESSIONS_DIR));
-    const res = await fetchFn(`${config.url}/v1/cc/presence`, {
+    const post = (withVersion: boolean) => fetchFn(`${config.url}/v1/cc/presence`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
         "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION,
       },
-      body: JSON.stringify({ coding: p.coding, waiting: p.waiting }),
+      body: JSON.stringify({
+        coding: p.coding, waiting: p.waiting,
+        ...(withVersion && version ? { agent: version.agent, pluginVersion: version.pluginVersion } : {}),
+      }),
       signal: AbortSignal.timeout(5000),
     });
+    const tryVersion = version !== undefined && now() >= versionKeysRefusedUntil;
+    let res = await post(tryVersion);
+    if (tryVersion && res.status === 400) {
+      versionKeysRefusedUntil = now() + PRESENCE_VERSION_REPROBE_MS;
+      res = await post(false);
+    }
     const text = await res.text().catch(() => "");
     let tier: unknown;
     if (res.ok) {
@@ -111,7 +154,7 @@ const EMPTY_KEY = JSON.stringify({ coding: [], waiting: false });
 export interface PresenceLoopDeps {
   load?: () => Promise<Config | null>;
   read?: () => Promise<SessionRecord[]>;
-  send?: (config: Config, presence: Presence) => Promise<PresenceResult>;
+  send?: (config: Config, presence: Presence, version?: PresenceVersion) => Promise<PresenceResult>;
   /** Every answer, for the watchdog's gone-strike bookkeeping. */
   onResult?: (result: PresenceResult) => void | Promise<void>;
   now?: () => number;
@@ -126,14 +169,14 @@ export interface PresenceLoopDeps {
 export function startPresenceLoop(deps: PresenceLoopDeps = {}): (clear?: boolean) => Promise<void> {
   const load = deps.load ?? loadConfig;
   const read = deps.read ?? (() => readRecords(SESSIONS_DIR));
-  const send = deps.send ?? ((config: Config, p: Presence) => sendPresence(config, fetch, {}, p));
+  const send = deps.send ?? ((config: Config, p: Presence, v?: PresenceVersion) => sendPresence(config, fetch, {}, p, v));
   const now = deps.now ?? Date.now;
   let sentKey: string | null = null;
   let lastAttemptAt = -Infinity;
   let busy: Promise<void> | null = null;
-  const attempt = async (config: Config, p: Presence, key: string) => {
+  const attempt = async (config: Config, p: Presence, key: string, v?: PresenceVersion) => {
     lastAttemptAt = now();
-    const result = await send(config, p);
+    const result = await send(config, p, v);
     if (result === "pro" || result === "free") sentKey = key;
     else if (result === "gone") sentKey = null; // retry at the gap: a real revoke reaches its 2nd strike fast
     await deps.onResult?.(result);
@@ -141,11 +184,12 @@ export function startPresenceLoop(deps: PresenceLoopDeps = {}): (clear?: boolean
   const tick = () => {
     if (busy) return;
     busy = (async () => {
-      const p = buildPresence(await read());
-      const key = JSON.stringify(p);
+      const records = await read();
+      const p = buildPresence(records);
+      const key = JSON.stringify(p); // the version rotation never triggers a POST of its own
       if (!presenceDue(key, sentKey, lastAttemptAt, now())) return;
       const config = await load();
-      if (config) await attempt(config, p, key);
+      if (config) await attempt(config, p, key, presenceVersion(records, now()));
     })().catch(() => { /* best-effort */ }).finally(() => { busy = null; });
   };
   const unschedule = deps.schedule?.(tick) ?? (() => {

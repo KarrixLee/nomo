@@ -244,6 +244,33 @@ function runtimeArgs(runtime, args) {
 function sidField(sessionId) {
   return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
 }
+function pickCarriedKeys(carried, status) {
+  const same = carried.status === status;
+  const keep = (k, when = true) => when && carried[k] !== undefined ? { [k]: carried[k] } : {};
+  return {
+    ...keep("controls"),
+    ...keep("phase", same && status === "working"),
+    ...keep("retryAt", same && status === "working"),
+    ...keep("retryReason", same && status === "working"),
+    ...keep("outcome", same && status === "done"),
+    ...keep("outcomeReason", same && status === "done"),
+    ...keep("bgAgents", same && status === "done"),
+    ...keep("replies")
+  };
+}
+async function carriedSessionKeys(record, e2eKey, status) {
+  if (record?.agent !== "opencode" || typeof record.blob !== "string" || record.blob.length === 0)
+    return {};
+  try {
+    return pickCarriedKeys(await decryptBlob(e2eKey, record.blob), status);
+  } catch {
+    return {};
+  }
+}
+function recordVersionField(record) {
+  const v = record?.pluginVersion;
+  return typeof v === "string" && v.length > 0 ? { pluginVersion: v } : {};
+}
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withPlan = appendFittedPlan(base, plan);
   if (typeof dbg !== "string" || dbg.length === 0)

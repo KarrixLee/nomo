@@ -30,7 +30,8 @@ App gates to flip, for `agent == .opencode`:
 | Always allow | `permissionProjectGrant` is non-empty (section 4) |
 
 The per-computer plugin version gate for these is **2.5.3**, but `controls` alone is enough: no
-older plugin sends it.
+older plugin sends it. Versions are per agent (`plugin-versions-contract.md`): gate on the session's own
+`pluginVersion`, never on the watchdog's.
 
 ## 2. Reply
 
@@ -51,6 +52,10 @@ Exactly the Antigravity wire (NOM-96):
   receipt arrives, as today; a repeated `mid` is delivered once.
 - While a permission card is held, the `d` receipt arrives with the session's next frame (after the
   card is answered).
+- A watchdog that can't route a message (2.5.3+) answers `x` at once. A watchdog from an older plugin
+  (one that lacks this feature) drops it silently. The resident OpenCode plugin replaces such a watchdog
+  within about 15 s, even while idle, and the phone's re-send (same `mid`) then gets through. So keep
+  re-sending until a receipt arrives, as today.
 
 ## 3. Interrupt
 
@@ -98,6 +103,7 @@ Exactly the existing command: `interrupt-session` `{kind, sessionId, ts, nonce}`
 | `retryReason` | `"rateLimited"` | with `retryAt` | the provider said 429 / rate limit ("Retrying (rate limited)") |
 | `phase` | `"compacting"` | `working` | OpenCode is summarizing the context ("Compacting") |
 | `outcome` | `"failed"` \| `"interrupted"` | `done` | the turn did not succeed ("Failed" / "Interrupted"); absent = succeeded |
+| `outcomeReason` | String, one line, ≤ 160 chars | `done` with `outcome: "failed"` | the provider's error message, when OpenCode gives one (e.g. "Insufficient balance…") |
 | `bgAgents` | Int > 0 | `done` | background subagents of this session still running ("Idle · 2 subagents running") |
 
 - `detail` is unchanged (`"retrying"` still renders "Reconnecting…" on older apps), and no new
@@ -107,10 +113,26 @@ Exactly the existing command: `interrupt-session` `{kind, sessionId, ts, nonce}`
 - Per the transient-failure rule, show `retrying` in amber/positive copy; `outcome: "failed"` is a
   finished state, not a transient.
 
-## 7. Key order (sealed blob)
+## 7. Every frame source carries them
 
-Base keys, then `controls`, `phase`, `retryAt`, `retryReason`, `outcome`, `bgAgents`, `replies`,
-then the fitted `plan`. On the card: the existing permission tail, `permissionGrant`, then
+A row can be painted from several frames for the same state. The plugin's own frame (worker), the
+watchdog's heartbeat (the record's blob verbatim), the watchdog's correctives (done / needsAttention /
+working / title repair, rebuilt from the record), the LAN state frame (done rows are rebuilt from the
+record), and the hold card with its plain fallback. All of them now carry the same keys:
+- `controls` and `replies` on every frame of the session.
+- `outcome`, `outcomeReason` and `bgAgents` on done frames.
+- `phase`, `retryAt` and `retryReason` on working frames.
+- `permissionProjectGrant` on the card.
+
+A rebuilt frame takes a per-state key only when the record's own blob is the same state, so a
+corrective done never inherits a stale working key. **App side:** the app's own local re-seal (the
+island's `a:roll` frame, `ClaudeCodeActivitySync.blobPlaintext`) must thread these keys too, or the
+island flips between "Interrupted" and "Done" (the two-frame-source trap).
+
+## 8. Key order (sealed blob)
+
+Base keys, then `controls`, `phase`, `retryAt`, `retryReason`, `outcome`, `outcomeReason`, `bgAgents`,
+`replies`, then the fitted `plan`. On the card: the existing permission tail, `permissionGrant`, then
 `permissionProjectGrant`, `controls`.
 
 ## Not possible on OpenCode 2.x (unchanged)

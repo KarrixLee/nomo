@@ -5013,3 +5013,52 @@ describe("free mode in the watchdog", () => {
     expect(seen).toEqual(["https://relay.test/v1/cc/full"]);
   });
 });
+
+// 2.5.3: per-agent plugin versions. A watchdog rebuilding a session's blob restates the version the
+// session's OWN integration stamped on its record — never its own (docs/plugin-versions-contract.md).
+describe("every rebuilt frame keeps OpenCode 2.x's append-last keys (no two-source flip)", () => {
+  const ALL = {
+    controls: ["reply", "interrupt", "denyNote"], phase: "compacting", retryAt: 9, retryReason: "rateLimited",
+    outcome: "interrupted", outcomeReason: "r", bgAgents: 2, replies: { "mid-aaaaaaaa": "d" },
+  };
+  const rec = async (status: string, agent = "opencode") =>
+    ({ pid: 1, machine: "m", label: "l", ts: 1, title: "t", agent, blob: await encryptBlob(KEY, { status, ...ALL }) }) as SessionRecord;
+  const open = async (env: unknown) => await decryptBlob(KEY, (env as { blob: string }).blob) as Record<string, unknown>;
+  const pick = (o: Record<string, unknown>) => Object.fromEntries(Object.keys(ALL).filter((k) => k in o).map((k) => [k, o[k]]));
+
+  test("done keeps the done keys; working keeps the working keys; attention keeps only session-level ones", async () => {
+    expect(pick(await open(await buildDoneEnvelope("ses_1", await rec("done"), 1, KEY, "opencode")))).toEqual({
+      controls: ALL.controls, outcome: "interrupted", outcomeReason: "r", bgAgents: 2, replies: ALL.replies,
+    });
+    expect(pick(await open(await buildWorkingEnvelope("ses_1", await rec("working"), 1, KEY, "opencode")))).toEqual({
+      controls: ALL.controls, phase: "compacting", retryAt: 9, retryReason: "rateLimited", replies: ALL.replies,
+    });
+    expect(pick(await open(await buildNeedsAttentionEnvelope("ses_1", await rec("needsAttention"), 1, KEY, "opencode")))).toEqual({
+      controls: ALL.controls, replies: ALL.replies,
+    });
+  });
+  test("a corrective done over a WORKING blob inherits no outcome; the heartbeat is the record blob verbatim", async () => {
+    expect(pick(await open(await buildDoneEnvelope("ses_1", await rec("working"), 1, KEY, "opencode")))).toEqual({
+      controls: ALL.controls, replies: ALL.replies,
+    });
+    const r = { ...(await rec("done")), pairingId: "p" } as SessionRecord;
+    const hb = buildHeartbeatEnvelope("ses_1", r, 1, "p") as { blob: string } | null;
+    expect(hb?.blob).toBe(r.blob);
+  });
+  test("other agents' rebuilt blobs stay byte-identical (nothing carried)", async () => {
+    expect(pick(await open(await buildDoneEnvelope("s", await rec("done", "claude"), 1, KEY)))).toEqual({});
+  });
+});
+
+describe("rebuilt blobs carry the session's own integration version", () => {
+  const base = { pid: 1, machine: "m", label: "l", ts: 1, title: "t" } as SessionRecord;
+  test("done / needsAttention restate record.pluginVersion; a record from an older integration has none", async () => {
+    const withV = { ...base, agent: "opencode", pluginVersion: "2.4.0" } as SessionRecord;
+    const done = await buildDoneEnvelope("ses_1", withV, 1, KEY, "opencode") as { blob: string };
+    expect((await decryptBlob(KEY, done.blob) as Record<string, unknown>).pluginVersion).toBe("2.4.0");
+    const attn = await buildNeedsAttentionEnvelope("ses_1", withV, 1, KEY, "opencode") as { blob: string };
+    expect((await decryptBlob(KEY, attn.blob) as Record<string, unknown>).pluginVersion).toBe("2.4.0");
+    const old = await buildDoneEnvelope("s2", base, 1, KEY) as { blob: string };
+    expect(await decryptBlob(KEY, old.blob)).not.toHaveProperty("pluginVersion");
+  });
+});
