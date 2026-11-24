@@ -76,7 +76,8 @@ export async function loadMachineId(path: string): Promise<string> {
 interface Row {
   d: string; a: ActivityAgent; s: number; t: number; bits: Uint8Array; u: Record<string, Tokens>;
   k?: Set<string>; ss?: Set<string>; // present ⇔ hot
-  ko?: Record<string, number>; // hot only: output counted per CC assistant id hash (see addEvent)
+  // hot only: [o, r] counted per CC assistant id hash (see grow). A bare number (2.4.x–2.5.1) is o alone.
+  ko?: Record<string, number | [number, number]>;
 }
 /** lastPairing = the pairingId the last upload went to; the relay keeps the blob PER PAIRING.
  *  lastVersion = the PLUGIN_VERSION that made it ("" in older files = treated as a different version). */
@@ -94,32 +95,33 @@ export function localDate(ts: number): string {
 }
 
 /** Fold one event in. Returns whether it counted (false = duplicate, frozen day or bad ts).
- *  CC writes one line per content block of a message, repeating message.id+requestId; output_tokens
- *  only GROWS on the later lines (the rest is identical). So a repeated CC id with more output adds the
- *  difference, tracked in `ko` — idempotent across re-reads and lines split across scans. */
+ *  CC writes one line per content block of a message, repeating message.id+requestId; output (and its
+ *  reasoning part) only GROWS on the later lines (the rest is identical). So a repeated CC id adds the
+ *  growth, tracked in `ko` — idempotent across re-reads and lines split across scans. The lines of one
+ *  message can straddle local midnight: the id is looked up on the neighbouring days too, so it counts
+ *  once, on the day of the line seen first. */
 export function addEvent(state: State, ev: ActivityEvent): boolean {
   // A finite ts can still be past Date's range (±8.64e15): localDate would then be "NaN-NaN-NaN" and the
   // row would be uploaded forever. Refused here for every agent.
   if (!Number.isFinite(ev.ts) || Number.isNaN(new Date(ev.ts).getTime())) return false;
+  const t = new Date(ev.ts);
   const d = localDate(ev.ts);
+  const id = h12(ev.id);
   const key = `${d}|${ev.agent}`;
   let row = state.rows.get(key);
+  if (row?.k?.has(id)) return grow(row, id, ev);
+  for (const step of [-1, 1]) { // calendar neighbours (noon: safe across DST)
+    const nb = state.rows.get(`${localDate(new Date(t.getFullYear(), t.getMonth(), t.getDate() + step, 12).getTime())}|${ev.agent}`);
+    if (nb?.k?.has(id)) return grow(nb, id, ev);
+  }
   if (!row) {
     row = { d, a: ev.agent, s: 0, t: 0, bits: new Uint8Array(36), u: {}, k: new Set(), ss: new Set(), ko: {} };
     state.rows.set(key, row);
   }
   if (!row.k || !row.ss) return false; // frozen
-  const id = h12(ev.id);
   const model = ev.model || "unknown";
-  if (row.k.has(id)) {
-    const prev = row.ko?.[id];
-    if (prev === undefined || !ev.tokens || ev.tokens.o <= prev) return false;
-    (row.u[model] ??= { i: 0, o: 0, cw: 0, cr: 0 }).o += ev.tokens.o - prev;
-    row.ko![id] = ev.tokens.o;
-    return true;
-  }
   row.k.add(id);
-  if (ev.agent === "claude" && ev.tokens) (row.ko ??= {})[id] = ev.tokens.o;
+  if (ev.agent === "claude" && ev.tokens) (row.ko ??= {})[id] = [ev.tokens.o, ev.tokens.r ?? 0];
   if (ev.sessionId) { row.ss.add(h12(ev.sessionId)); row.s = row.ss.size; }
   if (ev.kind === "turn") row.t++;
   if (ev.tokens) {
@@ -127,9 +129,25 @@ export function addEvent(state: State, ev: ActivityEvent): boolean {
     m.i += ev.tokens.i; m.o += ev.tokens.o; m.cw += ev.tokens.cw; m.cr += ev.tokens.cr;
     if (ev.tokens.r) m.r = (m.r ?? 0) + ev.tokens.r;
   }
-  const t = new Date(ev.ts);
   const slot = t.getHours() * 12 + Math.floor(t.getMinutes() / 5); // 0..287, MSB-first in each byte
   row.bits[slot >> 3] |= 0x80 >> (slot & 7);
+  return true;
+}
+
+/** A repeated id on a hot row: only a CC assistant line can carry more (output, reasoning); any other
+ *  repeat is a duplicate. With no baseline for a part — an id counted by 2.3.6 (no `ko`), or a bare
+ *  number from 2.4.x–2.5.1 (no reasoning) — this line becomes it: a re-read starts at the top of the
+ *  file, and the top line is what was counted then. */
+function grow(row: Row, id: string, ev: ActivityEvent): boolean {
+  if (ev.agent !== "claude" || !ev.tokens) return false;
+  const o = ev.tokens.o, r = ev.tokens.r ?? 0;
+  const prev = row.ko?.[id];
+  const [po, pr] = Array.isArray(prev) ? prev : [prev ?? o, r];
+  (row.ko ??= {})[id] = [Math.max(o, po), Math.max(r, pr)];
+  if (o <= po && r <= pr) return false;
+  const m = (row.u[ev.model || "unknown"] ??= { i: 0, o: 0, cw: 0, cr: 0 });
+  if (o > po) m.o += o - po;
+  if (r > pr) m.r = (m.r ?? 0) + r - pr;
   return true;
 }
 

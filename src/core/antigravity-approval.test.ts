@@ -5,7 +5,7 @@
 import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, setDefaultTimeout } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
   ANTIGRAVITY_STOP_DENY, ANTIGRAVITY_APPROVAL_MATCHER, ANTIGRAVITY_APPROVAL_TIMEOUT_S, ANTIGRAVITY_ENTRY_CAP_MS, ANTIGRAVITY_FALLBACK,
@@ -15,6 +15,9 @@ import { encryptBlob } from "./crypto";
 import { SAFE_SKILL_COMMANDS, skillCommand } from "../../plugin/scripts/antigravity-skill-command.mjs";
 import type { Config } from "./shared";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
+
+// These spawn real hook processes; under a loaded full `bun test` run they can outlast bun's 5 s default.
+setDefaultTimeout(30_000);
 
 const { spawnTestProcess } = createProcessHygiene();
 const PLUGIN = join(import.meta.dir, "../../plugin");

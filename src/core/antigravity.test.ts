@@ -6,7 +6,7 @@ import { chmod, cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, wr
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, setDefaultTimeout } from "bun:test";
 import { execFileSync } from "node:child_process";
 import {
   adapterFor, antigravityAdapter, antigravityChatTitle, antigravityDataDirFor, antigravityFirstPrompt, antigravityRunStatus,
@@ -24,6 +24,9 @@ import {
 import { markNudged, writeReceipt } from "./antigravity-inbox";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 import { plainAge, statusCmd } from "../entries/status-cmd";
+
+// These spawn real hook processes; under a loaded full `bun test` run they can outlast bun's 5 s default.
+setDefaultTimeout(30_000);
 
 const { spawnTestProcess } = createProcessHygiene();
 const PLUGIN = join(import.meta.dir, "../../plugin");

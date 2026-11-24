@@ -12,7 +12,10 @@ import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
 const { spawnTestProcess } = createProcessHygiene();
 const driver = join(import.meta.dir, "../test/opencode-plugin-driver.ts");
 
-async function replay(scenario: { hold: boolean; gateFirstEvent?: boolean; steps: unknown[] }): Promise<string[]> {
+async function replay(scenario: {
+  hold: boolean; gateFirstEvent?: boolean; steps: unknown[]; v2?: boolean; answer?: string;
+  sessions?: Record<string, unknown>;
+}): Promise<string[]> {
   const home = await mkdtemp(join(tmpdir(), "oc-plugin-"));
   try {
     const proc = spawnTestProcess({
@@ -91,5 +94,87 @@ describe("a hold the worker never granted", () => {
     expect(log.filter((entry) => entry.startsWith("TIMEOUT"))).toEqual([]);
     expect(log).toContain("event update needsAttention");
     expect(log.indexOf("event update needsAttention")).toBeGreaterThan(log.indexOf("decision"));
+  }, 30000);
+});
+
+// OpenCode 2.x: the same plugin through its `setup` entry — a scripted `ctx.event.subscribe` stream in
+// the live-captured 2.4.1 shapes (execution.* and permission.replied carry no location), replies through
+// `ctx.permission.reply`.
+describe("OpenCode 2.x through setup()", () => {
+  const D = "/tmp/oc-driver";
+  const v2 = (type: string, data: Record<string, unknown>, located = true) =>
+    ({ ev: { id: "evt_x", created: 1_795_478_135_943, type, ...(located ? { location: { directory: D } } : {}), data } });
+  const created2 = v2("session.created", { sessionID: S, agent: "build", model: { id: "m", providerID: "p" } });
+  const started2 = v2("session.execution.started", { sessionID: S }, false);
+  const succeeded2 = v2("session.execution.succeeded", { sessionID: S }, false);
+  const asked2 = v2("permission.asked", {
+    id: "per_2", sessionID: S, action: "shell", resources: ["ls -la"], save: ["ls *"],
+    source: { type: "tool", messageID: "msg_1", id: "call_1" },
+  });
+
+  test("a turn opens and closes the row; a foreign directory's events are dropped", async () => {
+    const log = await replay({
+      v2: true, hold: true,
+      steps: [
+        { ev: { id: "evt_y", created: 1, type: "session.created", location: { directory: "/elsewhere" }, data: { sessionID: "ses_far" } } },
+        { ev: { id: "evt_z", created: 1, type: "session.execution.started", data: { sessionID: "ses_far" } } },
+        created2, started2, waitFor("event start"), succeeded2, waitFor("event done"),
+      ],
+    });
+    expect(log.filter((entry) => entry.startsWith("TIMEOUT"))).toEqual([]);
+    expect(log.slice(0, 2)).toEqual(["event start working", "event done done"]);
+  }, 30000);
+
+  test("a phone Allow answers through ctx.permission.reply on a shell card with no Always allow", async () => {
+    const log = await replay({
+      v2: true, hold: true, answer: "allow",
+      steps: [created2, started2, waitFor("event start"), asked2, waitFor("reply")],
+    });
+    expect(log.filter((entry) => entry.startsWith("TIMEOUT"))).toEqual([]);
+    expect(log).toContain('card shell grant=""');
+    expect(log).toContain(`reply ${S} per_2 once`);
+  }, 30000);
+
+  test("a phone Deny is a reject", async () => {
+    const log = await replay({
+      v2: true, hold: true, answer: "deny",
+      steps: [created2, started2, waitFor("event start"), asked2, waitFor("reply")],
+    });
+    expect(log).toContain(`reply ${S} per_2 reject`);
+  }, 30000);
+
+  test("a question form is never held: the row asks to answer at the Mac, then goes back to working", async () => {
+    const log = await replay({
+      v2: true, hold: true,
+      steps: [
+        created2, started2, waitFor("event start"),
+        v2("form.created", { form: { id: "frm_1", sessionID: S, title: "Questions", fields: [{ key: "q0", type: "string" }] } }),
+        waitFor("event update needsAttention"),
+        v2("form.replied", { id: "frm_1", sessionID: S, answer: { q0: "Red" } }),
+        waitFor("event update working"),
+      ],
+    });
+    expect(log.filter((entry) => entry.startsWith("TIMEOUT"))).toEqual([]);
+    expect(log).not.toContain("decision");
+    expect(log.indexOf("event update working")).toBeGreaterThan(log.indexOf("event update needsAttention"));
+  }, 30000);
+
+  test("a session first met mid-flight is looked up: ours opens a row, a subagent or another folder does not", async () => {
+    const log = await replay({
+      v2: true, hold: true,
+      sessions: {
+        [S]: { id: S, title: "Old work", location: { directory: D }, time: { created: 1_700_000_000_000 } },
+        ses_sub: { id: "ses_sub", parentID: S, location: { directory: D }, time: { created: 1 } },
+        ses_far: { id: "ses_far", location: { directory: "/elsewhere" }, time: { created: 1 } },
+      },
+      steps: [
+        v2("session.execution.started", { sessionID: "ses_far" }, false),
+        v2("session.execution.started", { sessionID: "ses_sub" }, false),
+        v2("session.execution.started", { sessionID: "ses_gone" }, false), // lookup throws: dropped
+        started2, waitFor("event start"), succeeded2, waitFor("event done"),
+      ],
+    });
+    expect(log.filter((entry) => entry.startsWith("TIMEOUT"))).toEqual([]);
+    expect(log.slice(0, 2)).toEqual(["event start working", "event done done"]);
   }, 30000);
 });

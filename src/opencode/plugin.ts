@@ -11,7 +11,10 @@
  *  specifier gets the cached failure). So this module does NO work at load: it declares functions and
  *  a default export, and every side effect lives inside `server()`/the hooks, each wrapped. The legacy
  *  loader also throws `TypeError` on any non-function NAMED export, so the module exports exactly one
- *  thing: the `{id, server}` default.
+ *  thing: the `{id, server, setup}` default.
+ *
+ *  ONE FILE, BOTH MAJORS. OpenCode 1.x reads `server` and ignores `setup`; 2.x rejects a default without
+ *  `setup` (or `effect`) and ignores `server`. `setup` adapts the 2.x context onto `server()` — see v2.ts.
  *
  *  UNPAIRED IS THE COMMON CASE. `loadConfig()` returning null (no `~/.config/cc-status/config.json`)
  *  means this machine was never paired with the phone; we return `{}` and cost the user nothing.
@@ -33,6 +36,7 @@ import {
   newOcState, ocEndFrames, ocForgetStatusFrame, OcFrame, ocPromptAsked, ocPromptFrame, ocPromptHeld,
   ocPromptResolved, ocPromptsEndedBy, ocRowHeld, OcState, postOcEvent, reduceOcEvent,
 } from "./state";
+import { OC_V2_EVENT_TYPES, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope } from "./v2";
 
 /** The verified-live shape of OpenCode's `PluginInput` (1.18.15). Declared structurally rather than
  *  imported from `@opencode-ai/plugin`, which is not a dependency of this repo (the plugin ships as a
@@ -49,6 +53,9 @@ interface OpenCodePluginInput {
    *  fabricates `http://localhost:4096` whenever there is no TCP listener, which is every TUI session.
    *  Never reach for it without reading `ocPost` first — it is a fallback, not a route. */
   serverUrl?: unknown;
+  /** OpenCode 2.x only (set by `setup`): its questions are forms, which no plugin route can answer, so a
+   *  question is shown as "answer at your Mac" and never held. Absent on 1.x, which keeps holding. */
+  questionsOnComputer?: boolean;
 }
 
 interface OpenCodeHooks {
@@ -253,7 +260,8 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
       // Mac") instead of sitting on working while OpenCode waits on a human. It gets no Allow/Deny
       // card — the hold machinery (marker, record, settle) is keyed by the session that asked, and
       // that session has no row. The same plain attention covers a server we have no reply route to.
-      if (!canReply || ctx.state.children.has(request.sessionID)) { void repaint(request.sessionID); return; }
+      if (!canReply || (request.kind === "question" && input?.questionsOnComputer === true)
+        || ctx.state.children.has(request.sessionID)) { void repaint(request.sessionID); return; }
       const requestId = crypto.randomUUID();
       holds.set(request.id, requestId);
       ocPromptHeld(ctx.state, request.id, true);
@@ -345,4 +353,103 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
   }
 };
 
-export default { id: "nomo", server };
+/** The verified 2.x plugin context (v2.4.1 `@opencode/plugin` promise `Context`), structurally — the
+ *  four members this plugin touches. */
+interface OpenCodeV2Context {
+  location?: { directory?: unknown };
+  session?: { get?: (input: { sessionID: string }) => Promise<unknown> };
+  event?: { subscribe?: (options: { types: readonly string[]; signal: AbortSignal }) => AsyncIterable<unknown> };
+  permission?: { reply?: (input: { sessionID: string; requestID: string; decision: string }) => Promise<unknown> };
+}
+
+/** OpenCode 2.x entry. Runs `server()` with the 2.x reply seam dressed as a 1.x client, then pumps the
+ *  2.x event stream through the translator into the very same `event` hook. MUST NOT await the pump:
+ *  OpenCode awaits `setup` while loading plugins, and the stream never ends on its own. Returns the
+ *  cleanup OpenCode calls on unload (dispose + stop the pump). */
+const setup = async (ctx: OpenCodeV2Context): Promise<(() => Promise<void>) | undefined> => {
+  try {
+    const subscribe = ctx?.event?.subscribe;
+    const reply = ctx?.permission?.reply;
+    if (typeof subscribe !== "function") return undefined;
+    const directory = typeof ctx.location?.directory === "string" && ctx.location.directory.length > 0
+      ? ctx.location.directory
+      : undefined;
+    /** permission requestID → its session, because the 2.x reply needs both. */
+    const sessions = new Map<string, string>();
+    /** Sessions that are ours / another directory's — see ocV2Scope. */
+    const known = new Set<string>();
+    const foreign = new Set<string>();
+    const getSession = ctx.session?.get;
+    const hooks = await server({
+      directory,
+      client: typeof reply === "function"
+        ? ocV2Client((i) => reply.call(ctx.permission, i), (id) => sessions.get(id))
+        : undefined,
+      questionsOnComputer: true,
+    });
+    const onEvent = hooks.event;
+    if (!onEvent) return undefined; // not paired — no subscription, nothing to clean up
+
+    const abort = new AbortController();
+    /** A session we have never seen: look it up once. Ours → replay its `session.created` first (parent,
+     *  title, start); elsewhere → remember that. A failed lookup falls back to the event's own location. */
+    const adopt = async (event: unknown, sessionID: string): Promise<boolean> => {
+      let info: Record<string, unknown> | undefined;
+      try {
+        const got = typeof getSession === "function" ? await getSession.call(ctx.session, { sessionID }) : undefined;
+        // The promise adapter hands back the Session.Info itself (seen live on 2.4.1), though the HTTP
+        // route wraps it in `{data}` — take either.
+        const record = got as { id?: unknown; data?: Record<string, unknown> } | undefined;
+        info = record?.id !== undefined ? record as Record<string, unknown> : record?.data;
+      } catch { /* not found / not reachable — decided below */ }
+      const at = (info?.location as { directory?: unknown } | undefined)?.directory
+        ?? (event as { location?: { directory?: unknown } }).location?.directory;
+      if (typeof at !== "string" || (directory !== undefined && at !== directory)) { foreign.add(sessionID); return false; }
+      known.add(sessionID);
+      foreign.delete(sessionID);
+      if (info && (event as { type?: unknown }).type !== "session.deleted") {
+        for (const replayed of ocV1Backfill(sessionID, info)) void onEvent({ event: replayed });
+      }
+      return true;
+    };
+    const dispatch = async (event: unknown): Promise<void> => {
+      const scope = ocV2Scope(event, directory, known, foreign);
+      if (scope === "theirs") return;
+      const e = event as { type?: unknown; data?: { id?: unknown; requestID?: unknown; sessionID?: unknown; form?: { sessionID?: unknown } } };
+      if (scope === "ask") {
+        // Awaited, so this session's next events wait behind its replayed `session.created`. Once per
+        // new session, and in-process, so the stream never backs up on it.
+        const sessionID = e.data?.sessionID ?? e.data?.form?.sessionID;
+        if (typeof sessionID !== "string" || !await adopt(event, sessionID)) return;
+      }
+      if (e.type === "permission.asked" && typeof e.data?.id === "string" && typeof e.data.sessionID === "string") {
+        sessions.set(e.data.id, e.data.sessionID);
+      } else if (e.type === "permission.replied" && typeof e.data?.requestID === "string") {
+        sessions.delete(e.data.requestID);
+      }
+      // NOT awaited, exactly like OpenCode 1.x's `void hook.event(...)`: the hook folds state
+      // synchronously and orders its sends on its own chain, and a slow reader overflows the 2.x stream.
+      for (const translated of ocV1Events(event)) void onEvent({ event: translated });
+    };
+    void (async () => {
+      // A failed stream (overflow, reload) is resubscribed; the events in between are lost, which the
+      // reducer already tolerates (it adopts sessions it first sees mid-flight).
+      while (!abort.signal.aborted) {
+        try {
+          for await (const event of subscribe.call(ctx.event, { types: OC_V2_EVENT_TYPES, signal: abort.signal })) {
+            try { await dispatch(event); } catch { /* one malformed event must never break the stream */ }
+          }
+        } catch { /* fall through to the resubscribe */ }
+        if (!abort.signal.aborted) await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    })();
+    return async () => {
+      abort.abort();
+      await hooks.dispose?.();
+    };
+  } catch {
+    return undefined; // a broken init must never take the editor down with it
+  }
+};
+
+export default { id: "nomo", server, setup };

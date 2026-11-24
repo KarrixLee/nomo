@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, setDefaultTimeout } from "bun:test";
 import {
   agyBinary, ANTIGRAVITY_REPLY_NUDGE, antigravitySurface, cancelReply, confirmResume, enqueueReply, handleReplyCommand,
   hasQueuedReplies, pruneStaleReplies, readReceipts, receiptOf, REPLY_PHONE_GIVE_UP_MS, REPLY_RECEIPTS_MAX,
@@ -17,6 +17,9 @@ import { decryptBlob, encryptBlob } from "./crypto";
 import { Config, SessionRecord, writeInterruptFlagAt } from "./shared";
 import { classifySession, correctIdleClaude, drainCommands, publishReplyReceipts, resetCommandState } from "../entries/cc-watchdog";
 import { createProcessHygiene, isolatedTestEnv } from "../test/process-hygiene";
+
+// These spawn real hook processes; under a loaded full `bun test` run they can outlast bun's 5 s default.
+setDefaultTimeout(30_000);
 
 const { spawnTestProcess } = createProcessHygiene();
 const PLUGIN = join(import.meta.dir, "../../plugin");

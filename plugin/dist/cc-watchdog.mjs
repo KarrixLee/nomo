@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.5.1";
+var PLUGIN_VERSION = "2.5.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -9747,28 +9747,28 @@ function localDate(ts) {
 function addEvent(state, ev) {
   if (!Number.isFinite(ev.ts) || Number.isNaN(new Date(ev.ts).getTime()))
     return false;
+  const t = new Date(ev.ts);
   const d = localDate(ev.ts);
+  const id = h12(ev.id);
   const key = `${d}|${ev.agent}`;
   let row = state.rows.get(key);
+  if (row?.k?.has(id))
+    return grow(row, id, ev);
+  for (const step of [-1, 1]) {
+    const nb = state.rows.get(`${localDate(new Date(t.getFullYear(), t.getMonth(), t.getDate() + step, 12).getTime())}|${ev.agent}`);
+    if (nb?.k?.has(id))
+      return grow(nb, id, ev);
+  }
   if (!row) {
     row = { d, a: ev.agent, s: 0, t: 0, bits: new Uint8Array(36), u: {}, k: new Set, ss: new Set, ko: {} };
     state.rows.set(key, row);
   }
   if (!row.k || !row.ss)
     return false;
-  const id = h12(ev.id);
   const model = ev.model || "unknown";
-  if (row.k.has(id)) {
-    const prev = row.ko?.[id];
-    if (prev === undefined || !ev.tokens || ev.tokens.o <= prev)
-      return false;
-    (row.u[model] ??= { i: 0, o: 0, cw: 0, cr: 0 }).o += ev.tokens.o - prev;
-    row.ko[id] = ev.tokens.o;
-    return true;
-  }
   row.k.add(id);
   if (ev.agent === "claude" && ev.tokens)
-    (row.ko ??= {})[id] = ev.tokens.o;
+    (row.ko ??= {})[id] = [ev.tokens.o, ev.tokens.r ?? 0];
   if (ev.sessionId) {
     row.ss.add(h12(ev.sessionId));
     row.s = row.ss.size;
@@ -9784,9 +9784,24 @@ function addEvent(state, ev) {
     if (ev.tokens.r)
       m.r = (m.r ?? 0) + ev.tokens.r;
   }
-  const t = new Date(ev.ts);
   const slot = t.getHours() * 12 + Math.floor(t.getMinutes() / 5);
   row.bits[slot >> 3] |= 128 >> (slot & 7);
+  return true;
+}
+function grow(row, id, ev) {
+  if (ev.agent !== "claude" || !ev.tokens)
+    return false;
+  const o = ev.tokens.o, r = ev.tokens.r ?? 0;
+  const prev = row.ko?.[id];
+  const [po, pr] = Array.isArray(prev) ? prev : [prev ?? o, r];
+  (row.ko ??= {})[id] = [Math.max(o, po), Math.max(r, pr)];
+  if (o <= po && r <= pr)
+    return false;
+  const m = row.u[ev.model || "unknown"] ??= { i: 0, o: 0, cw: 0, cr: 0 };
+  if (o > po)
+    m.o += o - po;
+  if (r > pr)
+    m.r = (m.r ?? 0) + r - pr;
   return true;
 }
 function freeze(state, now) {

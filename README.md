@@ -318,10 +318,17 @@ real installs never set it, and anything that can set your agent's environment c
 ### OpenCode plugin
 
 - One resident module inside OpenCode's server process; it must never throw, block, print or install
-  process-wide signal handlers. It answers `permission.asked` (Allow / Always / Deny) and
-  `question.asked`. **Always** is OpenCode's own `always` reply: it allows the request's `always`
-  patterns (e.g. `git status *`, or `*` for every edit) for that project **until OpenCode restarts**,
-  across its sessions — OpenCode keeps the rule in memory, never on disk.
+  process-wide signal handlers. One file serves OpenCode 1.x (`server`) and 2.x (`setup`).
+- **OpenCode 1.x:** it answers `permission.asked` (Allow / Always / Deny) and `question.asked`.
+  **Always** is OpenCode's own `always` reply: it allows the request's `always` patterns (e.g.
+  `git status *`, or `*` for every edit) for that project **until OpenCode restarts**, across its
+  sessions — OpenCode keeps the rule in memory, never on disk.
+- **OpenCode 2.x:** it answers permissions with Allow / Deny only, through OpenCode's in-process
+  `ctx.permission.reply`. The phone offers **no Always**: 2.x saves an `always` rule to the project on
+  disk, where it outlives restarts, so the phone never sends one (a stale card's Always is sent as a
+  one-time allow). Questions are 2.x forms, which plugins have no way to answer: the phone shows the
+  session as waiting and you answer on the computer. A Deny rejects that request and every other one
+  OpenCode raised in the same step (the same assistant message).
 - `/nomo-update` acts only on Nomo's own checkout: the stub's target must be an absolute
   `<checkout>/plugin/dist/opencode.js` and the checkout's `origin` must be this repo on github.com
   (`https://`, `ssh://` or `git@github.com:`), or it refuses before running anything there.
@@ -554,6 +561,12 @@ process. Codex has no plugin update verb: with a `local` marketplace (`source_ty
   that never crosses HTTP, so it is not shown. With `OPENCODE_EXPERIMENTAL_PLAN_MODE` off a plan turn
   shows only "Planning"; with it on, `plan_exit` arrives as a normal question. Liveness is the OpenCode
   server process. `opencode --pure` starts without external plugins.
+- **2.x:** events come from `ctx.event.subscribe` and are translated into the 1.x shapes the plugin
+  already handles (`src/opencode/v2.ts`), so the phone sees the same records either way. The stream is
+  server-wide, so events for other folders are dropped. By default 2.x runs plugins in its background
+  service, not the TUI, so the row's liveness is that service: closing the TUI leaves a finished row,
+  ended when the service stops. A background subagent can still be running after the parent's turn
+  shows done.
 
 ### Cursor integration
 
