@@ -61,6 +61,10 @@ export interface OcSessionState {
    *  saying `plan` until the next user prompt, because plan_exit bypasses `setAgentModel`), while the
    *  assistant message is right every turn. Session events are a first-frame SEED, nothing more. */
   agentFromMessage?: boolean;
+  /** The row was CLOSED on the phone (`end`) by ocCloseUnattended while OpenCode itself kept the
+   *  session. The worker drops every frame for a closed row but a `start`, so the next frame that opens
+   *  it — a busy, or a new prompt's attention — must be one. */
+  closed?: boolean;
 }
 
 /** One permission/question OpenCode is blocked on a human for. */
@@ -290,6 +294,7 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
       // coalescing window. An adopted session is already `announced`, so it stays an `update`.
       const planned = frame(sessionId, live, live.announced ? "update" : "start", "working", now, detail);
       live.announced = true;
+      live.closed = undefined;
       // The identical-frame skip. `session.status {busy}` fires several times per turn with the exact
       // same payload; re-POSTing it costs a round trip and a re-seal for a frame the phone already
       // shows. The key spans everything that can change the RENDERED frame (title/model/todos included),
@@ -406,7 +411,44 @@ export function ocAttentionFrame(
   entry.announced = true;
   // The phone no longer shows the last working frame, so the skip key that says it does is void.
   entry.lastStatusFrame = undefined;
-  return frame(rootId, entry, "update", "needsAttention", now, detail, 1);
+  const op = entry.closed ? "start" : "update"; // a closed row reopens only on a start
+  entry.closed = undefined;
+  return frame(rootId, entry, op, "needsAttention", now, detail, 1);
+}
+
+/** ROOT rows the phone shows parked on a prompt that only an OpenCode WINDOW can answer: announced, a
+ *  prompt (its own or a subagent's) pending, and no hold's card on the row — a held Allow/Deny card is
+ *  still answerable from the phone, so it is never anyone's to close. */
+export function ocUnattendedRoots(state: OcState): string[] {
+  const roots = new Set<string>();
+  for (const prompt of state.prompts.values()) {
+    const root = ocRootSession(state, prompt.sessionID);
+    if (state.sessions.get(root)?.announced && !ocRowHeld(state, root)) roots.add(root);
+  }
+  return [...roots];
+}
+
+/** NOM-214: no OpenCode window is attached any more, so close every unattended row (see
+ *  ocWatchClients for when). On OpenCode 2.x every session lives in ONE shared server: closing the
+ *  window kills no process, so the watchdog's pid reap never fires, and OpenCode keeps the prompt
+ *  pending with no timeout — the yellow row stayed up forever.
+ *
+ *  A BLOB-BEARING `end`, the same frame 1.x's dispose sends when its window closes: the worker keeps it
+ *  as a closed history row (off the island, attention debt cleared), and `end` never raises the "Task
+ *  finished" alert a `done` would — the turn did not finish. The prompt STAYS registered (it is still
+ *  pending in OpenCode, answerable once a window is back), the row is un-announced so nothing but a
+ *  `start` posts to it again, and `closed` makes sure that start is what the next frame is. */
+export function ocCloseUnattended(state: OcState, now: number = Date.now()): OcFrame[] {
+  return ocUnattendedRoots(state).map((root) => {
+    const entry = state.sessions.get(root)!;
+    const closing = frame(root, entry, "end", "done", now);
+    entry.announced = false;
+    entry.closed = true;
+    entry.working = false;
+    entry.lastStatusFrame = undefined;
+    entry.turnStartedAt = undefined;
+    return closing;
+  });
 }
 
 /** Record a `permission.asked` / `question.asked` as pending. Reads the raw event because the tool
