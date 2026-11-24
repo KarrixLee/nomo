@@ -158,6 +158,8 @@ describe("bunx nomo-ai --uninstall", () => {
     expect(help.out).toContain("bunx nomo-ai unpair");
     expect(help.out).toContain("bunx nomo-ai uninstall --antigravity");
     expect(help.out).toContain("claude plugin uninstall nomo-cc@nomo");
+    expect(help.out).toContain("bunx nomo-ai uninstall --opencode");
+    expect(help.out).not.toContain("delete ~/.config/opencode");
   });
 
   test("--uninstall needs an agent flag: no picker, nothing run", async () => {
@@ -187,12 +189,61 @@ describe("bunx nomo-ai --uninstall", () => {
   });
 
   test("--uninstall for a host-owned install prints the host's command and runs nothing", async () => {
-    const r = await nomoAi(["--uninstall", "--claude", "--codex", "--opencode"]);
+    const r = await nomoAi(["--uninstall", "--claude", "--codex"]);
     expect(r.code).toBe(0);
     expect(r.out).toContain("claude plugin uninstall nomo-cc@nomo");
     expect(r.out).toContain("codex plugin remove nomo@nomo");
-    expect(r.out).toContain("~/.config/opencode/plugins/nomo.js");
     expect(r.out).not.toContain("$ claude");
+  });
+
+  /** An OpenCode config dir holding Nomo's install next to the user's own files. */
+  async function opencodeInstall(root: string): Promise<string> {
+    const dir = join(root, "opencode");
+    await mkdir(join(dir, "plugins"), { recursive: true });
+    await mkdir(join(dir, "plugin"), { recursive: true });
+    await mkdir(join(dir, "commands"), { recursive: true });
+    const stub = '// nomo-opencode-install — regenerate with /x/scripts/opencode-install.sh\nexport { default } from "/x/dist/opencode.js";\n';
+    await writeFile(join(dir, "plugins", "nomo.js"), stub);
+    await writeFile(join(dir, "plugin", "nomo.js"), 'export { default } from "/old/dist/opencode.js";\n'); // pre-631f3f2 stub
+    await writeFile(join(dir, "plugins", "theirs.js"), "export default {};\n");
+    await writeFile(join(dir, "commands", "nomo-pair.md"), "pair\n\n<!-- nomo-opencode-install -->\n");
+    await writeFile(join(dir, "commands", "nomo-status.md"), "status\n\n<!-- nomo-opencode-install -->\n");
+    await writeFile(join(dir, "commands", "nomo-mine.md"), "a user command that happens to share the prefix\n");
+    await writeFile(join(dir, "commands", "deploy.md"), "deploy\n");
+    await writeFile(join(dir, "opencode.json"), "{}\n");
+    return dir;
+  }
+
+  test("--uninstall --opencode removes only Nomo's stub(s) and /nomo-* commands, and says to restart", async () => {
+    let dir = "";
+    const r = await nomoAi(["--uninstall", "--opencode"], async (home) => { dir = await opencodeInstall(join(home, ".config")); });
+    expect(r.code).toBe(0);
+    expect(existsSync(join(dir, "plugins", "nomo.js"))).toBe(false);
+    expect(existsSync(join(dir, "plugin"))).toBe(false); // legacy stub gone, and its now-empty folder
+    expect(existsSync(join(dir, "commands", "nomo-pair.md"))).toBe(false);
+    expect(existsSync(join(dir, "commands", "nomo-status.md"))).toBe(false);
+    for (const kept of ["plugins/theirs.js", "commands/nomo-mine.md", "commands/deploy.md", "opencode.json"]) {
+      expect(existsSync(join(dir, kept))).toBe(true);
+    }
+    expect(r.out).toContain("Restart OpenCode");
+    expect(r.out).toContain("opencode service restart");
+    expect(r.out).not.toContain("not covered");
+  });
+
+  test("--uninstall --opencode --dry-run lists what it would remove and removes nothing; XDG_CONFIG_HOME is honoured", async () => {
+    let dir = "";
+    const r = await nomoAi(["--uninstall", "--opencode", "--dry-run"], async (home) => { dir = await opencodeInstall(join(home, ".config")); });
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`would remove: ${join(dir, "plugins", "nomo.js")}`);
+    expect(r.out).toContain(`would remove: ${join(dir, "commands", "nomo-pair.md")}`);
+    expect(r.out).not.toContain("nomo-mine.md");
+    expect(existsSync(join(dir, "plugins", "nomo.js"))).toBe(true);
+  });
+
+  test("--uninstall --opencode with nothing installed says so and succeeds", async () => {
+    const r = await nomoAi(["--uninstall", "--opencode"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("nothing of Nomo's");
   });
 });
 

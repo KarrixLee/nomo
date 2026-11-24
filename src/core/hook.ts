@@ -370,8 +370,12 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
    *  — its frames come off a resident event firehose, and a `session.status {retry}` message is free
    *  text no tool name can encode. Undefined for EVERY Claude/Codex caller, which leaves detailForHook
    *  as the only source and keeps their blobs byte-identical. */
-  detailOverride?: string): {
-  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; folderKey?: string; branch?: string; sid?: string; plan?: string; dbg?: string;
+  detailOverride?: string,
+  /** APPEND-LAST. Optional keys sealed after every base key but BEFORE the plan is fitted, so the
+   *  plan gets only the room these leave under the sealed ceiling (Antigravity's `surface`/`replies`,
+   *  OpenCode 2.x's `controls`/`replies`/honest-state keys). Undefined → byte-identical blob. */
+  extra?: Record<string, unknown>): {
+  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; folderKey?: string; branch?: string; sid?: string; pluginVersion?: string; plan?: string; dbg?: string;
 } {
   const folder = folderIdentity(input.cwd, pinnedFolder);
   const { label, folderKey } = folder;
@@ -427,6 +431,9 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
     ...(folderKey ? { folderKey } : {}),
     ...(branch ? { branch } : {}),
     ...sidField(input.session_id), // NOM-125, the last base key in EVERY producer (see sidField)
+    // 2.5.3, APPEND-LAST: the version of the integration sealing this blob (this hook / resident plugin)
+    // — the app gates per-agent features on it, never on the watchdog's or the computer's version.
+    pluginVersion: PLUGIN_VERSION,
   };
   const dbg = agent === "codex"
     ? dbgOverride ?? formatPlanPickerDebug({
@@ -435,7 +442,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
       by: "h",
     })
     : undefined;
-  return appendFittedPlanAndDebug(base, proposedPlan, dbg);
+  return appendFittedPlanAndDebug(extra ? { ...base, ...extra } : base, proposedPlan, dbg);
 }
 
 /** The wire envelope for one hook event: the blind v2 shape
@@ -461,8 +468,9 @@ export async function buildEnvelope(
   /** APPEND-LAST. Threaded straight through to buildBlob's own append-last `detailOverride` — see
    *  there. Undefined for every Claude/Codex caller. */
   detailOverride?: string,
-  /** APPEND-LAST. Keys sealed AFTER every buildBlob key (Antigravity's `surface` and reply receipts
-   *  `replies`). Undefined for every other caller, whose blobs stay byte-identical. */
+  /** APPEND-LAST. Keys sealed after every buildBlob base key and before the fitted plan (Antigravity's
+   *  `surface` and reply receipts `replies`; OpenCode 2.x's remote-control keys). Undefined for every
+   *  other caller, whose blobs stay byte-identical. */
   extraFields?: Record<string, unknown>,
 ): Promise<Record<string, unknown> | null> {
   if (typeof input !== "object" || input === null) return null;
@@ -480,7 +488,7 @@ export async function buildEnvelope(
   // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
   // and re-sent verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out.
   const at = Math.floor(now / 1000);
-  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride, extraFields);
   try { onBlobPlaintext?.(plaintext); } catch { /* a tee must never break an envelope */ }
   const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (
@@ -620,6 +628,10 @@ export async function trackSessionAt(
       // Same omit-for-claude rule as the blob's key above: absent MEANS claude on every reader
       // (recordAgent/`record.agent ?? "claude"`), and any other kind is stored as its own literal.
       ...(agent === "claude" ? {} : { agent }),
+      // 2.5.3: the version of the INTEGRATION writing this record (this hook / resident plugin), so a
+      // watchdog of another version rebuilding the session's blob states the session's own version, never
+      // its own (docs/plugin-versions-contract.md).
+      pluginVersion: PLUGIN_VERSION,
       // Cache the parsed start so the next hook and the watchdog re-send it without re-reading the
       // transcript (and so it survives the transcript later going away). Omitted when unknown.
       ...(typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {}),

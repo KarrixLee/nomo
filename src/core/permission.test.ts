@@ -1149,6 +1149,19 @@ describe("runPermissionHook — hold state machine", () => {
   // decisionPending row reached the phone with no honest event time at all — and the codex E2E vector
   // (cc-e2e-test-vectors.json: status decisionPending, "at": 1784937605) described a frame the plugin
   // never actually emitted. Both sealed variants carry it, since both derive from the same base blob.
+  test("cardExtra (OpenCode 2.x) rides last on the card, and its `controls` on the plain fallback too", async () => {
+    const { fn, calls } = scriptFetch(false, []);
+    const cardExtra = { permissionProjectGrant: "cmd:git status", controls: ["reply", "interrupt", "denyNote"] };
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, cardExtra }) as never);
+    const body = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
+    const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
+    const fb = (await decryptBlob(KEY, body.fallbackBlob)) as Record<string, unknown>;
+    expect(Object.keys(blob).slice(-2)).toEqual(["permissionProjectGrant", "controls"]);
+    expect(blob).toMatchObject(cardExtra);
+    expect(fb.controls).toEqual(cardExtra.controls);
+    expect(fb).not.toHaveProperty("permissionProjectGrant");
+  });
+
   test("the held frame carries `at` (epoch SECONDS of the event) in BOTH the blob and the fallbackBlob", async () => {
     const nowMs = 1_784_937_605_400;                                  // the vector's epoch second, plus 400 ms
     const { fn, calls } = scriptFetch(false, []);
@@ -1163,9 +1176,9 @@ describe("runPermissionHook — hold state machine", () => {
     // the permission keys is untouched. `folderKey` (the phone's folder-grouping identity) closes the
     // base after `at`, the same slot every other producer of this shape puts it in.
     const keys = Object.keys(blob);
-    expect(keys.slice(keys.indexOf("permissionSummary") - 3, keys.indexOf("permissionSummary")))
-      .toEqual(["at", "folderKey", "sid"]);
-    expect(Object.keys(fb).slice(-3)).toEqual(["at", "folderKey", "sid"]);
+    expect(keys.slice(keys.indexOf("permissionSummary") - 4, keys.indexOf("permissionSummary")))
+      .toEqual(["at", "folderKey", "sid", "pluginVersion"]);
+    expect(Object.keys(fb).slice(-4)).toEqual(["at", "folderKey", "sid", "pluginVersion"]);
   });
 
   // The held frames get `branch` for free: runPermissionHook hands buildBlob the WHOLE record, so the
@@ -1186,9 +1199,9 @@ describe("runPermissionHook — hold state machine", () => {
       expect(blob.branch).toBe("feat/hybrid-lan");
       expect(fb.branch).toBe("feat/hybrid-lan");
       const keys = Object.keys(blob);
-      expect(keys.slice(keys.indexOf("permissionSummary") - 4, keys.indexOf("permissionSummary")))
-        .toEqual(["at", "folderKey", "branch", "sid"]);
-      expect(Object.keys(fb).slice(-4)).toEqual(["at", "folderKey", "branch", "sid"]);
+      expect(keys.slice(keys.indexOf("permissionSummary") - 5, keys.indexOf("permissionSummary")))
+        .toEqual(["at", "folderKey", "branch", "sid", "pluginVersion"]);
+      expect(Object.keys(fb).slice(-5)).toEqual(["at", "folderKey", "branch", "sid", "pluginVersion"]);
       // The absolute path itself never crosses the wire — only the digest and the branch name.
       expect(JSON.stringify(blob)).not.toContain(repo);
     } finally {
@@ -2227,8 +2240,9 @@ describe("runPermissionHook — decision blob detail fields", () => {
   test("Bash: a long description never crowds out the command", async () => {
     for (const description of ["d".repeat(2000), "\u0001".repeat(2000)]) {
       const { body, blob } = await postedBlob({
-        // 1920, not 1950: the base now also carries `permissionGrant` (~33 sealed chars).
-        readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(1920), ts: 1000, model: "claude-opus-5" }),
+        // 1880, not 1950: the base now also carries `permissionGrant` (~33 sealed chars) and, since
+        // 2.5.3, `pluginVersion` (~37).
+        readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(1880), ts: 1000, model: "claude-opus-5" }),
         readInput: async () => inputWith({ tool_input: { command: "rm -rf build", description } }),
       });
       expect(body.blob.length).toBeLessThanOrEqual(BLOB_FIT_CHARS);

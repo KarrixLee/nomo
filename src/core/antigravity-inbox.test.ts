@@ -144,6 +144,14 @@ describe("routing a send-message", () => {
     expect(replyRoute(done({ cwd: undefined }), false, alive([]))).toBe("reject");
   });
 
+  test("OpenCode 2.x: queued for the resident plugin while its server lives (busy or idle), refused once it is gone", () => {
+    const oc = (over: Partial<SessionRecord> = {}) => rec({ agent: "opencode", transcript: "", ...over });
+    expect(replyRoute(oc(), false, alive([4242]))).toBe("queue");
+    expect(replyRoute(oc({ op: "done", lastEvent: "done" }), false, alive([4242]))).toBe("queue");
+    expect(replyRoute(oc(), false, alive([]))).toBe("reject");
+    expect(replyRoute(oc({ pid: undefined }), false, alive([4242]))).toBe("reject");
+  });
+
   test("handleReplyCommand: resume once, then queue behind the running resume; dupes and cancels", async () => {
     const dir = await tmp();
     const spawned: [string, string, string][] = [];
@@ -486,6 +494,35 @@ describe("watchdog: send-message / cancel-message through drainCommands' gates",
     expect(await hasQueuedReplies(r.dir, CONV)).toBe(false);
   });
 
+  test("an OpenCode row's send is queued (the resident plugin delivers it) and published; cancel works the same", async () => {
+    const OC = "ses_oc0000000000000000000001";
+    const ocRec = rec({ agent: "opencode", transcript: "" });
+    const r = await drain([
+      await seal({ sessionId: OC, mid: "mid-aaaaaaaa" }),
+      await seal({ sessionId: OC, mid: "mid-bbbbbbbb" }),
+      await seal({ kind: "cancel-message", sessionId: OC, mid: "mid-bbbbbbbb" }),
+    ], [{ sessionId: OC, rec: ocRec }]);
+    expect(r.traces.map((t) => [t.agent, t.result])).toEqual([
+      ["opencode", "reply-queued"], ["opencode", "reply-queued"], ["opencode", "reply-cancelled"],
+    ]);
+    expect(await receiptOf(r.dir, OC, "mid-aaaaaaaa")).toBe("q");
+    expect(await receiptOf(r.dir, OC, "mid-bbbbbbbb")).toBe("c");
+    expect(r.published).toEqual([OC, OC, OC]);
+  });
+
+  test("a send this daemon cannot deliver (agent with no reply route) gets an honest x receipt, once", async () => {
+    const r = await drain([
+      await seal({ sessionId: "claude-1", mid: "mid-aaaaaaaa" }),
+      await seal({ sessionId: "claude-1", mid: "mid-aaaaaaaa", text: "again" }),
+      await seal({ kind: "cancel-message", sessionId: "claude-1", mid: "mid-bbbbbbbb" }),
+    ], [{ sessionId: "claude-1", rec: rec({ agent: "claude" }) }]);
+    expect(r.traces.map((t) => t.result)).toEqual(["unsupported", "duplicate", "unsupported"]);
+    expect(await receiptOf(r.dir, "claude-1", "mid-aaaaaaaa")).toBe("x");
+    expect(await receiptOf(r.dir, "claude-1", "mid-bbbbbbbb")).toBeUndefined();
+    expect(r.published).toEqual(["claude-1"]); // a cancel of nothing publishes nothing
+    expect(await hasQueuedReplies(r.dir, "claude-1")).toBe(false);
+  });
+
   test("malformed text / mid never reach the inbox and publish nothing", async () => {
     const r = await drain([await seal({ text: "a\u0000b" }), await seal({ mid: "../x" })], [{ sessionId: CONV, rec: rec() }]);
     expect(r.traces.map((t) => t.result)).toEqual(["malformed", "malformed"]);
@@ -576,4 +613,17 @@ test("held approval + queued reply: the LAN card carries the receipt AND stays d
   expect(await decryptBlob(KEY, frame!.blob as string)).toMatchObject({ ...card, replies: { "mid-aaaaaaaa": "q" } });
   // a prio:0 working frame would make the worker serve it over the held card — losing the purple hand
   expect(posts).toHaveLength(0);
+});
+
+test("extra keys are sealed BEFORE the plan is fitted, so a long plan shrinks instead of overflowing the ceiling", async () => {
+  const { buildEnvelope } = await import("./hook");
+  const replies = Object.fromEntries(Array.from({ length: 16 }, (_, i) => [`${"m".repeat(60)}${String(i).padStart(4, "0")}`, "d"]));
+  const plan = Array.from({ length: 40 }, (_, i) => `- [ ] step ${i} ${"x".repeat(60)}`).join("\n");
+  const e = await buildEnvelope({ session_id: "ses_x", cwd: "/w" }, "m", NOW, "t", KEY, false, "opencode", NOW, 1, null, "g",
+    { op: "update", prio: 0, status: "working" }, undefined, plan, undefined, undefined, undefined,
+    { controls: ["reply", "interrupt", "denyNote"], replies });
+  expect((e!.blob as string).length).toBeLessThanOrEqual(3072);
+  const plain = await decryptBlob(KEY, e!.blob as string) as Record<string, unknown>;
+  expect(plain.replies).toEqual(replies);
+  expect(typeof plain.plan).toBe("string");
 });

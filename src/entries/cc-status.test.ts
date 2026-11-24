@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { b64url, decryptBlob } from "../core/crypto";
 import {
   BLOB_FIT_CHARS, CC_DIR, DBG_BLOB_TEXT_MAX_CHARS, folderIdentity, folderKeyFromCwd, formatPlanPickerDebug, fullTextForRecord, parseConfig, PendingEventStash, PLAN_BLOB_TEXT_MAX_CHARS, PLAN_BLOB_TRUNCATION_MARKER, postFullText,
-  decisionHoldFileName, interruptFlagFileName, readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt, writeInterruptFlagAt,
+  decisionHoldFileName, interruptFlagFileName, PLUGIN_VERSION, readDecisionHoldAt, readRecord, sealedBlobChars, SessionRecord, sessionBranch, writeDecisionHoldAt, writeInterruptFlagAt,
 } from "../core/shared";
 import {
   aiTitle, buildBlob, buildEnvelope, buildPendingStash, cleanPromptTitle, clearsInterruptFlag, codexIndexTitle, codexSessionTitle,
@@ -174,7 +174,7 @@ describe("planOp (op mapping table)", () => {
   test("an elicitation is NEVER an answerable approval: plain needsAttention blob, no decision keys", async () => {
     const input = { session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "Elicitation", mcp_server_name: "srv", message: "Token?" };
     const blob = buildBlob(input, "Mac", "t", planOp("Elicitation", input, false)!);
-    expect(blob).toEqual({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status", folderKey: KEY_API_STATUS, sid: "s" });
+    expect(blob).toEqual({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status", folderKey: KEY_API_STATUS, sid: "s", pluginVersion: PLUGIN_VERSION });
     const envelope = await buildEnvelope(input, "Mac", 1, "t", KEY, false);
     expect(envelope?.attentionKind).toBeUndefined();
   });
@@ -255,7 +255,7 @@ describe("planOp (op mapping table)", () => {
     expect(plan).toEqual({ op: "update", prio: 1, status: "needsAttention" });
     // AskUserQuestion has no tool→detail mapping, so the blob carries needsAttention with no `detail`.
     expect(buildBlob({ session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "AskUserQuestion" }, "Mac", "t", plan))
-      .toEqual({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status", folderKey: KEY_API_STATUS, sid: "s" });
+      .toEqual({ status: "needsAttention", title: "t", machine: "Mac", label: "api-status", folderKey: KEY_API_STATUS, sid: "s", pluginVersion: PLUGIN_VERSION });
   });
   test("Codex request_user_input carries needsAttention through blob construction", () => {
     const input = { session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "request_user_input" };
@@ -570,12 +570,12 @@ describe("buildBlob (plaintext content of the encrypted blob)", () => {
   test("carries status/title/machine/label and the tool detail", () => {
     const plan = planOp("PreToolUse", { session_id: "s", cwd: "/Users/x/api-status" }, false)!;
     expect(buildBlob({ session_id: "s", cwd: "/Users/x/api-status", hook_event_name: "PreToolUse", tool_name: "Edit" }, "Mac", "add font", plan))
-      .toEqual({ status: "working", detail: "editing", title: "add font", machine: "Mac", label: "api-status", folderKey: KEY_API_STATUS, sid: "s" });
+      .toEqual({ status: "working", detail: "editing", title: "add font", machine: "Mac", label: "api-status", folderKey: KEY_API_STATUS, sid: "s", pluginVersion: PLUGIN_VERSION });
   });
   test("no detail field for a hook with no detail; label falls back to 'session'", () => {
     const plan = planOp("Stop", { session_id: "s" }, false)!;
     const blob = buildBlob({ session_id: "s", hook_event_name: "Stop" }, "Mac", undefined, plan);
-    expect(blob).toEqual({ status: "done", title: "", machine: "Mac", label: "session", sid: "s" });
+    expect(blob).toEqual({ status: "done", title: "", machine: "Mac", label: "session", sid: "s", pluginVersion: PLUGIN_VERSION });
     expect(blob).not.toHaveProperty("detail");
   });
   test("needsAttention status rides through for a permission event", () => {
@@ -731,6 +731,7 @@ describe("folderKey (grouping identity derived from the first-seen absolute cwd)
       const rec = JSON.parse(await readFile(join(dir, "s1.json"), "utf8")) as SessionRecord;
       expect(rec.label).toBe("api");
       expect(rec.folderKey).toBe(folder.folderKey);
+      expect(rec.pluginVersion).toBe(PLUGIN_VERSION); // 2.5.3: the writing integration's own version
       // A bare-string caller (every pre-folderKey call site, and the tests below) writes no key at all.
       await trackSessionAt(dir, "s2", "update", 0, "working", "b", "Mac", "api", "/t.jsonl");
       const legacy = JSON.parse(await readFile(join(dir, "s2.json"), "utf8")) as SessionRecord;
@@ -777,7 +778,7 @@ describe("branch (live git branch of the pinned folder, threaded into the blob)"
     );
     expect(blob.branch).toBe("feat/hybrid-lan");
     expect(Object.keys(blob)).toEqual([
-      "status", "title", "machine", "label", "detail", "agent", "turnStartedAt", "model", "at", "folderKey", "branch", "sid", "dbg",
+      "status", "title", "machine", "label", "detail", "agent", "turnStartedAt", "model", "at", "folderKey", "branch", "sid", "pluginVersion", "dbg",
     ]);
   });
 
@@ -855,7 +856,7 @@ describe("buildEnvelope (v2 envelope + encrypted blob)", () => {
     expect(await decryptBlob(KEY, (env as { blob: string }).blob)).toEqual({
       status: "working", detail: "editing", title: "add font and timer", machine: "Karrix's MacBook", label: "api-status",
       at: 1, // buildEnvelope always freezes the real event time (floor(now/1000); now=1234 → 1)
-      folderKey: folderKeyFromCwd(input.cwd), sid: "abc",
+      folderKey: folderKeyFromCwd(input.cwd), sid: "abc", pluginVersion: PLUGIN_VERSION,
     });
   });
 
@@ -965,7 +966,7 @@ describe("turnStartedAt threading (blob-only; omitted when unknown)", () => {
   test("buildBlob includes a known turnStartedAt; OMITS the key when undefined or non-finite", () => {
     const plan = planOp("PreToolUse", input, false)!;
     expect(buildBlob(input, "Mac", "t", plan, "claude", 1_751_900_000))
-      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", turnStartedAt: 1_751_900_000, folderKey: folderKeyFromCwd(input.cwd), sid: "abc" });
+      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", turnStartedAt: 1_751_900_000, folderKey: folderKeyFromCwd(input.cwd), sid: "abc", pluginVersion: PLUGIN_VERSION });
     expect(buildBlob(input, "Mac", "t", plan)).not.toHaveProperty("turnStartedAt");
     expect(buildBlob(input, "Mac", "t", plan, "claude", Infinity)).not.toHaveProperty("turnStartedAt");
   });
@@ -994,7 +995,7 @@ describe("model threading (blob-only, optional; omitted when unknown — never a
 
   test("buildBlob includes a known model; OMITS the key when undefined or empty", () => {
     expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, "claude-fable-5"))
-      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", model: "claude-fable-5", folderKey: folderKeyFromCwd(input.cwd), sid: "abc" });
+      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", model: "claude-fable-5", folderKey: folderKeyFromCwd(input.cwd), sid: "abc", pluginVersion: PLUGIN_VERSION });
     expect(buildBlob(input, "Mac", "t", plan)).not.toHaveProperty("model");
     expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, "")).not.toHaveProperty("model");
   });
@@ -1029,17 +1030,17 @@ describe("at threading (frozen real-event time, blob-only, epoch seconds; append
 
   test("buildBlob includes a known at; OMITS the key when undefined or non-finite", () => {
     expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, undefined, 1_751_900_000))
-      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", at: 1_751_900_000, folderKey: folderKeyFromCwd(input.cwd), sid: "abc" });
+      .toEqual({ status: "working", detail: "editing", title: "t", machine: "Mac", label: "api-status", at: 1_751_900_000, folderKey: folderKeyFromCwd(input.cwd), sid: "abc", pluginVersion: PLUGIN_VERSION });
     expect(buildBlob(input, "Mac", "t", plan)).not.toHaveProperty("at");
     expect(buildBlob(input, "Mac", "t", plan, "claude", undefined, undefined, undefined, Infinity)).not.toHaveProperty("at");
   });
 
   test("at, then folderKey, close the base blob (append-last discipline for byte-stable decoders)", () => {
     const blob = buildBlob(input, "Mac", "t", plan, "codex", 1_751_900_000, undefined, "gpt-5-codex", 1_751_900_999);
-    expect(Object.keys(blob)).toEqual(["status", "title", "machine", "label", "detail", "agent", "turnStartedAt", "model", "at", "folderKey", "sid", "dbg"]);
+    expect(Object.keys(blob)).toEqual(["status", "title", "machine", "label", "detail", "agent", "turnStartedAt", "model", "at", "folderKey", "sid", "pluginVersion", "dbg"]);
     // …and a cwd-less event simply omits the grouping key, leaving the pre-folderKey order untouched.
     expect(Object.keys(buildBlob({ session_id: "abc", hook_event_name: "Stop" }, "Mac", "t", plan, "claude", undefined, undefined, undefined, 1_751_900_999)))
-      .toEqual(["status", "title", "machine", "label", "at", "sid"]);
+      .toEqual(["status", "title", "machine", "label", "at", "sid", "pluginVersion"]);
   });
 
   test("buildEnvelope ALWAYS freezes at = floor(now/1000) INSIDE the blob; the clear envelope stays blind", async () => {
@@ -1067,7 +1068,7 @@ describe("buildPendingStash (plaintext event stashed while pairing is pending)",
       sessionId: "s1", op: "done", prio: 0, stashedAt: 1234, pid: 4242,
       // real event time frozen (floor(1234/1000)); the stash derives its folder from cwd like any
       // first event, so the flushed first pairing frame already groups correctly on the phone.
-      blob: { status: "done", title: "add font", machine: "Mac", label: "api-status", at: 1, folderKey: folderKeyFromCwd(input.cwd), sid: "s1" },
+      blob: { status: "done", title: "add font", machine: "Mac", label: "api-status", at: 1, folderKey: folderKeyFromCwd(input.cwd), sid: "s1", pluginVersion: PLUGIN_VERSION },
     });
   });
   test("records process.ppid as the session pid by default (the `claude` process, per trackSession)", () => {

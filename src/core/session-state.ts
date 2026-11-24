@@ -22,7 +22,7 @@
 // the decay, i.e. two numbers about the transport and nothing about the status.
 
 import { adapterFor } from "./adapter";
-import { appendFittedPlanAndDebug, formatPlanPickerDebug, sessionBranch, sidField } from "./shared";
+import { appendFittedPlanAndDebug, formatPlanPickerDebug, sessionBranch, recordVersionField, sidField } from "./shared";
 import type { AgentKindWire, CCStatus, DecisionHold, SessionRecord } from "./shared";
 
 /** The 24 h abandonment cap — cc-watchdog's SESSION_STALE_MS, mirrored (an entry module must not be
@@ -363,6 +363,7 @@ export function buildStatePlaintext(
     ...(filled(record.folderKey) ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
+    ...recordVersionField(record),
   };
   const dbg = agent === "codex"
     ? formatPlanPickerDebug({
@@ -445,9 +446,10 @@ export function computeSessionState(input: SessionStateInput): SessionState | nu
   // The clear question discriminator, carried ONLY onto the two rungs a user can answer — see
   // SessionState.attentionKind. Mirrors lanFrameContent's `prio === 1` gate in v2's vocabulary.
   const asking = record.attentionKind === "userInput" ? { attentionKind: "userInput" as const } : {};
-  /** Mac-authored plaintext; an Antigravity row carries its record blob's reply receipts along. */
+  /** Mac-authored plaintext; an Antigravity or OpenCode row carries its record blob's append-last keys
+   *  along (receipts, OpenCode 2.x's controls and a done frame's outcome — see lan-frames). */
   const authored = (value: Record<string, unknown>): SessionStateBlob =>
-    ({ kind: "plain", value, ...(agent === "antigravity" ? { carry: record.blob } : {}) });
+    ({ kind: "plain", value, ...(agent === "antigravity" || agent === "opencode" ? { carry: record.blob } : {}) });
   const of = (
     state: SessionDisplayState, why: SessionStateWhy, blob: SessionStateBlob, at: number, terminal = false,
   ): SessionState => ({ state, terminal, ts: at, why, blob, agent, ...startedAt });

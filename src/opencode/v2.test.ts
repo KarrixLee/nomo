@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { ocDecisionRequest, ocResolvedRequestId } from "./approvals";
+import { ocDecisionRequest, ocReplyFor, ocResolvedRequestId } from "./approvals";
 import plugin from "./plugin";
 import { newOcState, ocPromptAsked, ocPromptsEndedBy, reduceOcEvent } from "./state";
 import type { OcFrame, OcState } from "./state";
-import { OC_V2_EVENT_TYPES, ocClientCount, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope, ocWatchClients } from "./v2";
+import { OC_V2_EVENT_TYPES, ocClientCount, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope, ocErrorReason, ocWatchClients, ocWatchdogServesUs, resolveRuntime } from "./v2";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 // -------------------------------------------------------------------------------------------------
 // THE FIXTURES ARE REAL. Each `data` below is a capture from a live OpenCode 2.4.1 TUI (`--standalone`,
@@ -203,9 +206,38 @@ describe("permissions", () => {
     });
   });
 
-  test("2.x offers NO Always allow: `always` persists to disk now, the phone's label says until restart", () => {
-    expect(ocDecisionRequest(ocV1Events(permissionAsked())[0])!.grant).toBe("");
-    expect(ocDecisionRequest(ocV1Events(permissionAsked("edit", ["src/a.ts"]))[0])!.grant).toBe("");
+  test("2.x keeps `permissionGrant` empty (an older app hides Always) and states the PROJECT grant separately", () => {
+    const shell = ocDecisionRequest(ocV1Events(permissionAsked())[0])!;
+    expect(shell).toMatchObject({ grant: "", projectGrant: "cmd:echo", v2: true });
+    const edit = ocDecisionRequest(ocV1Events(ev("permission.asked", {
+      id: "per_e", sessionID: S, action: "edit", resources: ["src/a.ts"], save: ["*"],
+    }))[0])!;
+    expect(edit).toMatchObject({ grant: "", projectGrant: "edits" });
+  });
+
+  test("a 2.x request that saves nothing has an empty project grant (Always stays hidden)", () => {
+    const req = ocDecisionRequest(ocV1Events(ev("permission.asked", { id: "per_n", sessionID: S, action: "shell", resources: ["x"] }))[0])!;
+    expect(req).toMatchObject({ grant: "", projectGrant: "", v2: true });
+  });
+
+  test("a 1.x request has no project grant and no v2 mark", () => {
+    const req = ocDecisionRequest({
+      type: "permission.asked",
+      properties: { id: "per_1", sessionID: S, permission: "bash", patterns: ["ls"], always: ["ls *"], metadata: {} },
+    })!;
+    expect(req.grant).toBe("cmd:ls");
+    expect(req.projectGrant).toBeUndefined();
+    expect(req.v2).toBeUndefined();
+  });
+
+  test("deny with note: a 2.x reject carries the note; the plain-Deny placeholder and 1.x never do", () => {
+    const v2req = ocDecisionRequest(ocV1Events(permissionAsked())[0])!;
+    const line = (decision: object) => JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision } });
+    expect(ocReplyFor(v2req, line({ behavior: "deny", message: "  use bun instead  " }))!.body)
+      .toEqual({ reply: "reject", message: "use bun instead" });
+    expect(ocReplyFor(v2req, line({ behavior: "deny", message: "Denied from phone" }))!.body).toEqual({ reply: "reject" });
+    const v1req = { ...v2req, v2: undefined };
+    expect(ocReplyFor(v1req, line({ behavior: "deny", message: "use bun instead" }))!.body).toEqual({ reply: "reject" });
   });
 
   test("the other mapped permissions keep their 1.x cards; unmapped ones keep their name + detail", () => {
@@ -304,10 +336,19 @@ describe("ocV2Client — the 2.x reply seam behind the 1.x client shape", () => 
     expect(await client._client.post({ url: "/permission/per_1/reply", body: { reply: "reject" } })).toEqual({ response: { status: 204 } });
     expect(calls).toEqual([{ sessionID: S, requestID: "per_1", decision: "reject" }]);
   });
-  test("`always` is sent as `once` — 2.x would save it to the project forever", async () => {
+  test("`always` goes through as `always` (2.5.3: only a 'saved for this project' card offers it)", async () => {
     calls.length = 0;
     await client._client.post({ url: "/permission/per_1/reply", body: { reply: "always" } });
-    expect(calls).toEqual([{ sessionID: S, requestID: "per_1", decision: "once" }]);
+    expect(calls).toEqual([{ sessionID: S, requestID: "per_1", decision: "always" }]);
+  });
+  test("a reject's note is passed on as `message`; a note on anything else is not", async () => {
+    calls.length = 0;
+    await client._client.post({ url: "/permission/per_1/reply", body: { reply: "reject", message: "use bun" } });
+    await client._client.post({ url: "/permission/per_1/reply", body: { reply: "once", message: "stray" } });
+    expect(calls).toEqual([
+      { sessionID: S, requestID: "per_1", decision: "reject", message: "use bun" },
+      { sessionID: S, requestID: "per_1", decision: "once" },
+    ]);
   });
   test("an unknown request or a question route is a 404, never a call", async () => {
     calls.length = 0;
@@ -385,5 +426,126 @@ describe("ocWatchClients — close what only a window could answer, once no wind
     w.stop();
     await tick();
     expect(w.polls()).toBe(0);
+  });
+});
+
+describe("honest states (2.x only)", () => {
+  test("retrying carries the next attempt (epoch seconds) and the rate-limit reason", () => {
+    const state = newOcState(true);
+    fold(state, created(), started());
+    const [frame] = fold(state, ev("session.retry.scheduled", {
+      sessionID: S, assistantMessageID: MSG, attempt: 2, at: 1_795_478_200_400,
+      error: { type: "APIError", message: "Too many requests", status: 429 },
+    }, null));
+    expect(frame).toMatchObject({ op: "update", status: "working", detail: "retrying", retryAt: 1_795_478_201, retryReason: "rateLimited" });
+  });
+
+  test("a non-rate-limit retry has no reason; each new attempt time is a new frame", () => {
+    const state = newOcState(true);
+    fold(state, created(), started());
+    const retry = (at: number) => ev("session.retry.scheduled", {
+      sessionID: S, assistantMessageID: MSG, attempt: 1, at, error: { type: "APIError", message: "overloaded", status: 529 },
+    }, null);
+    const frames = fold(state, retry(1_795_478_200_000), retry(1_795_478_200_000), retry(1_795_478_210_000));
+    expect(frames.map((f) => [f.retryAt, f.retryReason])).toEqual([[1_795_478_200, undefined], [1_795_478_210, undefined]]);
+  });
+
+  test("compacting rides a working frame and clears at the next step", () => {
+    const state = newOcState(true);
+    fold(state, created(), started(), step());
+    const frames = fold(state, ev("session.compaction.started", { sessionID: S, reason: "auto" }), step());
+    expect(frames.map((f) => [brief(f), f.phase])).toEqual([["update working", "compacting"], ["update working", undefined]]);
+  });
+
+  test("a failed or interrupted turn says so on its done frame; a succeeded one does not", () => {
+    for (const [type, outcome] of [
+      ["session.execution.failed", "failed"], ["session.execution.interrupted", "interrupted"], ["session.execution.succeeded", undefined],
+    ] as const) {
+      const state = newOcState(true);
+      fold(state, created(), started());
+      const [done] = fold(state, ev(type, { sessionID: S, error: { type: "X", message: "boom" }, reason: "user" }, null));
+      expect(done.op).toBe("done");
+      expect(done.outcome).toBe(outcome);
+    }
+  });
+
+  test("idle with background subagents still running counts them on the done frame", () => {
+    const state = newOcState(true);
+    fold(state, created(), started());
+    fold(state, created(CHILD, { parentID: S }), started(CHILD), created("ses_child2", { parentID: S }), started("ses_child2"));
+    fold(state, succeeded("ses_child2"));
+    const [done] = fold(state, succeeded());
+    expect(done).toMatchObject({ op: "done", bgAgents: 1 });
+  });
+
+  test("1.x (state not v2): the same events carry none of the keys", () => {
+    const state = newOcState();
+    fold(state, created(), started(), created(CHILD, { parentID: S }), started(CHILD));
+    const frames = fold(state,
+      ev("session.retry.scheduled", { sessionID: S, at: 1_795_478_200_400, error: { type: "X", message: "m", status: 429 } }, null),
+      ev("session.compaction.started", { sessionID: S, reason: "auto" }),
+      ev("session.execution.failed", { sessionID: S, error: { type: "X", message: "m" } }, null));
+    for (const f of frames) {
+      expect(f.retryAt ?? f.retryReason ?? f.phase ?? f.outcome ?? f.bgAgents).toBeUndefined();
+    }
+  });
+});
+
+describe("ocWatchdogServesUs — the idle guard's cheap test (no ps, no hash)", () => {
+  const alive = (pid: number) => pid === 42;
+  test("a live daemon of this version, or a newer one, can serve our commands", () => {
+    expect(ocWatchdogServesUs("42 2.5.3 abc", alive, "2.5.3")).toBe(true);
+    expect(ocWatchdogServesUs("42 99.0.0 abc", alive, "2.5.3")).toBe(true);
+  });
+  test("an OLDER daemon (it drops OpenCode Reply/Interrupt), a dead one, none, or a pre-stamp one → full check", () => {
+    expect(ocWatchdogServesUs("42 2.5.1 abc", alive, "2.5.3")).toBe(false);
+    expect(ocWatchdogServesUs("7 2.5.3", alive, "2.5.3")).toBe(false);
+    expect(ocWatchdogServesUs(undefined, alive, "2.5.3")).toBe(false);
+    expect(ocWatchdogServesUs("42", alive, "2.5.3")).toBe(false);
+    expect(ocWatchdogServesUs("junk", alive, "2.5.3")).toBe(false);
+  });
+});
+
+describe("resolveRuntime — the resident plugin must be able to START the watchdog it evicts for", () => {
+  const exe = (path: string) => { mkdirSync(join(path, ".."), { recursive: true }); writeFileSync(path, "#!/bin/sh\n"); chmodSync(path, 0o755); };
+  test("no run.sh cache (its fast path never writes one): bun on PATH, then ~/.bun/bin", () => {
+    const root = mkdtempSync(join(tmpdir(), "oc-rt-"));
+    const cc = join(root, "cc");
+    exe(join(root, "pathbin", "bun"));
+    expect(resolveRuntime({ PATH: `relative:${join(root, "pathbin")}`, HOME: root }, cc)).toBe(join(root, "pathbin", "bun"));
+    exe(join(root, ".bun", "bin", "bun"));
+    expect(resolveRuntime({ PATH: "relative/only", HOME: root }, cc)).toBe(join(root, ".bun", "bin", "bun"));
+  });
+  test("NOMO_RUNTIME, then a positive cache, win over the probe; a NONE sentinel is not a path", () => {
+    const root = mkdtempSync(join(tmpdir(), "oc-rt-"));
+    const cc = join(root, "cc");
+    mkdirSync(cc);
+    exe(join(root, "forced"));
+    exe(join(root, "cached"));
+    writeFileSync(join(cc, "runtime"), join(root, "cached"));
+    expect(resolveRuntime({ NOMO_RUNTIME: join(root, "forced"), PATH: "", HOME: root }, cc)).toBe(join(root, "forced"));
+    expect(resolveRuntime({ PATH: "", HOME: root }, cc)).toBe(join(root, "cached"));
+    writeFileSync(join(cc, "runtime"), "NONE:1");
+    const fallback = resolveRuntime({ PATH: "", HOME: root }, cc);
+    expect(fallback === undefined || fallback.startsWith("/")).toBe(true); // only system candidates remain
+  });
+});
+
+describe("failed turns carry a short reason", () => {
+  test("execution.failed → outcome failed + outcomeReason; an interrupt has no reason", () => {
+    const state = newOcState(true);
+    fold(state, created(), started(), step());
+    const [failed] = fold(state, ev("session.execution.failed", { sessionID: S, error: { type: "ProviderAuthError", message: "Insufficient balance.\nSubscribe to OpenCode Go" } }, null));
+    expect(failed).toMatchObject({ outcome: "failed", outcomeReason: "Insufficient balance. Subscribe to OpenCode Go" });
+    fold(state, started(), step());
+    const [interrupted] = fold(state, ev("session.execution.interrupted", { sessionID: S, reason: "user" }, null));
+    expect(interrupted).toMatchObject({ outcome: "interrupted" });
+    expect(interrupted.outcomeReason).toBeUndefined();
+  });
+  test("ocErrorReason: message else type, one line, capped", () => {
+    expect(ocErrorReason({ type: "T", message: " a\n\tb " })).toBe("a b");
+    expect(ocErrorReason({ type: "OnlyType" })).toBe("OnlyType");
+    expect(ocErrorReason({})).toBeUndefined();
+    expect(ocErrorReason({ message: "x".repeat(400) })!.length).toBe(160);
   });
 });

@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.5.2";
+var PLUGIN_VERSION = "2.5.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -246,6 +246,33 @@ function runtimeArgs(runtime, args) {
 }
 function sidField(sessionId) {
   return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
+}
+function pickCarriedKeys(carried, status) {
+  const same = carried.status === status;
+  const keep = (k, when = true) => when && carried[k] !== undefined ? { [k]: carried[k] } : {};
+  return {
+    ...keep("controls"),
+    ...keep("phase", same && status === "working"),
+    ...keep("retryAt", same && status === "working"),
+    ...keep("retryReason", same && status === "working"),
+    ...keep("outcome", same && status === "done"),
+    ...keep("outcomeReason", same && status === "done"),
+    ...keep("bgAgents", same && status === "done"),
+    ...keep("replies")
+  };
+}
+async function carriedSessionKeys(record, e2eKey, status) {
+  if (record?.agent !== "opencode" || typeof record.blob !== "string" || record.blob.length === 0)
+    return {};
+  try {
+    return pickCarriedKeys(await decryptBlob(e2eKey, record.blob), status);
+  } catch {
+    return {};
+  }
+}
+function recordVersionField(record) {
+  const v = record?.pluginVersion;
+  return typeof v === "string" && v.length > 0 ? { pluginVersion: v } : {};
 }
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withPlan = appendFittedPlan(base, plan);
@@ -1311,6 +1338,8 @@ function antigravitySurface(path) {
   return;
 }
 function replyRoute(record, resumeAlive, alive) {
+  if (record.agent === "opencode")
+    return typeof record.pid === "number" && record.pid > 1 && alive(record.pid) ? "queue" : "reject";
   const done = record.op === "done" || record.lastEvent === "done";
   if (!done || resumeAlive)
     return "queue";
@@ -3209,7 +3238,9 @@ var opencodeAdapter = {
   toolDetail: {},
   blobAgentFields: { agent: "opencode" },
   ambientPlan: true,
-  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps),
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".oc-interrupt"
 };
 function cursorModel(input) {
   for (const key of ["model", "model_id"]) {
@@ -3757,7 +3788,8 @@ function buildStatePlaintext(record, status, at, titleFallback, sessionId) {
     at: Math.floor(at / 1000),
     ...filled(record.folderKey) ? { folderKey: record.folderKey } : {},
     ...branch ? { branch } : {},
-    ...sidField(sessionId)
+    ...sidField(sessionId),
+    ...recordVersionField(record)
   };
   const dbg = agent === "codex" ? formatPlanPickerDebug({
     event: status === "done" ? "done" : "working",
@@ -3792,7 +3824,7 @@ function computeSessionState(input) {
   const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
   const sealed = { kind: "sealed", value: record.blob };
   const asking = record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {};
-  const authored = (value) => ({ kind: "plain", value, ...agent === "antigravity" ? { carry: record.blob } : {} });
+  const authored = (value) => ({ kind: "plain", value, ...agent === "antigravity" || agent === "opencode" ? { carry: record.blob } : {} });
   const of = (state, why, blob, at, terminal = false) => ({ state, terminal, ts: at, why, blob, agent, ...startedAt });
   if (correctives?.ended === true)
     return of("ended", "end", sealed, ts, true);
@@ -3985,7 +4017,7 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride, extra) {
   const folder = folderIdentity(input.cwd, pinnedFolder);
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
@@ -4003,14 +4035,15 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...folderKey ? { folderKey } : {},
     ...branch ? { branch } : {},
-    ...sidField(input.session_id)
+    ...sidField(input.session_id),
+    pluginVersion: PLUGIN_VERSION
   };
   const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
     event: hookName || "event",
     classifier: plan.status === "needsAttention" ? "attn" : plan.status === "working" ? "work" : "done",
     by: "h"
   }) : undefined;
-  return appendFittedPlanAndDebug(base, proposedPlan, dbg);
+  return appendFittedPlanAndDebug(extra ? { ...base, ...extra } : base, proposedPlan, dbg);
 }
 async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride, extraFields) {
   if (typeof input !== "object" || input === null)
@@ -4026,7 +4059,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride, extraFields);
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}
@@ -4090,6 +4123,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       prio,
       ...blob ? { blob } : {},
       ...agent === "claude" ? {} : { agent },
+      pluginVersion: PLUGIN_VERSION,
       ...typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {},
       ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
       ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},
@@ -6290,8 +6324,8 @@ function createLanFrameStore(deps = {}) {
       let value = blob.value;
       if (blob.carry) {
         try {
-          const { surface, replies } = await decryptBlob(e2eKey, blob.carry);
-          value = { ...value, ...surface !== undefined ? { surface } : {}, ...replies !== undefined ? { replies } : {} };
+          const c = await decryptBlob(e2eKey, blob.carry);
+          value = { ...value, ...c.surface !== undefined ? { surface: c.surface } : {}, ...pickCarriedKeys(c, value.status) };
         } catch {}
       }
       try {
@@ -8163,14 +8197,15 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions 
   return { detail: shortest, omitted: all.length - lo, ...tail };
 }
 function permissionFrame(base, detail, omitted, questions = [], tail = {}) {
-  const { permissionGrant, ...rest } = base;
+  const { permissionGrant, cardTail, ...rest } = base;
   return {
     ...rest,
     ...detail.length > 0 ? { permissionDetail: detail } : {},
     ...omitted > 0 ? { permissionDetailOmitted: omitted } : {},
     ...questions.length > 0 ? { permissionQuestions: questions } : {},
     ...tail,
-    ...typeof permissionGrant === "string" ? { permissionGrant } : {}
+    ...typeof permissionGrant === "string" ? { permissionGrant } : {},
+    ...typeof cardTail === "object" && cardTail !== null ? cardTail : {}
   };
 }
 function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
@@ -8495,7 +8530,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionSummary: summary,
       permissionRequestId: requestId,
       permissionToolName: toolName,
-      ...grant !== undefined ? { permissionGrant: grant } : {}
+      ...grant !== undefined ? { permissionGrant: grant } : {},
+      ...deps.cardExtra && Object.keys(deps.cardExtra).length > 0 ? { cardTail: deps.cardExtra } : {}
     };
     const diffFiles = buildPermissionDiff(toolName, toolInput);
     const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput, diffFiles);
@@ -8511,7 +8547,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     }
     const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail));
-    const fallbackBlob = await encryptBlob(config.e2eKey, base);
+    const plainBase = Array.isArray(deps.cardExtra?.controls) ? { ...base, controls: deps.cardExtra.controls } : base;
+    const fallbackBlob = await encryptBlob(config.e2eKey, plainBase);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     let lastPostTs = 0;
@@ -8602,7 +8639,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const stalledPatch = async (at) => {
       let stalledBlob = fallbackBlob;
       try {
-        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at / 1000) });
+        stalledBlob = await encryptBlob(config.e2eKey, { ...plainBase, reconnecting: Math.floor(at / 1000) });
       } catch {}
       return { ts: at, blob: stalledBlob, attentionStalledAt: at };
     };
@@ -10345,6 +10382,25 @@ function buildPresence(records) {
   }
   return { coding: [...coding].slice(0, MAX_CODING), waiting };
 }
+function presenceVersion(records, now) {
+  const best = new Map;
+  for (const r of records) {
+    const v = r.pluginVersion;
+    if (typeof v !== "string" || v.length === 0)
+      continue;
+    const agent = r.agent ?? "claude";
+    const held = best.get(agent);
+    if (held === undefined || watchdogVersionOutranks(v, held))
+      best.set(agent, v);
+  }
+  const agents = [...best.keys()].sort();
+  if (agents.length === 0)
+    return;
+  const agent = agents[Math.floor(now / PRESENCE_EVERY_MS) % agents.length];
+  return { agent, pluginVersion: best.get(agent) };
+}
+var versionKeysRefusedUntil = 0;
+var PRESENCE_VERSION_REPROBE_MS = 6 * 60 * 60000;
 async function readRecords(dir) {
   const files = await readdir10(dir).catch(() => []);
   const out = [];
@@ -10368,11 +10424,11 @@ function isGoneResponse(status, text) {
     return false;
   }
 }
-async function sendPresence(config, fetchFn = fetch, paths = {}, presence) {
+async function sendPresence(config, fetchFn = fetch, paths = {}, presence, version, now = Date.now) {
   const freeModePath = paths.freeModePath ?? FREE_MODE_PATH;
   try {
     const p = presence ?? buildPresence(await readRecords(paths.sessionsDir ?? SESSIONS_DIR));
-    const res = await fetchFn(`${config.url}/v1/cc/presence`, {
+    const post = (withVersion) => fetchFn(`${config.url}/v1/cc/presence`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -10380,9 +10436,19 @@ async function sendPresence(config, fetchFn = fetch, paths = {}, presence) {
         "x-cc-auth": config.pcSecret,
         "x-cc-version": PLUGIN_VERSION
       },
-      body: JSON.stringify({ coding: p.coding, waiting: p.waiting }),
+      body: JSON.stringify({
+        coding: p.coding,
+        waiting: p.waiting,
+        ...withVersion && version ? { agent: version.agent, pluginVersion: version.pluginVersion } : {}
+      }),
       signal: AbortSignal.timeout(5000)
     });
+    const tryVersion = version !== undefined && now() >= versionKeysRefusedUntil;
+    let res = await post(tryVersion);
+    if (tryVersion && res.status === 400) {
+      versionKeysRefusedUntil = now() + PRESENCE_VERSION_REPROBE_MS;
+      res = await post(false);
+    }
     const text = await res.text().catch(() => "");
     let tier;
     if (res.ok) {
@@ -10414,14 +10480,14 @@ var EMPTY_KEY = JSON.stringify({ coding: [], waiting: false });
 function startPresenceLoop(deps = {}) {
   const load = deps.load ?? loadConfig;
   const read = deps.read ?? (() => readRecords(SESSIONS_DIR));
-  const send = deps.send ?? ((config, p) => sendPresence(config, fetch, {}, p));
+  const send = deps.send ?? ((config, p, v) => sendPresence(config, fetch, {}, p, v));
   const now = deps.now ?? Date.now;
   let sentKey = null;
   let lastAttemptAt = -Infinity;
   let busy = null;
-  const attempt = async (config, p, key) => {
+  const attempt = async (config, p, key, v) => {
     lastAttemptAt = now();
-    const result = await send(config, p);
+    const result = await send(config, p, v);
     if (result === "pro" || result === "free")
       sentKey = key;
     else if (result === "gone")
@@ -10432,13 +10498,14 @@ function startPresenceLoop(deps = {}) {
     if (busy)
       return;
     busy = (async () => {
-      const p = buildPresence(await read());
+      const records = await read();
+      const p = buildPresence(records);
       const key = JSON.stringify(p);
       if (!presenceDue(key, sentKey, lastAttemptAt, now()))
         return;
       const config = await load();
       if (config)
-        await attempt(config, p, key);
+        await attempt(config, p, key, presenceVersion(records, now()));
     })().catch(() => {}).finally(() => {
       busy = null;
     });
@@ -10576,6 +10643,8 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
     ...branch ? { branch } : {},
     ...sidField(sessionId),
+    ...recordVersionField(record),
+    ...await carriedSessionKeys(record, e2eKey, "done"),
     ...antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
@@ -10597,6 +10666,8 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
     ...branch ? { branch } : {},
     ...sidField(sessionId),
+    ...recordVersionField(record),
+    ...await carriedSessionKeys(record, e2eKey, "needsAttention"),
     ...antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
@@ -10626,6 +10697,8 @@ async function buildWorkingEnvelope(sessionId, record, now, e2eKey, agent = "cla
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
     ...branch ? { branch } : {},
     ...sidField(sessionId),
+    ...recordVersionField(record),
+    ...await carriedSessionKeys(record, e2eKey, "working"),
     ...antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
@@ -11349,7 +11422,12 @@ async function drainCommands(config, deps = {}) {
         }
         if (REPLY_COMMAND_KINDS.has(payload.kind)) {
           const dir = deps.replySessionsDir ?? (lanRunningUnderTest() ? undefined : SESSIONS_DIR);
-          if (agent !== "antigravity" || !dir) {
+          if (agent !== "antigravity" && agent !== "opencode" || !dir) {
+            const mid = replyMessageId(payload.mid);
+            if (dir && mid && payload.kind === "send-message" && !await receiptOf(dir, payload.sessionId, mid)) {
+              await writeReceipt(dir, payload.sessionId, mid, "x");
+              await (deps.publishRepliesFn ?? ((id, d) => publishReplyReceipts(config, id, d)))(payload.sessionId, dir).catch(() => {});
+            }
             traceFocus(deps, { ...base, agent, result: "unsupported" });
             continue;
           }
@@ -12293,7 +12371,9 @@ async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, a
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
     ...branch ? { branch } : {},
-    ...sidField(sessionId)
+    ...sidField(sessionId),
+    ...recordVersionField(record),
+    ...await carriedSessionKeys(record, e2eKey, statusFromRecord(record))
   };
   const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title",
@@ -12870,7 +12950,7 @@ async function claimSingleInstance() {
   const build = watchdogBuildStamp();
   try {
     const holder = parseWatchdogPidfile(readFileSync3(WATCHDOG_PID_PATH, "utf8"));
-    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && holder.version === PLUGIN_VERSION && !watchdogBuildDiffers(holder.build, build)) {
+    if (holder && holder.pid !== process.pid && watchdogHolderIsLive(holder.pid) && (holder.version === PLUGIN_VERSION && !watchdogBuildDiffers(holder.build, build) || holder.version !== undefined && watchdogVersionOutranks(holder.version, PLUGIN_VERSION))) {
       return false;
     }
   } catch {}

@@ -49,6 +49,10 @@ update and uninstall lives at **[docs.nomo.gg](https://docs.nomo.gg)**.
   you, except auto-approving its **own** status commands, matched byte for byte. Nomo's own pair,
   unpair, reset and uninstall commands always ask.
   [Hooks security](#hooks-security)
+- **Phone commands are sealed and narrow.** Interrupt, Reply (Antigravity, OpenCode 2.x) and Open on Mac
+  run only when sealed by your paired phone, fresh (under 2 minutes) and never replayed, for a session
+  this computer tracks. A reply is handed to the agent as a user message; nothing from the phone is
+  ever run as a shell command. [OpenCode 2.x remote control](#opencode-plugin)
 - **Local files are owner-only.** Pairing keys and session records live in `~/.config/cc-status/`,
   written `0600`. Every file Nomo writes into an agent's config is listed below, and the installers
   merge rather than overwrite. [Files on your computer](#files-on-your-computer)
@@ -78,8 +82,11 @@ and OpenCode needs it that way round: it reads the pairing once, at start. Devin
 can instead use the plugin: `devin plugins install KarrixLee/nomo`. The three agent config files it
 merges into directly are undone with `nomo uninstall --cursor`, `nomo uninstall --antigravity` and
 `nomo uninstall --devin` (also spelled `--uninstall`; the same as
-`node ~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall`). An agent flag is required. For Claude
-Code, Codex and OpenCode, uninstall only prints the host's own removal command.
+`node ~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall`). `nomo uninstall --opencode` deletes the
+plugin stub and the `/nomo-*` command files `opencode-install.sh` wrote (only files carrying its marker;
+your other plugins, commands and `opencode.json` are untouched), then asks you to restart OpenCode
+(`opencode service restart` for the 2.x background service). `--dry-run` lists what it would remove. An
+agent flag is required. For Claude Code and Codex, uninstall only prints the host's own removal command.
 
 **Commands**, from any folder, for any agent:
 
@@ -205,7 +212,7 @@ computer twice — a UUID made once and kept in `~/.config/cc-status/machine-id`
 derived from serial, MAC, hostname or user name; delete the file for a new one.
 
 **Presence — two fields, every pairing.** About once a minute while the watchdog runs (an agent session
-is open), and as soon as the answer changes (never more than once per ~27 s), the plugin POSTs `/v1/cc/presence` with exactly `{ "coding": [agent ids], "waiting": true|false }`:
+is open), and as soon as the answer changes (never more than once per ~27 s), the plugin POSTs `/v1/cc/presence` with `{ "coding": [agent ids], "waiting": true|false }` plus one `"agent"` + `"pluginVersion"` pair (each agent's own Nomo integration version, one agent per POST in turn; left off against a relay that does not take them yet):
 which agents (`claude`, `codex`, …) have a turn open, and whether any session is waiting for an
 approval. No session id, title, folder, command or text. It is not sealed (the relay keeps it about 3
 minutes so the phone can show "Claude is coding"), and the reply tells the plugin whether the pairing is
@@ -236,7 +243,8 @@ computer names from the app's own App Group container. It never leaves the devic
 | `~/.config/cc-status/config.json` (`0600`) | pairing id, computer secret, 32-byte key; deleted by unpair (after a server revoke) | pair |
 | `~/.config/cc-status/sessions/*.json` (`0600`) | one record per live session (agent pid, last sealed blob) | hooks, watchdog |
 | `~/.config/cc-status/sessions/<id>.devin-allow` (owner-only) | Devin "Always allow (this session)" grants; deleted by unpair, reset and pairing again | Devin approval hook |
-| `~/.config/cc-status/sessions/<conv>.<id>.agy-inbox` (owner-only) | queued Antigravity phone replies, deleted after a day | watchdog |
+| `~/.config/cc-status/sessions/<conv>.<id>.agy-inbox` (owner-only) | queued Antigravity and OpenCode 2.x phone replies, deleted after a day | watchdog |
+| `~/.config/cc-status/sessions/<id>.oc-interrupt` (owner-only) | an OpenCode 2.x Interrupt waiting for the plugin (consumed within ~1 s; ignored after 2 minutes) | watchdog |
 | `~/.config/cc-status/hook-shim.sh` (`0700`) | version-stable hook launcher | `run.sh`, pair |
 | `~/.config/cc-status/activity-days.json`, `machine-id` | activity summary, per-computer id | watchdog |
 | `~/.config/cc-status/free-mode` | time the relay last said this pairing is not Pro (counts for 15 minutes for sending; keeps the LAN listener off until the relay says Pro) | hooks, watchdog |
@@ -323,12 +331,34 @@ real installs never set it, and anything that can set your agent's environment c
   **Always** is OpenCode's own `always` reply: it allows the request's `always` patterns (e.g.
   `git status *`, or `*` for every edit) for that project **until OpenCode restarts**, across its
   sessions — OpenCode keeps the rule in memory, never on disk.
-- **OpenCode 2.x:** it answers permissions with Allow / Deny only, through OpenCode's in-process
-  `ctx.permission.reply`. The phone offers **no Always**: 2.x saves an `always` rule to the project on
-  disk, where it outlives restarts, so the phone never sends one (a stale card's Always is sent as a
-  one-time allow). Questions are 2.x forms, which plugins have no way to answer: the phone shows the
-  session as waiting and you answer on the computer. A Deny rejects that request and every other one
-  OpenCode raised in the same step (the same assistant message).
+- **OpenCode 2.x:** it answers permissions through OpenCode's in-process `ctx.permission.reply`:
+  Allow, **Always allow (saved for this project)**, Deny and **Deny with note**. 2.x saves an Always
+  rule (the request's `save` patterns, e.g. `git status *`) to the project **on disk**, where it
+  outlives restarts, so the card states it as `permissionProjectGrant` and only a phone that labels it
+  "saved for this project" (app 2.5.3+) offers it; `permissionGrant` stays `""`, so an older app, whose
+  OpenCode label says "until OpenCode restarts", keeps hiding Always. A note rides on the reject as
+  OpenCode's `message`: the model reads it and keeps working (a plain Deny ends the step). A Deny
+  rejects that request and every other one OpenCode raised in the same step (the same assistant
+  message). Questions are 2.x forms, which plugins have no way to answer: the phone shows the session
+  as waiting and you answer on the computer.
+- **OpenCode 2.x remote control — Reply and Interrupt.** These are new powers for your phone: **Reply**
+  types a message into a session (as if you typed it in OpenCode), and **Interrupt** stops its running
+  turn. Both arrive only as commands sealed by your paired phone and pass the watchdog's usual gates
+  (decrypted under the pairing key, a kind on the allow-list, sealed less than 2 minutes ago, nonce
+  never seen before, naming a session this computer tracks). The watchdog then leaves them as
+  owner-only files in `~/.config/cc-status/sessions/`: a reply as one `.agy-inbox` file (at most 4,000
+  characters, no control characters but line breaks), an interrupt as `<session>.oc-interrupt`. The
+  plugin, inside OpenCode, checks once a second, acts only for sessions in its own folder, claims each
+  file with an atomic rename (so it acts once), and calls only `ctx.session.prompt` (`delivery:
+  "steer"`, with a fixed message id so a retry is never added twice) or `ctx.session.interrupt`. An
+  interrupt flag older than 2 minutes is dropped unread; unclaimed messages are deleted after a day.
+  Interrupt needs the local link, like every agent's; Reply also works over the relay. The plugin
+  advertises what this OpenCode can do in the sealed blob (`controls`), and OpenCode 1.x never does,
+  so the phone offers neither there. Nothing is executed as a shell command, and no process is started.
+  Only a watchdog of this version or newer can route these commands, so while OpenCode runs the
+  plugin checks every 15 s (one pidfile read and a `kill(pid, 0)`) and, when an older plugin's
+  watchdog holds the queue, replaces it through the usual highest-version-wins handoff. It never stops
+  a watchdog it could not replace. A message a watchdog cannot route gets an `x` (refused) receipt.
 - `/nomo-update` acts only on Nomo's own checkout: the stub's target must be an absolute
   `<checkout>/plugin/dist/opencode.js` and the checkout's `origin` must be this repo on github.com
   (`https://`, `ssh://` or `git@github.com:`), or it refuses before running anything there.
@@ -571,7 +601,10 @@ process. Codex has no plugin update verb: with a `local` marketplace (`source_ty
   listening port (`lsof`), since 2.x has no client-presence event. OpenCode keeps the prompt pending; answer
   it in a reopened window and the row comes back. An Allow/Deny card on the phone is never closed this
   way, and a running turn is left alone. A background subagent can still be running after the parent's
-  turn shows done. 2.x only produces todos when its `todo` flag is on (`OPENCODE_FLAGS=todo` or
+  turn shows done; the done frame counts them (`bgAgents`). Other 2.x states ride sealed too: a retry's
+  next attempt time and whether it is rate limiting (`retryAt`, `retryReason`), compaction (`phase`), and
+  a failed or interrupted turn (`outcome`); see
+  [docs/opencode-2x-remote-contract.md](docs/opencode-2x-remote-contract.md). 2.x only produces todos when its `todo` flag is on (`OPENCODE_FLAGS=todo` or
   `experimental.todo: true`).
 
 ### Cursor integration

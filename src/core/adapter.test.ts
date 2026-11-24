@@ -2213,8 +2213,11 @@ describe("interrupt capability is stated per agent", () => {
   test("codex interrupts through the app-server bridge", () => {
     expect(codexAdapter.interrupt).toBe("app-server");
   });
-  test("opencode and unknown agents have none", () => {
-    expect(opencodeAdapter.interrupt).toBeUndefined();
+  test("opencode (2.x) stamps its own flag, which the resident plugin consumes", () => {
+    expect(opencodeAdapter.interrupt).toBe("hook-flag");
+    expect(opencodeAdapter.interruptFlagSuffix).toBe(".oc-interrupt");
+  });
+  test("unknown agents have none", () => {
     expect(unknownAgentAdapter("some-future-agent").interrupt).toBeUndefined();
   });
 });

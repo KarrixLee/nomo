@@ -105,7 +105,7 @@ async function sha256Hex(s) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.5.2";
+var PLUGIN_VERSION = "2.5.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -247,6 +247,33 @@ function runtimeArgs(runtime, args) {
 }
 function sidField(sessionId) {
   return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
+}
+function pickCarriedKeys(carried, status) {
+  const same = carried.status === status;
+  const keep = (k, when = true) => when && carried[k] !== undefined ? { [k]: carried[k] } : {};
+  return {
+    ...keep("controls"),
+    ...keep("phase", same && status === "working"),
+    ...keep("retryAt", same && status === "working"),
+    ...keep("retryReason", same && status === "working"),
+    ...keep("outcome", same && status === "done"),
+    ...keep("outcomeReason", same && status === "done"),
+    ...keep("bgAgents", same && status === "done"),
+    ...keep("replies")
+  };
+}
+async function carriedSessionKeys(record, e2eKey, status) {
+  if (record?.agent !== "opencode" || typeof record.blob !== "string" || record.blob.length === 0)
+    return {};
+  try {
+    return pickCarriedKeys(await decryptBlob(e2eKey, record.blob), status);
+  } catch {
+    return {};
+  }
+}
+function recordVersionField(record) {
+  const v = record?.pluginVersion;
+  return typeof v === "string" && v.length > 0 ? { pluginVersion: v } : {};
 }
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withPlan = appendFittedPlan(base, plan);
@@ -2914,7 +2941,9 @@ var opencodeAdapter = {
   toolDetail: {},
   blobAgentFields: { agent: "opencode" },
   ambientPlan: true,
-  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps),
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".oc-interrupt"
 };
 function cursorModel(input) {
   for (const key of ["model", "model_id"]) {
@@ -3452,7 +3481,8 @@ function buildStatePlaintext(record, status, at, titleFallback, sessionId) {
     at: Math.floor(at / 1000),
     ...filled(record.folderKey) ? { folderKey: record.folderKey } : {},
     ...branch ? { branch } : {},
-    ...sidField(sessionId)
+    ...sidField(sessionId),
+    ...recordVersionField(record)
   };
   const dbg = agent === "codex" ? formatPlanPickerDebug({
     event: status === "done" ? "done" : "working",
@@ -3487,7 +3517,7 @@ function computeSessionState(input) {
   const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
   const sealed = { kind: "sealed", value: record.blob };
   const asking = record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {};
-  const authored = (value) => ({ kind: "plain", value, ...agent === "antigravity" ? { carry: record.blob } : {} });
+  const authored = (value) => ({ kind: "plain", value, ...agent === "antigravity" || agent === "opencode" ? { carry: record.blob } : {} });
   const of = (state, why, blob, at, terminal = false) => ({ state, terminal, ts: at, why, blob, agent, ...startedAt });
   if (correctives?.ended === true)
     return of("ended", "end", sealed, ts, true);
@@ -3680,7 +3710,7 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride, extra) {
   const folder = folderIdentity(input.cwd, pinnedFolder);
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
@@ -3698,14 +3728,15 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...folderKey ? { folderKey } : {},
     ...branch ? { branch } : {},
-    ...sidField(input.session_id)
+    ...sidField(input.session_id),
+    pluginVersion: PLUGIN_VERSION
   };
   const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
     event: hookName || "event",
     classifier: plan.status === "needsAttention" ? "attn" : plan.status === "working" ? "work" : "done",
     by: "h"
   }) : undefined;
-  return appendFittedPlanAndDebug(base, proposedPlan, dbg);
+  return appendFittedPlanAndDebug(extra ? { ...base, ...extra } : base, proposedPlan, dbg);
 }
 async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride, extraFields) {
   if (typeof input !== "object" || input === null)
@@ -3721,7 +3752,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride, extraFields);
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}
@@ -3785,6 +3816,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       prio,
       ...blob ? { blob } : {},
       ...agent === "claude" ? {} : { agent },
+      pluginVersion: PLUGIN_VERSION,
       ...typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {},
       ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
       ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},

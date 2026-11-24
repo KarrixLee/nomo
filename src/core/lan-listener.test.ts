@@ -2347,6 +2347,21 @@ describe("state — the snapshot store", () => {
     expect(row.why).toBe("done");
     expect(await decryptBlob(KEY, row.blob)).toMatchObject({ status: "done", surface: "cli", replies: { "mid-1": "q" } });
   });
+
+  test("a failed/interrupted done carries outcome, reason and controls; a corrective done over a working blob carries no outcome", async () => {
+    const dir = await snapDir();
+    const store = snapStore(dir);
+    const done = { agent: "opencode" as const, op: "done" as const, lastEvent: "done", transcript: "" };
+    await write(dir, "s1", { ...done, blob: await encryptBlob(KEY, {
+      status: "done", controls: ["reply"], outcome: "failed", outcomeReason: "no Go plan", bgAgents: 2, replies: { "mid-1": "d" },
+    }) });
+    await write(dir, "s2", { ...done, blob: await encryptBlob(KEY, { status: "working", controls: ["reply"], outcome: "failed" }) });
+    await store.reconcile();
+    const rows = Object.fromEntries(await Promise.all(store.states(0).sessions.map(async (r) => [r.sessionId, await decryptBlob(KEY, r.blob) as Record<string, unknown>])));
+    expect(rows.s1).toMatchObject({ status: "done", controls: ["reply"], outcome: "failed", outcomeReason: "no Go plan", bgAgents: 2, replies: { "mid-1": "d" } });
+    expect(rows.s2).toMatchObject({ status: "done", controls: ["reply"] });
+    expect(rows.s2).not.toHaveProperty("outcome");
+  });
 });
 
 describe("POST /v1/lan — op:state", () => {
