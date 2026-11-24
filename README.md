@@ -702,6 +702,12 @@ disagree. `package.json` carries the version only so `bunx nomo-ai --version` is
 report. The npm publish is manual — `npm pack --dry-run` first: the tarball is `bin/` plus
 `package.json`, `README.md` and `LICENSE`, nothing else.
 
+## Contributors
+
+Thank you to everyone who helped make Nomo better:
+
+- [@tecandrew](https://github.com/tecandrew): worked out the OpenCode 2.x plugin migration and shared a working adapter, which became OpenCode 2.x support in plugin 2.5.2.
+
 ## License — MIT
 
 Released under the [MIT License](LICENSE). © 2026 KarrixLee.
