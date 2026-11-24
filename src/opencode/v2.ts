@@ -17,14 +17,18 @@
  *  | session.agent.selected {agent}             | session.updated {info:{agent}} (a seed, like 1.x)     |
  *  | session.step.started {agent, model}        | message.updated (assistant) + session.status busy     |
  *  | session.execution.started                  | session.status busy                                   |
- *  | session.execution.succeeded/failed/interr. | session.status idle                                   |
- *  | session.retry.scheduled                    | session.status retry                                  |
+ *  | session.execution.succeeded/failed/interr. | session.status idle (+ nomo.outcome failed/interr.)   |
+ *  | session.retry.scheduled {at, error}        | session.status retry (+ nomo.retryAt/retryReason)     |
+ *  | session.compaction.started                 | session.status busy (+ nomo.phase "compacting")       |
  *  | session.deleted                            | session.deleted                                       |
  *  | session.tool.success/failed {id}           | message.part.updated (tool completed/error)           |
  *  |   (todowrite: metadata.todos)              | + todo.updated                                        |
  *  | permission.asked {action,resources,source} | permission.asked {permission,patterns,tool}           |
  *  | permission.replied                         | permission.replied (same fields)                      |
  *  | form.created / replied / cancelled         | question.asked / question.replied / question.rejected |
+ *
+ *  `nomo` is a 2.x-only hint bag the reducer reads for the honest-state blob keys (state.ts OcHints);
+ *  no 1.x event carries it.
  *
  *  2.x never publishes `session.status` / `session.idle` (the schema still declares them; nothing in
  *  core emits them), so turn start/end come from `session.execution.*`.
@@ -38,6 +42,7 @@ export const OC_V2_EVENT_TYPES = [
   "session.tool.success", "session.tool.failed",
   "permission.asked", "permission.replied",
   "form.created", "form.replied", "form.cancelled",
+  "session.compaction.started",
 ] as const;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -154,11 +159,34 @@ export function ocV1Events(event: unknown): unknown[] {
     case "session.execution.started":
       return sessionID ? [v1("session.status", { sessionID, status: { type: "busy" } })] : [];
     case "session.execution.succeeded":
+      return sessionID ? [v1("session.status", { sessionID, status: { type: "idle" } })] : [];
     case "session.execution.failed":
     case "session.execution.interrupted":
-      return sessionID ? [v1("session.status", { sessionID, status: { type: "idle" } })] : [];
-    case "session.retry.scheduled":
-      return sessionID ? [v1("session.status", { sessionID, status: { type: "retry" } })] : [];
+      return sessionID
+        ? [v1("session.status", {
+          sessionID, status: { type: "idle" },
+          nomo: { outcome: type === "session.execution.failed" ? "failed" : "interrupted" },
+        })]
+        : [];
+    case "session.retry.scheduled": {
+      if (!sessionID) return [];
+      // `at` is the next attempt in epoch MS (core/session/runner/retry.ts: scheduled + delay).
+      const at = Number(d.at);
+      const error = asRecord(d.error);
+      const rateLimited = error?.status === 429 || /rate.?limit|too.?many.?requests/i.test(asString(error?.type) ?? "");
+      return [v1("session.status", {
+        sessionID, status: { type: "retry" },
+        nomo: {
+          ...(Number.isFinite(at) && at > 0 ? { retryAt: Math.ceil(at / 1000) } : {}),
+          ...(rateLimited ? { retryReason: "rateLimited" } : {}),
+        },
+      })];
+    }
+    case "session.compaction.started":
+      // Always inside an execution (auto: mid-step; manual: drained by the runner), so the idle that
+      // ends it follows. Cleared by the next step's plain busy, never by compaction.ended — a busy
+      // planned from that could land after the idle and reopen a finished row.
+      return sessionID ? [v1("session.status", { sessionID, status: { type: "busy" }, nomo: { phase: "compacting" } })] : [];
     case "session.deleted":
       return sessionID ? [v1("session.deleted", { sessionID, info: { id: sessionID } })] : [];
     case "session.tool.success":
@@ -186,12 +214,14 @@ export function ocV1Events(event: unknown): unknown[] {
         sessionID,
         permission: v1Permission(asString(d.action)),
         patterns: Array.isArray(d.resources) ? d.resources : [],
-        // DELIBERATELY EMPTY, so the card offers NO "Always allow". In 2.x `always` is no longer the
-        // in-memory rule the phone's copy promises ("… (until OpenCode restarts)"): core/src/permission.ts
-        // `reply` writes the request's `save` patterns to the project's SQLite `permission` table, where
-        // they survive restarts. An empty list makes ocGrantText return "" (= a one-time tap only), and
-        // the phone hides the button. Restore it once the app's label says "saved for this project".
+        // DELIBERATELY EMPTY, so `permissionGrant` stays "" and an OLDER app offers no "Always allow":
+        // its OpenCode label promises "(until OpenCode restarts)", but 2.x `reply("always")` writes the
+        // request's `save` patterns to the project's SQLite `permission` table (core/src/permission.ts),
+        // where they survive restarts. The real grant rides as `save` → the card's append-last
+        // `permissionProjectGrant`, which only a 2.5.3+ app reads ("saved for this project"). Always
+        // `save` (possibly []) on 2.x: its presence is what marks the request as 2.x (approvals.ts).
         always: [],
+        save: Array.isArray(d.save) ? d.save.filter((p): p is string => typeof p === "string") : [],
         metadata: asRecord(d.metadata) ?? {},
         ...(source?.type === "tool" ? { tool: { messageID: source.messageID, callID: source.id } } : {}),
       })];
@@ -232,10 +262,11 @@ export function ocV1Events(event: unknown): unknown[] {
  *  `POST /permission/:id/reply`; the reply is `ctx.permission.reply({sessionID, requestID, decision})`,
  *  which needs the session — hence `sessionOf`, fed from `permission.asked`.
  *
- *  An `always` is sent as `once`: the card never offers it on 2.x (see `always: []` above), and if a
- *  stale card sends one anyway it must not write a permanent project rule nobody was told about. */
+ *  An `always` goes through as `always` (2.5.3): only an app that read `permissionProjectGrant` — and
+ *  so said "saved for this project" — offers it on 2.x. A reject's `message` (a deny NOTE) is passed on;
+ *  OpenCode hands it to the model as a CorrectedError and the model continues. */
 export function ocV2Client(
-  reply: (input: { sessionID: string; requestID: string; decision: string }) => Promise<unknown>,
+  reply: (input: { sessionID: string; requestID: string; decision: string; message?: string }) => Promise<unknown>,
   sessionOf: (requestID: string) => string | undefined,
 ): { _client: { post: (o: { url: string; body?: unknown }) => Promise<{ response: { status: number } }> } } {
   return {
@@ -244,8 +275,9 @@ export function ocV2Client(
         const requestID = /^\/permission\/([^/]+)\/reply$/.exec(url)?.[1];
         const sessionID = requestID === undefined ? undefined : sessionOf(requestID);
         const decision = asString(asRecord(body)?.reply);
+        const message = asString(asRecord(body)?.message);
         if (requestID === undefined || sessionID === undefined || decision === undefined) return { response: { status: 404 } };
-        await reply({ sessionID, requestID, decision: decision === "always" ? "once" : decision });
+        await reply({ sessionID, requestID, decision, ...(decision === "reject" && message ? { message } : {}) });
         return { response: { status: 204 } };
       },
     },

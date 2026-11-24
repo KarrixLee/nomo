@@ -1160,7 +1160,8 @@ export interface CommandPayload {
  *  plugin is now the ONLY party that can read the blob — a blind relay cannot filter what it can't
  *  see. Anything else decrypts fine and is then rejected as bad-kind. */
 const INTERRUPT_COMMAND_KIND = "interrupt-session";
-/** Phone replies to an Antigravity session (core/antigravity-inbox.ts): `mid` + `text` ride sealed too. */
+/** Phone replies to an Antigravity or OpenCode 2.x session (core/antigravity-inbox.ts): `mid` + `text`
+ *  ride sealed too. */
 const REPLY_COMMAND_KINDS = new Set(["send-message", "cancel-message"]);
 const COMMAND_KINDS_ALLOWED = new Set(["focus-terminal", INTERRUPT_COMMAND_KIND, ...REPLY_COMMAND_KINDS]);
 
@@ -1583,7 +1584,8 @@ export async function drainCommands(config: Config, deps: DrainCommandsDeps = {}
         }
         if (REPLY_COMMAND_KINDS.has(payload.kind)) {
           const dir = deps.replySessionsDir ?? (lanRunningUnderTest() ? undefined : SESSIONS_DIR);
-          if (agent !== "antigravity" || !dir) {
+          // Antigravity's hooks or OpenCode 2.x's resident plugin take the queue (replyRoute).
+          if ((agent !== "antigravity" && agent !== "opencode") || !dir) {
             traceFocus(deps, { ...base, agent, result: "unsupported" as FocusTraceResult });
             continue;
           }

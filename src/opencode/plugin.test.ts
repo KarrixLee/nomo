@@ -13,8 +13,8 @@ const { spawnTestProcess } = createProcessHygiene();
 const driver = join(import.meta.dir, "../test/opencode-plugin-driver.ts");
 
 async function replay(scenario: {
-  hold: boolean; gateFirstEvent?: boolean; steps: unknown[]; v2?: boolean; answer?: string;
-  sessions?: Record<string, unknown>;
+  hold: boolean; gateFirstEvent?: boolean; steps: unknown[]; v2?: boolean; answer?: string; answerMessage?: string;
+  sessions?: Record<string, unknown>; logKeys?: boolean;
 }): Promise<string[]> {
   const home = await mkdtemp(join(tmpdir(), "oc-plugin-"));
   try {
@@ -123,6 +123,83 @@ describe("OpenCode 2.x through setup()", () => {
     });
     expect(log.filter((entry) => entry.startsWith("TIMEOUT"))).toEqual([]);
     expect(log.slice(0, 2)).toEqual(["event start working", "event done done"]);
+  }, 30000);
+
+  test("frames carry `controls`; the card carries controls + the PROJECT grant while permissionGrant stays \"\"", async () => {
+    const log = await replay({
+      v2: true, hold: true, answer: "allow_always", logKeys: true,
+      steps: [created2, started2, waitFor("event start"), asked2, waitFor("reply")],
+    });
+    expect(log.filter((entry) => entry.startsWith("TIMEOUT"))).toEqual([]);
+    expect(log).toContain('keys start {"controls":["reply","interrupt","denyNote"]}');
+    expect(log).toContain('card shell grant=""');
+    expect(log).toContain('cardkeys {"permissionProjectGrant":"cmd:ls","controls":["reply","interrupt","denyNote"]}');
+    // Always allow from a 2.5.3 app is a real `always` now: OpenCode saves `ls *` for the project.
+    expect(log).toContain(`reply ${S} per_2 always`);
+  }, 30000);
+
+  test("Deny with note reaches ctx.permission.reply as `message`", async () => {
+    const log = await replay({
+      v2: true, hold: true, answer: "deny", answerMessage: "use bun test instead",
+      steps: [created2, started2, waitFor("event start"), asked2, waitFor("reply")],
+    });
+    expect(log).toContain(`reply ${S} per_2 reject use bun test instead`);
+  }, 30000);
+
+  test("a failed turn ends with outcome:failed on its done frame", async () => {
+    const log = await replay({
+      v2: true, hold: true, logKeys: true,
+      steps: [
+        created2, started2, waitFor("event start"),
+        v2("session.execution.failed", { sessionID: S, error: { type: "APIError", message: "bad key" } }, false),
+        waitFor("event done"),
+      ],
+    });
+    expect(log).toContain('keys done {"controls":["reply","interrupt","denyNote"],"outcome":"failed"}');
+  }, 30000);
+
+  test("a phone reply left by the watchdog is prompted into the session (steer, idempotent id) and receipted", async () => {
+    const log = await replay({
+      v2: true, hold: true, logKeys: true,
+      steps: [
+        created2, started2, waitFor("event start"),
+        { write: { name: `${S}.abcd1234.agy-reply`, content: "q" } },
+        { write: { name: `${S}.abcd1234.agy-inbox`, content: JSON.stringify({ mid: "abcd1234", text: "also run lint", ts: 1 }) } },
+        waitFor("prompt"),
+        waitFor("keys update"),
+      ],
+    });
+    expect(log.filter((entry) => entry.startsWith("TIMEOUT"))).toEqual([]);
+    expect(log).toContain(`prompt ${S} also run lint steer msg_nomo_abcd1234`);
+    expect(log.find((entry) => entry.startsWith("keys update"))).toContain('"replies":{"abcd1234":"d"}');
+  }, 30000);
+
+  test("an interrupt flag is consumed once and calls ctx.session.interrupt; a stale one is dropped unread", async () => {
+    const log = await replay({
+      v2: true, hold: true,
+      steps: [
+        created2, started2, waitFor("event start"),
+        { write: { name: `${S}.oc-interrupt`, content: JSON.stringify({ at: Date.now() }) } },
+        waitFor("interrupt"),
+        { write: { name: `${S}.oc-interrupt`, content: JSON.stringify({ at: Date.now() - 10 * 60_000 }) } },
+        { sleep: 2500 },
+      ],
+    });
+    expect(log.filter((entry) => entry.startsWith("interrupt"))).toEqual([`interrupt ${S}`]);
+  }, 30000);
+
+  test("another folder's session is never prompted or interrupted from here", async () => {
+    const log = await replay({
+      v2: true, hold: true,
+      sessions: { ses_far: { id: "ses_far", location: { directory: "/elsewhere" }, time: { created: 1 } } },
+      steps: [
+        created2, started2, waitFor("event start"),
+        { write: { name: "ses_far.oc-interrupt", content: JSON.stringify({ at: Date.now() }) } },
+        { write: { name: "ses_far.abcd1234.agy-inbox", content: JSON.stringify({ mid: "abcd1234", text: "hi", ts: 1 }) } },
+        { sleep: 2500 },
+      ],
+    });
+    expect(log.some((entry) => entry.startsWith("interrupt") || entry.startsWith("prompt"))).toBe(false);
   }, 30000);
 
   test("a phone Allow answers through ctx.permission.reply on a shell card with no Always allow", async () => {

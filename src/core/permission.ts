@@ -1525,7 +1525,9 @@ function permissionFrame(
   // diff tail), so the
   // fit's size prediction and the real seal both carry it in its append-last position. Present only
   // when the hold computed one; "" is meaningful (the tap is a one-time allow), absent = unknown.
-  const { permissionGrant, ...rest } = base;
+  // `cardTail` (2.5.3, PermissionHookDeps.cardExtra) is not a wire key: its entries are sealed after
+  // permissionGrant, last of all, so an older iOS decoder that ignores them is byte-unaffected.
+  const { permissionGrant, cardTail, ...rest } = base;
   return {
     ...rest,
     ...(detail.length > 0 ? { permissionDetail: detail } : {}),
@@ -1533,6 +1535,7 @@ function permissionFrame(
     ...(questions.length > 0 ? { permissionQuestions: questions } : {}),
     ...tail,
     ...(typeof permissionGrant === "string" ? { permissionGrant } : {}),
+    ...(typeof cardTail === "object" && cardTail !== null ? cardTail as Record<string, unknown> : {}),
   };
 }
 
@@ -1891,6 +1894,10 @@ export interface PermissionHookDeps {
    *  (Nomo's own session grant). "" = the tap would be a one-time allow. Absent → derived for Claude
    *  Code, omitted for every other agent. */
   grant?: string;
+  /** OPTIONAL extra card keys, sealed LAST on the decisionPending card (after permissionGrant). OpenCode
+   *  2.x passes `permissionProjectGrant` (its Always is saved per project, which an older app would
+   *  mislabel, so `permissionGrant` stays "" there) and `controls`. Absent → byte-identical card. */
+  cardExtra?: Record<string, unknown>;
   /** Resolve Codex's effective per-turn approval policy from its rollout. Tests inject this so no
    *  local Codex state is touched; Claude never calls it. */
   loadCodexTurnPolicyFn?: (
@@ -2151,6 +2158,7 @@ export async function runPermissionHook(
       permissionToolName: toolName,
       // What Always allow really grants (see claudeGrantText) — moved to the tail by permissionFrame.
       ...(grant !== undefined ? { permissionGrant: grant } : {}),
+      ...(deps.cardExtra && Object.keys(deps.cardExtra).length > 0 ? { cardTail: deps.cardExtra } : {}),
     };
     // Built once: a Write's diff reads the file it overwrites and runs the bounded line diff.
     const diffFiles = buildPermissionDiff(toolName, toolInput);

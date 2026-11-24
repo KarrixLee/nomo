@@ -60,6 +60,13 @@ export interface OcDecisionRequest {
   /** What an `always` reply really grants, for the card's Always-allow label (`permissionGrant`):
    *  built from the request's `always` patterns (ocGrantText). Permissions only. */
   grant?: string;
+  /** OpenCode 2.x only: what an `always` reply SAVES FOR THE PROJECT (its `save` patterns, the same
+   *  shapes 1.x's `always` had), for the card's `permissionProjectGrant`. `grant` stays "" on 2.x, so an
+   *  older app — whose OpenCode label says "(until OpenCode restarts)" — keeps hiding Always allow. */
+  projectGrant?: string;
+  /** OpenCode 2.x: a deny may carry the user's note (`permission.reply({decision:"reject", message})`
+   *  reaches the model as a CorrectedError and it keeps working). 1.x keeps the bare reject. */
+  v2?: boolean;
   /** OpenCode's own `questions` array, kept verbatim so the answers round-trip can re-find each
    *  question's original option labels. Questions only. */
   questions?: unknown[];
@@ -134,6 +141,10 @@ export function ocDecisionRequest(event: unknown): OcDecisionRequest | null {
     const always = Array.isArray(properties.always)
       ? properties.always.filter((p): p is string => typeof p === "string" && p.length > 0)
       : [];
+    // `save` is only ever present on a 2.x request (v2.ts always sets it, possibly []): 1.x has `always`.
+    const save = Array.isArray(properties.save)
+      ? properties.save.filter((p): p is string => typeof p === "string" && p.length > 0)
+      : undefined;
     return {
       kind: "permission",
       id,
@@ -142,6 +153,7 @@ export function ocDecisionRequest(event: unknown): OcDecisionRequest | null {
       toolInput: mapped ? mapped.input({ metadata, patterns }) : {},
       ...(detail ? { detail } : {}),
       grant: ocGrantText(permission, always),
+      ...(save ? { projectGrant: ocGrantText(permission, save), v2: true } : {}),
     };
   }
 
@@ -218,6 +230,9 @@ export function ocAnswers(questions: unknown[], map: Record<string, unknown>): s
   });
 }
 
+/** The message permission.ts's plain-Deny line always carries (DENY_HSO). Not a note. */
+const OC_PLAIN_DENY_MESSAGE = "Denied from phone";
+
 /** Translate the ONE decision line `runPermissionHook` emitted into the OpenCode call it means.
  *
  *  | phone answer                          | permission channel | question channel        |
@@ -231,9 +246,10 @@ export function ocAnswers(questions: unknown[], map: Record<string, unknown>): s
  *  answers at the Mac. We must NOT invent a reply for those: the TUI dialog is still up and OpenCode's
  *  own request stays pending, which is exactly the intended degraded mode.
  *
- *  A deny MESSAGE is deliberately dropped. OpenCode's reply schema accepts one, but a `message` turns
- *  the tool's `RejectedError` into a `CorrectedError`, which its own TUI buckets differently — and the
- *  common case is the frozen "Denied from phone" placeholder rather than anything the user typed. */
+ *  A deny MESSAGE is dropped on 1.x: there a `message` turns the tool's `RejectedError` into a
+ *  `CorrectedError`, a different outcome than the user was told. On 2.x that IS the documented
+ *  deny-with-feedback (the model reads the note and keeps working), so a real note is sent there —
+ *  never the frozen "Denied from phone" placeholder a plain Deny carries. */
 export function ocReplyFor(request: OcDecisionRequest, line: string | undefined): OcReply | null {
   if (line === undefined) return null;
   let decision: Record<string, unknown> | undefined;
@@ -252,7 +268,14 @@ export function ocReplyFor(request: OcDecisionRequest, line: string | undefined)
     return null; // a bare allow on a question never reaches here (emitDecision releases it) — belt and braces
   }
 
-  if (decision.behavior === "deny") return { path: `permission/${request.id}/reply`, body: { reply: "reject" } };
+  if (decision.behavior === "deny") {
+    // 2.x only: a real note rides along. The plain-Deny line always carries the frozen placeholder,
+    // which is not the user's words and must stay a bare reject (it ends the step, as a TUI deny does).
+    const note = typeof decision.message === "string" ? decision.message.trim() : "";
+    return request.v2 && note.length > 0 && note !== OC_PLAIN_DENY_MESSAGE
+      ? { path: `permission/${request.id}/reply`, body: { reply: "reject", message: note } }
+      : { path: `permission/${request.id}/reply`, body: { reply: "reject" } };
+  }
   if (decision.behavior !== "allow") return null;
   // `updatedPermissions` is the always-allow marker: allowAlwaysLine adds it, allowLine never does.
   const always = Array.isArray(decision.updatedPermissions) && decision.updatedPermissions.length > 0;
@@ -372,6 +395,9 @@ export interface OcApprovalOptions {
   /** TEST SEAM ONLY. The local no-hold escape-hatch flag, so a test can drive the hold arm without
    *  depending on whether the developer running it has paused approvals on their own machine. */
   noHoldPath?: string;
+  /** Extra keys sealed last on the card (PermissionHookDeps.cardExtra): 2.x's `controls`. The request's
+   *  own `projectGrant` is added here as `permissionProjectGrant`. */
+  cardExtra?: Record<string, unknown>;
 }
 
 /** How one hold ended, for the caller that owns the row afterwards. */
@@ -383,6 +409,13 @@ export interface OcApprovalResult {
    *  record. False = paused, refused by the worker, or the POST never landed: no card ever went up, no
    *  settle ran, and nothing has painted the row. */
   granted: boolean;
+}
+
+/** The card's 2.x tail: `permissionProjectGrant` (omitted when the request saves nothing) + `cardExtra`.
+ *  Undefined for 1.x with no extras, so its card stays byte-identical. */
+function ocCardExtra(request: OcDecisionRequest, extra?: Record<string, unknown>): Record<string, unknown> | undefined {
+  const out = { ...(request.projectGrant ? { permissionProjectGrant: request.projectGrant } : {}), ...extra };
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** Hold ONE OpenCode decision on the phone, then reply to OpenCode with the answer.
@@ -429,6 +462,7 @@ export async function runOcApproval(request: OcDecisionRequest, o: OcApprovalOpt
       // header. Undefined for everything else, which is every Claude/Codex hold and every mapped one.
       detail: request.detail,
       grant: request.grant,
+      cardExtra: ocCardExtra(request, o.cardExtra),
       trace,
       fetchFn: o.fetchFn,
       delegate: o.delegate,

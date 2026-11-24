@@ -2535,7 +2535,7 @@ export async function opencodeLocateTuiPid(
  *  session identity, title, model, busy/idle — from an in-process event firehose. Nothing in the
  *  transcript-scanning pipeline this interface was shaped around applies.
  *
- *  What is LIVE here is `kind`, `blobAgentFields`, `ambientPlan` and `locateTuiPid`: three call sites (`cc-watchdog`'s corrective
+ *  What is LIVE here is `kind`, `blobAgentFields`, `ambientPlan`, `locateTuiPid` and `interrupt`: three call sites (`cc-watchdog`'s corrective
  *  builders, `session-state`'s rollup, `computeSessionState`) reach `adapterFor()` on an OpenCode
  *  record and want only the `agent:"opencode"` literal to thread into the blob they are rebuilding.
  *  Every other member is inert — a path that does not exist, a matcher that never matches, an
@@ -2567,6 +2567,11 @@ export const opencodeAdapter: AgentAdapter = {
   // The third live member: "Open on Mac" for the DESKTOP app only. See opencodeLocateTuiPid — a CLI /
   // `opencode serve` session returns undefined and the phone keeps the button hidden, as before.
   locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps),
+  // 2.5.3: Interrupt on OpenCode 2.x. The watchdog stamps `<session>.oc-interrupt`; the resident plugin
+  // (src/opencode/remote.ts) consumes it within ~1 s and calls `ctx.session.interrupt`. A 1.x plugin
+  // never reads the flag — and its frames carry no `controls`, so the phone never offers the button.
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".oc-interrupt", // OC_INTERRUPT_SUFFIX in src/opencode/remote.ts
 };
 
 /** Cursor's model id off a hook payload: `model` (on every event, e.g. "cursor-grok-4.6-high-fast"),
