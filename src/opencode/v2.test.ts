@@ -3,7 +3,7 @@ import { ocDecisionRequest, ocResolvedRequestId } from "./approvals";
 import plugin from "./plugin";
 import { newOcState, ocPromptAsked, ocPromptsEndedBy, reduceOcEvent } from "./state";
 import type { OcFrame, OcState } from "./state";
-import { OC_V2_EVENT_TYPES, ocV1Events, ocV2Client, ocV2InScope } from "./v2";
+import { OC_V2_EVENT_TYPES, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope } from "./v2";
 
 // -------------------------------------------------------------------------------------------------
 // THE FIXTURES ARE REAL. Each `data` below is a capture from a live OpenCode 2.4.1 TUI (`--standalone`,
@@ -247,26 +247,51 @@ describe("forms (questions)", () => {
   });
 });
 
-describe("ocV2InScope — the server-wide stream, one directory's instance", () => {
-  test("another directory is dropped", () => {
-    expect(ocV2InScope(created(), "/elsewhere", new Set())).toBe(false);
+describe("ocV2Scope — the server-wide stream, one directory's instance", () => {
+  test("another directory is theirs, and stays theirs even on its location-less events", () => {
+    const known = new Set<string>(); const foreign = new Set<string>();
+    expect(ocV2Scope(created(), "/elsewhere", known, foreign)).toBe("theirs");
+    expect(ocV2Scope(started(), "/elsewhere", known, foreign)).toBe("theirs");
   });
-  test("location-less events (execution.*, permission.replied) count only for sessions seen here first", () => {
-    const known = new Set<string>();
-    expect(ocV2InScope(started(), DIR, known)).toBe(false); // another directory's turn, nothing to tie it here
-    expect(ocV2InScope(created(), DIR, known)).toBe(true);
-    expect(ocV2InScope(started(), DIR, known)).toBe(true);
-    expect(ocV2InScope(permissionReplied, DIR, known)).toBe(true);
-    expect(ocV2InScope(formCreated, DIR, known)).toBe(true);
+  test("born here is ours; then its location-less events (execution.*, permission.replied, forms) are too", () => {
+    const known = new Set<string>(); const foreign = new Set<string>();
+    expect(ocV2Scope(created(), DIR, known, foreign)).toBe("ours");
+    expect(ocV2Scope(started(), DIR, known, foreign)).toBe("ours");
+    expect(ocV2Scope(permissionReplied, DIR, known, foreign)).toBe("ours");
+    expect(ocV2Scope(formCreated, DIR, known, foreign)).toBe("ours");
+  });
+  test("a session never seen must be looked up — located or not (a continued session, a subagent)", () => {
+    expect(ocV2Scope(started(), DIR, new Set(), new Set())).toBe("ask");
+    expect(ocV2Scope(step(), DIR, new Set(), new Set())).toBe("ask");
   });
   test("a located deleted forgets the session", () => {
     const known = new Set([S]);
-    expect(ocV2InScope(ev("session.deleted", { sessionID: S }), DIR, known)).toBe(true);
+    expect(ocV2Scope(ev("session.deleted", { sessionID: S }), DIR, known, new Set())).toBe("ours");
     expect(known.has(S)).toBe(false);
   });
   test("the subscription asks for every type the translator maps", () => {
     expect(OC_V2_EVENT_TYPES).toContain("session.execution.succeeded");
     expect(OC_V2_EVENT_TYPES).toContain("form.created");
+  });
+});
+
+describe("ocV1Backfill — a session first met mid-flight", () => {
+  test("a subagent that predates the plugin is learned as a child, so it never gets a row", () => {
+    const state = newOcState();
+    fold(state, created());
+    for (const e of ocV1Backfill(CHILD, { id: CHILD, parentID: S, location: loc, time: { created: 1 } })) reduceOcEvent(state, e);
+    expect(state.children.get(CHILD)).toBe(S);
+    expect(fold(state, started(CHILD), step(CHILD))).toEqual([]);
+  });
+  test("a continued session gets its title, agent and real start before its first busy", () => {
+    const state = newOcState();
+    for (const e of ocV1Backfill(S, { id: S, title: "Old work", agent: "plan", model, location: loc, time: { created: 1_700_000_000_000 } })) {
+      reduceOcEvent(state, e);
+    }
+    const [frame] = fold(state, started());
+    expect(frame).toMatchObject({
+      op: "start", status: "working", title: "Old work", detail: "planning", model: "tidepool-alpha-free", startedAt: 1_700_000_000_000,
+    });
   });
 });
 

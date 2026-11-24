@@ -5689,22 +5689,47 @@ function asString3(value) {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 var v1 = (type, properties) => ({ type, properties });
-function ocV2InScope(event, directory, known) {
+function ocV2Scope(event, directory, known, foreign) {
   const e = asRecord3(event);
   const d = asRecord3(e?.data);
   const sessionID = asString3(d?.sessionID) ?? asString3(asRecord3(d?.form)?.sessionID);
   const at = asString3(asRecord3(e?.location)?.directory);
-  if (at !== undefined && directory !== undefined && at !== directory)
-    return false;
+  const elsewhere = at !== undefined && directory !== undefined && at !== directory;
   if (sessionID === undefined)
-    return true;
-  if (at === undefined && directory !== undefined && !known.has(sessionID))
-    return false;
-  if (e?.type === "session.deleted")
+    return elsewhere ? "theirs" : "ours";
+  if (elsewhere) {
     known.delete(sessionID);
-  else
+    foreign.add(sessionID);
+    return "theirs";
+  }
+  if (known.has(sessionID)) {
+    if (e?.type === "session.deleted")
+      known.delete(sessionID);
+    return "ours";
+  }
+  if (e?.type === "session.created" && at !== undefined) {
     known.add(sessionID);
-  return true;
+    foreign.delete(sessionID);
+    return "ours";
+  }
+  return foreign.has(sessionID) && at === undefined ? "theirs" : "ask";
+}
+function ocV1Backfill(sessionID, info) {
+  const i = asRecord3(info);
+  const created = Number(asRecord3(i?.time)?.created);
+  const out = [v1("session.created", {
+    sessionID,
+    info: {
+      id: sessionID,
+      parentID: i?.parentID,
+      title: i?.title,
+      agent: i?.agent,
+      ...Number.isFinite(created) && created > 0 ? { time: { created } } : {}
+    }
+  })];
+  if (asRecord3(i?.model))
+    out.push(assistantMessage(sessionID, i?.model, undefined));
+  return out;
 }
 function assistantMessage(sessionID, model, agent) {
   const m = asRecord3(model);
@@ -6019,6 +6044,8 @@ var setup = async (ctx) => {
     const directory = typeof ctx.location?.directory === "string" && ctx.location.directory.length > 0 ? ctx.location.directory : undefined;
     const sessions = new Map;
     const known = new Set;
+    const foreign = new Set;
+    const getSession = ctx.session?.get;
     const hooks = await server({
       directory,
       client: typeof reply === "function" ? ocV2Client((i) => reply.call(ctx.permission, i), (id) => sessions.get(id)) : undefined,
@@ -6028,10 +6055,36 @@ var setup = async (ctx) => {
     if (!onEvent)
       return;
     const abort = new AbortController;
-    const dispatch = (event) => {
-      if (!ocV2InScope(event, directory, known))
+    const adopt = async (event, sessionID) => {
+      let info;
+      try {
+        const got = typeof getSession === "function" ? await getSession.call(ctx.session, { sessionID }) : undefined;
+        const record = got;
+        info = record?.id !== undefined ? record : record?.data;
+      } catch {}
+      const at = info?.location?.directory ?? event.location?.directory;
+      if (typeof at !== "string" || directory !== undefined && at !== directory) {
+        foreign.add(sessionID);
+        return false;
+      }
+      known.add(sessionID);
+      foreign.delete(sessionID);
+      if (info && event.type !== "session.deleted") {
+        for (const replayed of ocV1Backfill(sessionID, info))
+          onEvent({ event: replayed });
+      }
+      return true;
+    };
+    const dispatch = async (event) => {
+      const scope = ocV2Scope(event, directory, known, foreign);
+      if (scope === "theirs")
         return;
       const e = event;
+      if (scope === "ask") {
+        const sessionID = e.data?.sessionID ?? e.data?.form?.sessionID;
+        if (typeof sessionID !== "string" || !await adopt(event, sessionID))
+          return;
+      }
       if (e.type === "permission.asked" && typeof e.data?.id === "string" && typeof e.data.sessionID === "string") {
         sessions.set(e.data.id, e.data.sessionID);
       } else if (e.type === "permission.replied" && typeof e.data?.requestID === "string") {
@@ -6045,7 +6098,7 @@ var setup = async (ctx) => {
         try {
           for await (const event of subscribe.call(ctx.event, { types: OC_V2_EVENT_TYPES, signal: abort.signal })) {
             try {
-              dispatch(event);
+              await dispatch(event);
             } catch {}
           }
         } catch {}

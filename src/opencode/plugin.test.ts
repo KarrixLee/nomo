@@ -14,6 +14,7 @@ const driver = join(import.meta.dir, "../test/opencode-plugin-driver.ts");
 
 async function replay(scenario: {
   hold: boolean; gateFirstEvent?: boolean; steps: unknown[]; v2?: boolean; answer?: string;
+  sessions?: Record<string, unknown>;
 }): Promise<string[]> {
   const home = await mkdtemp(join(tmpdir(), "oc-plugin-"));
   try {
@@ -156,5 +157,24 @@ describe("OpenCode 2.x through setup()", () => {
     expect(log.filter((entry) => entry.startsWith("TIMEOUT"))).toEqual([]);
     expect(log).not.toContain("decision");
     expect(log.indexOf("event update working")).toBeGreaterThan(log.indexOf("event update needsAttention"));
+  }, 30000);
+
+  test("a session first met mid-flight is looked up: ours opens a row, a subagent or another folder does not", async () => {
+    const log = await replay({
+      v2: true, hold: true,
+      sessions: {
+        [S]: { id: S, title: "Old work", location: { directory: D }, time: { created: 1_700_000_000_000 } },
+        ses_sub: { id: "ses_sub", parentID: S, location: { directory: D }, time: { created: 1 } },
+        ses_far: { id: "ses_far", location: { directory: "/elsewhere" }, time: { created: 1 } },
+      },
+      steps: [
+        v2("session.execution.started", { sessionID: "ses_far" }, false),
+        v2("session.execution.started", { sessionID: "ses_sub" }, false),
+        v2("session.execution.started", { sessionID: "ses_gone" }, false), // lookup throws: dropped
+        started2, waitFor("event start"), succeeded2, waitFor("event done"),
+      ],
+    });
+    expect(log.filter((entry) => entry.startsWith("TIMEOUT"))).toEqual([]);
+    expect(log.slice(0, 2)).toEqual(["event start working", "event done done"]);
   }, 30000);
 });

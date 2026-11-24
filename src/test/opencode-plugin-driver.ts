@@ -13,6 +13,8 @@
 //                     entries starting with the string · { release } open the gate
 //   - v2              drive the OpenCode 2.x entry (`setup` + a scripted `ctx.event.subscribe` stream);
 //                     each `ctx.permission.reply` is logged as `reply <sessionID> <requestID> <decision>`
+//   - sessions        v2: what `ctx.session.get` returns per sessionID (the bare Info, as 2.4.1 does);
+//                     absent ids throw NotFound
 //   - answer          the phone's decision verb, served on the hold's first poll (default: none, pending)
 
 import { mkdir, writeFile } from "node:fs/promises";
@@ -22,6 +24,7 @@ import plugin from "../opencode/plugin";
 type Step = { ev: unknown } | { waitFor: string; count: number } | { release: true };
 const scenario = JSON.parse(process.argv[2] ?? "{}") as {
   hold?: boolean; gateFirstEvent?: boolean; steps: Step[]; v2?: boolean; answer?: string;
+  sessions?: Record<string, unknown>;
 };
 
 const key = new Uint8Array(32).fill(7) as Bytes;
@@ -83,6 +86,13 @@ async function* stream(signal: AbortSignal): AsyncGenerator<unknown> {
 const v2Cleanup = scenario.v2 ? await plugin.setup({
   location: { directory: "/tmp/oc-driver" },
   event: { subscribe: ({ signal }) => stream(signal) },
+  session: {
+    get: async ({ sessionID }) => {
+      const data = scenario.sessions?.[sessionID];
+      if (data === undefined) throw new Error("Session.NotFoundError");
+      return data;
+    },
+  },
   permission: {
     reply: async (input) => { log.push(`reply ${input.sessionID} ${input.requestID} ${input.decision}`); },
   },

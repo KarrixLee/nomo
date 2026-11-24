@@ -36,7 +36,7 @@ import {
   newOcState, ocEndFrames, ocForgetStatusFrame, OcFrame, ocPromptAsked, ocPromptFrame, ocPromptHeld,
   ocPromptResolved, ocPromptsEndedBy, ocRowHeld, OcState, postOcEvent, reduceOcEvent,
 } from "./state";
-import { OC_V2_EVENT_TYPES, ocV1Events, ocV2Client, ocV2InScope } from "./v2";
+import { OC_V2_EVENT_TYPES, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope } from "./v2";
 
 /** The verified-live shape of OpenCode's `PluginInput` (1.18.15). Declared structurally rather than
  *  imported from `@opencode-ai/plugin`, which is not a dependency of this repo (the plugin ships as a
@@ -354,9 +354,10 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
 };
 
 /** The verified 2.x plugin context (v2.4.1 `@opencode/plugin` promise `Context`), structurally — the
- *  three members this plugin touches. */
+ *  four members this plugin touches. */
 interface OpenCodeV2Context {
   location?: { directory?: unknown };
+  session?: { get?: (input: { sessionID: string }) => Promise<unknown> };
   event?: { subscribe?: (options: { types: readonly string[]; signal: AbortSignal }) => AsyncIterable<unknown> };
   permission?: { reply?: (input: { sessionID: string; requestID: string; decision: string }) => Promise<unknown> };
 }
@@ -375,8 +376,10 @@ const setup = async (ctx: OpenCodeV2Context): Promise<(() => Promise<void>) | un
       : undefined;
     /** permission requestID → its session, because the 2.x reply needs both. */
     const sessions = new Map<string, string>();
-    /** Sessions seen here with OUR location — see ocV2InScope. */
+    /** Sessions that are ours / another directory's — see ocV2Scope. */
     const known = new Set<string>();
+    const foreign = new Set<string>();
+    const getSession = ctx.session?.get;
     const hooks = await server({
       directory,
       client: typeof reply === "function"
@@ -388,9 +391,37 @@ const setup = async (ctx: OpenCodeV2Context): Promise<(() => Promise<void>) | un
     if (!onEvent) return undefined; // not paired — no subscription, nothing to clean up
 
     const abort = new AbortController();
-    const dispatch = (event: unknown): void => {
-      if (!ocV2InScope(event, directory, known)) return;
-      const e = event as { type?: unknown; data?: { id?: unknown; requestID?: unknown; sessionID?: unknown } };
+    /** A session we have never seen: look it up once. Ours → replay its `session.created` first (parent,
+     *  title, start); elsewhere → remember that. A failed lookup falls back to the event's own location. */
+    const adopt = async (event: unknown, sessionID: string): Promise<boolean> => {
+      let info: Record<string, unknown> | undefined;
+      try {
+        const got = typeof getSession === "function" ? await getSession.call(ctx.session, { sessionID }) : undefined;
+        // The promise adapter hands back the Session.Info itself (seen live on 2.4.1), though the HTTP
+        // route wraps it in `{data}` — take either.
+        const record = got as { id?: unknown; data?: Record<string, unknown> } | undefined;
+        info = record?.id !== undefined ? record as Record<string, unknown> : record?.data;
+      } catch { /* not found / not reachable — decided below */ }
+      const at = (info?.location as { directory?: unknown } | undefined)?.directory
+        ?? (event as { location?: { directory?: unknown } }).location?.directory;
+      if (typeof at !== "string" || (directory !== undefined && at !== directory)) { foreign.add(sessionID); return false; }
+      known.add(sessionID);
+      foreign.delete(sessionID);
+      if (info && (event as { type?: unknown }).type !== "session.deleted") {
+        for (const replayed of ocV1Backfill(sessionID, info)) void onEvent({ event: replayed });
+      }
+      return true;
+    };
+    const dispatch = async (event: unknown): Promise<void> => {
+      const scope = ocV2Scope(event, directory, known, foreign);
+      if (scope === "theirs") return;
+      const e = event as { type?: unknown; data?: { id?: unknown; requestID?: unknown; sessionID?: unknown; form?: { sessionID?: unknown } } };
+      if (scope === "ask") {
+        // Awaited, so this session's next events wait behind its replayed `session.created`. Once per
+        // new session, and in-process, so the stream never backs up on it.
+        const sessionID = e.data?.sessionID ?? e.data?.form?.sessionID;
+        if (typeof sessionID !== "string" || !await adopt(event, sessionID)) return;
+      }
       if (e.type === "permission.asked" && typeof e.data?.id === "string" && typeof e.data.sessionID === "string") {
         sessions.set(e.data.id, e.data.sessionID);
       } else if (e.type === "permission.replied" && typeof e.data?.requestID === "string") {
@@ -406,7 +437,7 @@ const setup = async (ctx: OpenCodeV2Context): Promise<(() => Promise<void>) | un
       while (!abort.signal.aborted) {
         try {
           for await (const event of subscribe.call(ctx.event, { types: OC_V2_EVENT_TYPES, signal: abort.signal })) {
-            try { dispatch(event); } catch { /* one malformed event must never break the stream */ }
+            try { await dispatch(event); } catch { /* one malformed event must never break the stream */ }
           }
         } catch { /* fall through to the resubscribe */ }
         if (!abort.signal.aborted) await new Promise((resolve) => setTimeout(resolve, 1000));

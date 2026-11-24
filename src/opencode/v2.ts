@@ -52,22 +52,49 @@ const v1 = (type: string, properties: Record<string, unknown>) => ({ type, prope
 
 /** The 2.x stream is SERVER-wide — the bus is global, and the default background service hosts every
  *  directory with one plugin instance per location — while the 1.x `event` hook was directory-scoped.
- *  So an event for another directory is dropped. TRAP (seen live on 2.4.1): `session.execution.*` and
- *  `session.viewed` carry NO location, so "no location" cannot mean "ours" — that would let every
- *  instance adopt every directory's turns. A location-less event is ours only when its session already
- *  showed up here WITH our location (`session.created` / `session.step.started` always carry one).
- *  `known` is that set; this function maintains it. */
-export function ocV2InScope(event: unknown, directory: string | undefined, known: Set<string>): boolean {
+ *  Whose is this event?
+ *   - "theirs": another directory's (stamped with it, or its session was looked up and found elsewhere);
+ *   - "ours":   a session already seen here, or one born here (`session.created` with our location);
+ *   - "ask":    a session we have never seen. TRAP (seen live on 2.4.1): `session.execution.*` and
+ *               `permission.replied` carry NO location, so "no location" cannot mean "ours" — the caller
+ *               looks the session up (`ctx.session.get`), which also recovers its parent and title when
+ *               it predates this plugin instance (a continued session, a plugin reload, a subagent).
+ *  `known` / `foreign` are the memo; this function maintains `known` for what it can decide alone. */
+export function ocV2Scope(
+  event: unknown, directory: string | undefined, known: Set<string>, foreign: Set<string>,
+): "ours" | "theirs" | "ask" {
   const e = asRecord(event);
   const d = asRecord(e?.data);
   const sessionID = asString(d?.sessionID) ?? asString(asRecord(d?.form)?.sessionID);
   const at = asString(asRecord(e?.location)?.directory);
-  if (at !== undefined && directory !== undefined && at !== directory) return false;
-  if (sessionID === undefined) return true;
-  if (at === undefined && directory !== undefined && !known.has(sessionID)) return false;
-  if (e?.type === "session.deleted") known.delete(sessionID);
-  else known.add(sessionID);
-  return true;
+  const elsewhere = at !== undefined && directory !== undefined && at !== directory;
+  if (sessionID === undefined) return elsewhere ? "theirs" : "ours";
+  if (elsewhere) { known.delete(sessionID); foreign.add(sessionID); return "theirs"; }
+  if (known.has(sessionID)) {
+    if (e?.type === "session.deleted") known.delete(sessionID);
+    return "ours";
+  }
+  if (e?.type === "session.created" && at !== undefined) { known.add(sessionID); foreign.delete(sessionID); return "ours"; }
+  return foreign.has(sessionID) && at === undefined ? "theirs" : "ask";
+}
+
+/** The 1.x `session.created` for a session first met mid-flight, from its `ctx.session.get` record
+ *  (`Session.Info`, `time.created` as epoch ms). Its parentID is what keeps a subagent
+ *  that predates us off the phone as a row of its own; its title is what a continued session would
+ *  otherwise never get (2.x renames once, where 1.x re-sent the title on every `session.updated`).
+ *  Like any created session, the next busy opens its row with a `start`. */
+export function ocV1Backfill(sessionID: string, info: unknown): unknown[] {
+  const i = asRecord(info);
+  const created = Number(asRecord(i?.time)?.created);
+  const out: unknown[] = [v1("session.created", {
+    sessionID,
+    info: {
+      id: sessionID, parentID: i?.parentID, title: i?.title, agent: i?.agent,
+      ...(Number.isFinite(created) && created > 0 ? { time: { created } } : {}),
+    },
+  })];
+  if (asRecord(i?.model)) out.push(assistantMessage(sessionID, i?.model, undefined));
+  return out;
 }
 
 /** The assistant `message.updated` the 1.x reducer reads the model (and the latched agent) from. */
