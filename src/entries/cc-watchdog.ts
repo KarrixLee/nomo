@@ -58,7 +58,7 @@ import {
   forgetDevinGrants, GONE_STRIKE_LIMIT, isFreeMode, lanBlockedByFreeMode, loadConfig, applyTierFromResponse, loadPendingConfig, localApprovalsState,
   PAIR_HTML_FILE, PairPollResult, parseWatchdogPidfile, PendingConfig, pidAlive, PLUGIN_VERSION, readDecisionHoldAt, readPrefix, readSuffix, recordGoneStrike, removeRevokedConfig,
   resetGoneStrikes, resolveGitDir, SessionRecord, sessionBranch, sidField, SESSIONS_DIR, traceSession, tracePlanPickerDecision, watchdogBuildDiffers,
-  recordVersionField, watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, watchdogVersionOutranks, writeInterruptFlagAt,
+  carriedSessionKeys, recordVersionField, watchdogBuildStamp, watchdogHolderIsLive, WATCHDOG_PID_PATH, watchdogVersionOutranks, writeInterruptFlagAt,
 } from "../core/shared";
 import { rememberBounded } from "../core/bounded-set";
 import { startActivityLoop } from "../core/activity";
@@ -328,6 +328,8 @@ export async function buildDoneEnvelope(sessionId: string, record: SessionRecord
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
     ...recordVersionField(record),
+    // OpenCode 2.x's append-last keys, kept from the record's own blob (pickCarriedKeys).
+    ...(await carriedSessionKeys(record, e2eKey, "done")),
     // Antigravity's append-last `surface` (hook.ts extraFields): without it the phone cannot tell a
     // watchdog-settled idle `agy` CLI row is resumable. Only an Antigravity transcript path yields one.
     ...(antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}),
@@ -385,6 +387,8 @@ export async function buildNeedsAttentionEnvelope(
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
     ...recordVersionField(record),
+    // OpenCode 2.x's append-last keys, kept from the record's own blob (pickCarriedKeys).
+    ...(await carriedSessionKeys(record, e2eKey, "needsAttention")),
     // Antigravity's append-last `surface` (hook.ts extraFields): without it the phone cannot tell a
     // watchdog-settled idle `agy` CLI row is resumable. Only an Antigravity transcript path yields one.
     ...(antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}),
@@ -426,6 +430,8 @@ export async function buildWorkingEnvelope(
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
     ...recordVersionField(record),
+    // OpenCode 2.x's append-last keys, kept from the record's own blob (pickCarriedKeys).
+    ...(await carriedSessionKeys(record, e2eKey, "working")),
     // Antigravity's append-last `surface` (hook.ts extraFields): without it the phone cannot tell a
     // watchdog-settled idle `agy` CLI row is resumable. Only an Antigravity transcript path yields one.
     ...(antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}),
@@ -3462,6 +3468,8 @@ export async function buildTitleRepairEnvelope(
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
     ...recordVersionField(record),
+    // OpenCode 2.x's append-last keys, kept from the record's own blob (pickCarriedKeys).
+    ...(await carriedSessionKeys(record, e2eKey, statusFromRecord(record))),
   };
   const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title", classifier: statusFromRecord(record), marker: record.pendingPlanPicker ? "p" : record.planPickerVerificationPending ? "v" : record.planPickerSettled ? "s" : "0", by: "wd",

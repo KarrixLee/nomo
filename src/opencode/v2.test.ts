@@ -3,7 +3,7 @@ import { ocDecisionRequest, ocReplyFor, ocResolvedRequestId } from "./approvals"
 import plugin from "./plugin";
 import { newOcState, ocPromptAsked, ocPromptsEndedBy, reduceOcEvent } from "./state";
 import type { OcFrame, OcState } from "./state";
-import { OC_V2_EVENT_TYPES, ocClientCount, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope, ocWatchClients, ocWatchdogServesUs, resolveRuntime } from "./v2";
+import { OC_V2_EVENT_TYPES, ocClientCount, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope, ocErrorReason, ocWatchClients, ocWatchdogServesUs, resolveRuntime } from "./v2";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -528,5 +528,24 @@ describe("resolveRuntime — the resident plugin must be able to START the watch
     writeFileSync(join(cc, "runtime"), "NONE:1");
     const fallback = resolveRuntime({ PATH: "", HOME: root }, cc);
     expect(fallback === undefined || fallback.startsWith("/")).toBe(true); // only system candidates remain
+  });
+});
+
+describe("failed turns carry a short reason", () => {
+  test("execution.failed → outcome failed + outcomeReason; an interrupt has no reason", () => {
+    const state = newOcState(true);
+    fold(state, created(), started(), step());
+    const [failed] = fold(state, ev("session.execution.failed", { sessionID: S, error: { type: "ProviderAuthError", message: "Insufficient balance.\nSubscribe to OpenCode Go" } }, null));
+    expect(failed).toMatchObject({ outcome: "failed", outcomeReason: "Insufficient balance. Subscribe to OpenCode Go" });
+    fold(state, started(), step());
+    const [interrupted] = fold(state, ev("session.execution.interrupted", { sessionID: S, reason: "user" }, null));
+    expect(interrupted).toMatchObject({ outcome: "interrupted" });
+    expect(interrupted.outcomeReason).toBeUndefined();
+  });
+  test("ocErrorReason: message else type, one line, capped", () => {
+    expect(ocErrorReason({ type: "T", message: " a\n\tb " })).toBe("a b");
+    expect(ocErrorReason({ type: "OnlyType" })).toBe("OnlyType");
+    expect(ocErrorReason({})).toBeUndefined();
+    expect(ocErrorReason({ message: "x".repeat(400) })!.length).toBe(160);
   });
 });

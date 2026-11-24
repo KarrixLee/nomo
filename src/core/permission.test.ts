@@ -1149,6 +1149,19 @@ describe("runPermissionHook — hold state machine", () => {
   // decisionPending row reached the phone with no honest event time at all — and the codex E2E vector
   // (cc-e2e-test-vectors.json: status decisionPending, "at": 1784937605) described a frame the plugin
   // never actually emitted. Both sealed variants carry it, since both derive from the same base blob.
+  test("cardExtra (OpenCode 2.x) rides last on the card, and its `controls` on the plain fallback too", async () => {
+    const { fn, calls } = scriptFetch(false, []);
+    const cardExtra = { permissionProjectGrant: "cmd:git status", controls: ["reply", "interrupt", "denyNote"] };
+    await runPermissionHook(baseDeps({ fetchFn: fn, emit: () => {}, cardExtra }) as never);
+    const body = JSON.parse(calls.find((c) => c.method === "POST" && c.url.endsWith("/v1/cc/decision"))!.body!);
+    const blob = (await decryptBlob(KEY, body.blob)) as Record<string, unknown>;
+    const fb = (await decryptBlob(KEY, body.fallbackBlob)) as Record<string, unknown>;
+    expect(Object.keys(blob).slice(-2)).toEqual(["permissionProjectGrant", "controls"]);
+    expect(blob).toMatchObject(cardExtra);
+    expect(fb.controls).toEqual(cardExtra.controls);
+    expect(fb).not.toHaveProperty("permissionProjectGrant");
+  });
+
   test("the held frame carries `at` (epoch SECONDS of the event) in BOTH the blob and the fallbackBlob", async () => {
     const nowMs = 1_784_937_605_400;                                  // the vector's epoch second, plus 400 ms
     const { fn, calls } = scriptFetch(false, []);

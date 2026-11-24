@@ -2210,7 +2210,11 @@ export async function runPermissionHook(
     // see. It rejects a detail sealed under a different hold outright (see postFullText).
     const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail));
-    const fallbackBlob = await encryptBlob(config.e2eKey, base);
+    // OpenCode 2.x's session-level `controls` rides the plain frames too (the fallback and its stalled
+    // twin), so no frame source of the row drops it (docs/opencode-2x-remote-contract.md).
+    const plainBase: Record<string, unknown> = Array.isArray(deps.cardExtra?.controls)
+      ? { ...base, controls: deps.cardExtra!.controls } : base;
+    const fallbackBlob = await encryptBlob(config.e2eKey, plainBase);
 
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -2367,7 +2371,7 @@ export async function runPermissionHook(
     const stalledPatch = async (at: number): Promise<Partial<SessionRecord>> => {
       let stalledBlob = fallbackBlob;
       try {
-        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at / 1000) });
+        stalledBlob = await encryptBlob(config.e2eKey, { ...plainBase, reconnecting: Math.floor(at / 1000) });
       } catch { /* the plain attention frame is still honest, just less specific */ }
       return { ts: at, blob: stalledBlob, attentionStalledAt: at };
     };

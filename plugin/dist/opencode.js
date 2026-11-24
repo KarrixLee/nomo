@@ -4895,7 +4895,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     }
     const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail));
-    const fallbackBlob = await encryptBlob(config.e2eKey, base);
+    const plainBase = Array.isArray(deps.cardExtra?.controls) ? { ...base, controls: deps.cardExtra.controls } : base;
+    const fallbackBlob = await encryptBlob(config.e2eKey, plainBase);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     let lastPostTs = 0;
@@ -4986,7 +4987,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const stalledPatch = async (at) => {
       let stalledBlob = fallbackBlob;
       try {
-        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at / 1000) });
+        stalledBlob = await encryptBlob(config.e2eKey, { ...plainBase, reconnecting: Math.floor(at / 1000) });
       } catch {}
       return { ts: at, blob: stalledBlob, attentionStalledAt: at };
     };
@@ -5712,6 +5713,8 @@ function finishTurn(state, sessionId, entry, now, hints) {
   const done = frame(sessionId, entry, "done", "done", now);
   if (hints?.outcome === "failed" || hints?.outcome === "interrupted")
     done.outcome = hints.outcome;
+  if (done.outcome === "failed" && typeof hints?.reason === "string" && hints.reason)
+    done.outcomeReason = hints.reason;
   if (state.v2) {
     let bg = 0;
     for (const child of state.running)
@@ -5925,6 +5928,16 @@ async function postOcEvent(config, envelope) {
 // src/opencode/v2.ts
 import { accessSync, constants, readFileSync as readFileSync3 } from "node:fs";
 import { delimiter as delimiter2, isAbsolute as isAbsolute5, join as join5 } from "node:path";
+function ocErrorReason(error) {
+  const e = asRecord3(error);
+  const raw = asString3(e?.message) ?? asString3(e?.type);
+  if (!raw)
+    return;
+  const clean = raw.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!clean)
+    return;
+  return clean.length <= 160 ? clean : `${clean.slice(0, 159)}…`;
+}
 var OC_V2_EVENT_TYPES = [
   "session.created",
   "session.renamed",
@@ -6045,12 +6058,16 @@ function ocV1Events(event) {
     case "session.execution.succeeded":
       return sessionID ? [v1("session.status", { sessionID, status: { type: "idle" } })] : [];
     case "session.execution.failed":
-    case "session.execution.interrupted":
-      return sessionID ? [v1("session.status", {
+    case "session.execution.interrupted": {
+      if (!sessionID)
+        return [];
+      const reason = type === "session.execution.failed" ? ocErrorReason(d.error) : undefined;
+      return [v1("session.status", {
         sessionID,
         status: { type: "idle" },
-        nomo: { outcome: type === "session.execution.failed" ? "failed" : "interrupted" }
-      })] : [];
+        nomo: { outcome: type === "session.execution.failed" ? "failed" : "interrupted", ...reason ? { reason } : {} }
+      })];
+    }
     case "session.retry.scheduled": {
       if (!sessionID)
         return [];
@@ -6284,6 +6301,7 @@ async function ocExtraFields(ctx, frame) {
     ...frame.retryAt !== undefined ? { retryAt: frame.retryAt } : {},
     ...frame.retryReason ? { retryReason: frame.retryReason } : {},
     ...frame.outcome ? { outcome: frame.outcome } : {},
+    ...frame.outcomeReason ? { outcomeReason: frame.outcomeReason } : {},
     ...frame.bgAgents ? { bgAgents: frame.bgAgents } : {},
     ...Object.keys(replies).length > 0 ? { replies } : {}
   };

@@ -49,6 +49,8 @@ export interface OcFrame {
   outcome?: "failed" | "interrupted";
   /** Done frames: background subagents of this session still running (> 0 only). */
   bgAgents?: number;
+  /** With `outcome: "failed"`: the provider's error message, one line, ≤ 160 chars (when known). */
+  outcomeReason?: string;
 }
 
 export interface OcSessionState {
@@ -114,7 +116,7 @@ export function newOcState(v2 = false): OcState {
 
 /** The honest-state hints v2.ts attaches to a translated 1.x event as `properties.nomo`. Read only
  *  when `state.v2`. */
-interface OcHints { retryAt?: unknown; retryReason?: unknown; outcome?: unknown; phase?: unknown }
+interface OcHints { retryAt?: unknown; retryReason?: unknown; outcome?: unknown; phase?: unknown; reason?: unknown }
 
 /** The row a session's events belong to: itself, or the top of its subagent chain. */
 export function ocRootSession(state: OcState, sessionId: string): string {
@@ -398,6 +400,7 @@ function finishTurn(
   // vanished on any session older than half an hour.
   const done = frame(sessionId, entry, "done", "done", now);
   if (hints?.outcome === "failed" || hints?.outcome === "interrupted") done.outcome = hints.outcome;
+  if (done.outcome === "failed" && typeof hints?.reason === "string" && hints.reason) done.outcomeReason = hints.reason;
   if (state.v2) {
     // ponytail: a snapshot at turn end. OpenCode wakes the parent when its subagents report back, and
     // that turn's done re-counts; no separate update is sent when one finishes in between.

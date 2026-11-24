@@ -103,6 +103,7 @@ Exactly the existing command: `interrupt-session` `{kind, sessionId, ts, nonce}`
 | `retryReason` | `"rateLimited"` | with `retryAt` | the provider said 429 / rate limit ("Retrying (rate limited)") |
 | `phase` | `"compacting"` | `working` | OpenCode is summarizing the context ("Compacting") |
 | `outcome` | `"failed"` \| `"interrupted"` | `done` | the turn did not succeed ("Failed" / "Interrupted"); absent = succeeded |
+| `outcomeReason` | String, one line, ≤ 160 chars | `done` with `outcome: "failed"` | the provider's error message, when OpenCode gives one (e.g. "Insufficient balance…") |
 | `bgAgents` | Int > 0 | `done` | background subagents of this session still running ("Idle · 2 subagents running") |
 
 - `detail` is unchanged (`"retrying"` still renders "Reconnecting…" on older apps), and no new
@@ -112,10 +113,26 @@ Exactly the existing command: `interrupt-session` `{kind, sessionId, ts, nonce}`
 - Per the transient-failure rule, show `retrying` in amber/positive copy; `outcome: "failed"` is a
   finished state, not a transient.
 
-## 7. Key order (sealed blob)
+## 7. Every frame source carries them
 
-Base keys, then `controls`, `phase`, `retryAt`, `retryReason`, `outcome`, `bgAgents`, `replies`,
-then the fitted `plan`. On the card: the existing permission tail, `permissionGrant`, then
+A row can be painted from several frames for the same state. The plugin's own frame (worker), the
+watchdog's heartbeat (the record's blob verbatim), the watchdog's correctives (done / needsAttention /
+working / title repair, rebuilt from the record), the LAN state frame (done rows are rebuilt from the
+record), and the hold card with its plain fallback. All of them now carry the same keys:
+- `controls` and `replies` on every frame of the session.
+- `outcome`, `outcomeReason` and `bgAgents` on done frames.
+- `phase`, `retryAt` and `retryReason` on working frames.
+- `permissionProjectGrant` on the card.
+
+A rebuilt frame takes a per-state key only when the record's own blob is the same state, so a
+corrective done never inherits a stale working key. **App side:** the app's own local re-seal (the
+island's `a:roll` frame, `ClaudeCodeActivitySync.blobPlaintext`) must thread these keys too, or the
+island flips between "Interrupted" and "Done" (the two-frame-source trap).
+
+## 8. Key order (sealed blob)
+
+Base keys, then `controls`, `phase`, `retryAt`, `retryReason`, `outcome`, `outcomeReason`, `bgAgents`,
+`replies`, then the fitted `plan`. On the card: the existing permission tail, `permissionGrant`, then
 `permissionProjectGrant`, `controls`.
 
 ## Not possible on OpenCode 2.x (unchanged)

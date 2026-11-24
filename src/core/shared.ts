@@ -16,7 +16,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { b64url, Bytes, deriveE2EKey, deriveRatchetKey, encryptBlob, fromB64url } from "./crypto";
+import { b64url, Bytes, decryptBlob, deriveE2EKey, deriveRatchetKey, encryptBlob, fromB64url } from "./crypto";
 // TYPE-ONLY (erased at build): PendingEventStash.blob IS buildBlob's return type, and duplicating it
 // here is what let the two drift apart.
 import type { buildBlob } from "./hook";
@@ -333,6 +333,37 @@ export function runtimeArgs(runtime: string, args: string[]): string[] {
  *  tails), and omits it when the id is unknown — never empty. */
 export function sidField(sessionId: unknown): { sid?: string } {
   return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
+}
+
+/** OpenCode 2.x's append-last keys (docs/opencode-2x-remote-contract.md) that a frame REBUILT from the
+ *  session record — a watchdog corrective or a LAN state frame — must keep, or the phone flips between
+ *  the plugin's frame and the rebuilt one ("Interrupted" ↔ "Done"). `controls` and `replies` are
+ *  session-level and always kept; the per-state keys only when the record's own blob describes the SAME
+ *  status as the rebuilt frame (a corrective done over a working blob inherits no `outcome`). Pure. */
+export function pickCarriedKeys(carried: Record<string, unknown>, status: unknown): Record<string, unknown> {
+  const same = carried.status === status;
+  const keep = (k: string, when = true) => (when && carried[k] !== undefined ? { [k]: carried[k] } : {});
+  return {
+    ...keep("controls"),
+    ...keep("phase", same && status === "working"), ...keep("retryAt", same && status === "working"),
+    ...keep("retryReason", same && status === "working"),
+    ...keep("outcome", same && status === "done"), ...keep("outcomeReason", same && status === "done"),
+    ...keep("bgAgents", same && status === "done"),
+    ...keep("replies"),
+  };
+}
+
+/** pickCarriedKeys from an OpenCode record's own sealed blob; {} for every other agent (their rebuilt
+ *  blobs stay byte-identical) or an unreadable blob. */
+export async function carriedSessionKeys(
+  record: { agent?: unknown; blob?: unknown } | null | undefined, e2eKey: Bytes, status: unknown,
+): Promise<Record<string, unknown>> {
+  if (record?.agent !== "opencode" || typeof record.blob !== "string" || record.blob.length === 0) return {};
+  try {
+    return pickCarriedKeys(await decryptBlob(e2eKey, record.blob) as Record<string, unknown>, status);
+  } catch {
+    return {};
+  }
 }
 
 /** 2.5.3: the session's OWN integration version, restated by a blob a watchdog rebuilds from the record

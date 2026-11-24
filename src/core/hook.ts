@@ -375,7 +375,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
    *  plan gets only the room these leave under the sealed ceiling (Antigravity's `surface`/`replies`,
    *  OpenCode 2.x's `controls`/`replies`/honest-state keys). Undefined → byte-identical blob. */
   extra?: Record<string, unknown>): {
-  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; folderKey?: string; branch?: string; sid?: string; plan?: string; dbg?: string;
+  status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; folderKey?: string; branch?: string; sid?: string; pluginVersion?: string; plan?: string; dbg?: string;
 } {
   const folder = folderIdentity(input.cwd, pinnedFolder);
   const { label, folderKey } = folder;

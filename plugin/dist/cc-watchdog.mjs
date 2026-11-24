@@ -247,6 +247,29 @@ function runtimeArgs(runtime, args) {
 function sidField(sessionId) {
   return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
 }
+function pickCarriedKeys(carried, status) {
+  const same = carried.status === status;
+  const keep = (k, when = true) => when && carried[k] !== undefined ? { [k]: carried[k] } : {};
+  return {
+    ...keep("controls"),
+    ...keep("phase", same && status === "working"),
+    ...keep("retryAt", same && status === "working"),
+    ...keep("retryReason", same && status === "working"),
+    ...keep("outcome", same && status === "done"),
+    ...keep("outcomeReason", same && status === "done"),
+    ...keep("bgAgents", same && status === "done"),
+    ...keep("replies")
+  };
+}
+async function carriedSessionKeys(record, e2eKey, status) {
+  if (record?.agent !== "opencode" || typeof record.blob !== "string" || record.blob.length === 0)
+    return {};
+  try {
+    return pickCarriedKeys(await decryptBlob(e2eKey, record.blob), status);
+  } catch {
+    return {};
+  }
+}
 function recordVersionField(record) {
   const v = record?.pluginVersion;
   return typeof v === "string" && v.length > 0 ? { pluginVersion: v } : {};
@@ -3801,7 +3824,7 @@ function computeSessionState(input) {
   const startedAt = finite(record.sessionStartedAt) ? { startedAt: record.sessionStartedAt } : {};
   const sealed = { kind: "sealed", value: record.blob };
   const asking = record.attentionKind === "userInput" ? { attentionKind: "userInput" } : {};
-  const authored = (value) => ({ kind: "plain", value, ...agent === "antigravity" ? { carry: record.blob } : {} });
+  const authored = (value) => ({ kind: "plain", value, ...agent === "antigravity" || agent === "opencode" ? { carry: record.blob } : {} });
   const of = (state, why, blob, at, terminal = false) => ({ state, terminal, ts: at, why, blob, agent, ...startedAt });
   if (correctives?.ended === true)
     return of("ended", "end", sealed, ts, true);
@@ -6301,8 +6324,8 @@ function createLanFrameStore(deps = {}) {
       let value = blob.value;
       if (blob.carry) {
         try {
-          const { surface, replies } = await decryptBlob(e2eKey, blob.carry);
-          value = { ...value, ...surface !== undefined ? { surface } : {}, ...replies !== undefined ? { replies } : {} };
+          const c = await decryptBlob(e2eKey, blob.carry);
+          value = { ...value, ...c.surface !== undefined ? { surface: c.surface } : {}, ...pickCarriedKeys(c, value.status) };
         } catch {}
       }
       try {
@@ -8524,7 +8547,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     }
     const fullUpload = postFullText(config, sessionId, "permission-detail", detailFull, fetchFn, trace, requestId);
     const blob = await encryptBlob(config.e2eKey, permissionFrame(permissionBase, fitted.detail, fitted.omitted, fitted.questions, diffTail));
-    const fallbackBlob = await encryptBlob(config.e2eKey, base);
+    const plainBase = Array.isArray(deps.cardExtra?.controls) ? { ...base, controls: deps.cardExtra.controls } : base;
+    const fallbackBlob = await encryptBlob(config.e2eKey, plainBase);
     const pcHeaders = { "x-cc-pairing": config.pairingId, "x-cc-auth": config.pcSecret, "x-cc-version": PLUGIN_VERSION };
     const sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     let lastPostTs = 0;
@@ -8615,7 +8639,7 @@ async function runPermissionHook(deps = {}, agent = "claude") {
     const stalledPatch = async (at) => {
       let stalledBlob = fallbackBlob;
       try {
-        stalledBlob = await encryptBlob(config.e2eKey, { ...base, reconnecting: Math.floor(at / 1000) });
+        stalledBlob = await encryptBlob(config.e2eKey, { ...plainBase, reconnecting: Math.floor(at / 1000) });
       } catch {}
       return { ts: at, blob: stalledBlob, attentionStalledAt: at };
     };
@@ -10620,6 +10644,7 @@ async function buildDoneEnvelope(sessionId, record, now, e2eKey, agent = "claude
     ...branch ? { branch } : {},
     ...sidField(sessionId),
     ...recordVersionField(record),
+    ...await carriedSessionKeys(record, e2eKey, "done"),
     ...antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "done", classifier: "done", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
@@ -10642,6 +10667,7 @@ async function buildNeedsAttentionEnvelope(sessionId, record, now, e2eKey, agent
     ...branch ? { branch } : {},
     ...sidField(sessionId),
     ...recordVersionField(record),
+    ...await carriedSessionKeys(record, e2eKey, "needsAttention"),
     ...antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "attention", classifier: "pending", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
@@ -10672,6 +10698,7 @@ async function buildWorkingEnvelope(sessionId, record, now, e2eKey, agent = "cla
     ...branch ? { branch } : {},
     ...sidField(sessionId),
     ...recordVersionField(record),
+    ...await carriedSessionKeys(record, e2eKey, "working"),
     ...antigravitySurface(record.transcript) ? { surface: antigravitySurface(record.transcript) } : {}
   };
   const debug = appendCodexBridgeMarker(agent === "codex" ? dbg ?? formatPlanPickerDebug({ event: "working", classifier: "resolved", marker: "0", by: "wd" }) : undefined, codexBridgeIsDown());
@@ -12345,7 +12372,8 @@ async function buildTitleRepairEnvelope(sessionId, record, title, now, e2eKey, a
     ...typeof record.folderKey === "string" && record.folderKey.length > 0 ? { folderKey: record.folderKey } : {},
     ...branch ? { branch } : {},
     ...sidField(sessionId),
-    ...recordVersionField(record)
+    ...recordVersionField(record),
+    ...await carriedSessionKeys(record, e2eKey, statusFromRecord(record))
   };
   const dbg = appendCodexBridgeMarker(agent === "codex" ? record.dbg ?? formatPlanPickerDebug({
     event: "title",

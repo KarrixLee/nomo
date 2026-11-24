@@ -38,6 +38,17 @@ import { accessSync, constants, readFileSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 import { CC_DIR, parseWatchdogPidfile, pidAlive, PLUGIN_VERSION, watchdogVersionOutranks } from "../core/shared";
 
+/** A SessionError (`{type, message}`) as a short, single-line reason for the sealed `outcomeReason`:
+ *  the message (else the type), control characters folded to spaces, capped at 160 characters. */
+export function ocErrorReason(error: unknown): string | undefined {
+  const e = asRecord(error);
+  const raw = asString(e?.message) ?? asString(e?.type);
+  if (!raw) return undefined;
+  const clean = raw.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  if (!clean) return undefined;
+  return clean.length <= 160 ? clean : `${clean.slice(0, 159)}…`;
+}
+
 /** Every 2.x type the translator reads — the subscription filter, so OpenCode never encodes the rest. */
 export const OC_V2_EVENT_TYPES = [
   "session.created", "session.renamed", "session.agent.selected", "session.step.started",
@@ -165,13 +176,14 @@ export function ocV1Events(event: unknown): unknown[] {
     case "session.execution.succeeded":
       return sessionID ? [v1("session.status", { sessionID, status: { type: "idle" } })] : [];
     case "session.execution.failed":
-    case "session.execution.interrupted":
-      return sessionID
-        ? [v1("session.status", {
-          sessionID, status: { type: "idle" },
-          nomo: { outcome: type === "session.execution.failed" ? "failed" : "interrupted" },
-        })]
-        : [];
+    case "session.execution.interrupted": {
+      if (!sessionID) return [];
+      const reason = type === "session.execution.failed" ? ocErrorReason(d.error) : undefined;
+      return [v1("session.status", {
+        sessionID, status: { type: "idle" },
+        nomo: { outcome: type === "session.execution.failed" ? "failed" : "interrupted", ...(reason ? { reason } : {}) },
+      })];
+    }
     case "session.retry.scheduled": {
       if (!sessionID) return [];
       // `at` is the next attempt in epoch MS (core/session/runner/retry.ts: scheduled + delay).

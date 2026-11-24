@@ -182,6 +182,7 @@ async function ocExtraFields(ctx: OcContext, frame: OcFrame): Promise<Record<str
     ...(frame.retryAt !== undefined ? { retryAt: frame.retryAt } : {}),
     ...(frame.retryReason ? { retryReason: frame.retryReason } : {}),
     ...(frame.outcome ? { outcome: frame.outcome } : {}),
+    ...(frame.outcomeReason ? { outcomeReason: frame.outcomeReason } : {}),
     ...(frame.bgAgents ? { bgAgents: frame.bgAgents } : {}),
     ...(Object.keys(replies).length > 0 ? { replies } : {}),
   };
