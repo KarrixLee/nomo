@@ -11,9 +11,12 @@ import {
   parseState, runActivityCycle, scanAll, serializeState, startActivityLoop, State,
 } from "./activity";
 
-const asst = (id: string, req: string, ts: string, out = 10, sid = "s1") => JSON.stringify({
+const asst = (id: string, req: string, ts: string, out = 10, sid = "s1", thinking?: number) => JSON.stringify({
   type: "assistant", timestamp: ts, sessionId: sid, requestId: req, userType: "external",
-  message: { id, model: "claude-x", usage: { input_tokens: 1, output_tokens: out, cache_creation_input_tokens: 2, cache_read_input_tokens: 3 } },
+  message: { id, model: "claude-x", usage: {
+    input_tokens: 1, output_tokens: out, cache_creation_input_tokens: 2, cache_read_input_tokens: 3,
+    ...(thinking !== undefined ? { output_tokens_details: { thinking_tokens: thinking } } : {}),
+  } },
 });
 const user = (uuid: string, ts: string, content: unknown = "hi", extra = {}) => JSON.stringify({
   type: "user", userType: "external", timestamp: ts, sessionId: "s1", uuid, message: { role: "user", content }, ...extra,
@@ -54,6 +57,58 @@ describe("claude dedupe + turns", () => {
     writeFileSync(f, [asst("m1", "r1", ts, 5), asst("m1", "r1", ts, 364), asst("m1", "r1", ts, 300), ""].join("\n")); // full re-read
     await scanAll(st, cur, roots, NOW);
     expect(row(st, "2026-11-03")!.u).toEqual([{ m: "claude-x", i: 1, o: 364, cw: 2, cr: 3 }]);
+  });
+
+  test("NOM-177: reasoning growth on a repeated id is added, not only the non-reasoning output", async () => {
+    const f = join(roots.claude, "p", "a.jsonl");
+    const ts = "2026-11-03T01:00:00Z";
+    writeFileSync(f, [asst("m1", "r1", ts, 10, "s1", 0), asst("m1", "r1", ts, 500, "s1", 300), ""].join("\n"));
+    const cur: Cursor = {};
+    let st = emptyState();
+    await scanAll(st, cur, roots, NOW);
+    expect(row(st, "2026-11-03")!.u).toEqual([{ m: "claude-x", i: 1, o: 200, cw: 2, cr: 3, r: 300 }]);
+    appendFileSync(f, asst("m1", "r1", ts, 900, "s1", 600) + "\n"); // more growth in the next scan, after a save/load
+    st = parseState(serializeState(st));
+    await scanAll(st, cur, roots, NOW);
+    expect(row(st, "2026-11-03")!.u).toEqual([{ m: "claude-x", i: 1, o: 300, cw: 2, cr: 3, r: 600 }]);
+    await scanAll(st, {}, roots, NOW); // full re-read adds nothing
+    expect(row(st, "2026-11-03")!.u).toEqual([{ m: "claude-x", i: 1, o: 300, cw: 2, cr: 3, r: 600 }]);
+  });
+
+  test("NOM-177: a message whose lines cross local midnight counts once, on the day of the line seen first", async () => {
+    const before = "2026-11-02T14:59:50Z"; // 23:59:50 JST 11-02
+    const after = "2026-11-02T15:00:10Z"; // 00:00:10 JST 11-03
+    writeFileSync(join(roots.claude, "p", "a.jsonl"), [asst("m1", "r1", before, 5), asst("m1", "r1", after, 364), ""].join("\n"));
+    let st = emptyState();
+    await scanAll(st, {}, roots, NOW);
+    expect(row(st, "2026-11-02")!.u).toEqual([{ m: "claude-x", i: 1, o: 364, cw: 2, cr: 3 }]);
+    expect(row(st, "2026-11-03")).toBeUndefined();
+    // The later line read first (another file, or a resumed copy): still once, on its day.
+    st = emptyState();
+    expect(addEvent(st, parseClaudeLine(asst("m2", "r2", after, 364))!)).toBe(true);
+    expect(addEvent(st, parseClaudeLine(asst("m2", "r2", before, 5))!)).toBe(false);
+    expect(row(st, "2026-11-03")!.u).toEqual([{ m: "claude-x", i: 1, o: 364, cw: 2, cr: 3 }]);
+    expect(row(st, "2026-11-02")).toBeUndefined();
+  });
+
+  test("NOM-177: an id counted by plugin 2.3.6 (no ko entry) still gets later output growth", async () => {
+    const ts = "2026-11-03T01:00:00Z";
+    const st = emptyState();
+    addEvent(st, parseClaudeLine(asst("m1", "r1", ts, 5))!); // 2.3.6 counted the first line in full and kept no ko
+    const old = JSON.parse(serializeState(st));
+    for (const d of old.days) delete d.ko;
+    const st236 = parseState(JSON.stringify(old));
+    writeFileSync(join(roots.claude, "p", "a.jsonl"), [asst("m1", "r1", ts, 5), asst("m1", "r1", ts, 364), ""].join("\n"));
+    await scanAll(st236, {}, roots, NOW); // re-read from the top of the file
+    expect(row(st236, "2026-11-03")!.u).toEqual([{ m: "claude-x", i: 1, o: 364, cw: 2, cr: 3 }]);
+  });
+
+  test("a repeated codex id is a plain duplicate (no growth path)", () => {
+    const st = emptyState();
+    const ev = { ts: Date.parse("2026-11-03T01:00:00Z"), agent: "codex" as const, sessionId: "s", kind: "assistant" as const, id: "cx:u:a:1" };
+    expect(addEvent(st, { ...ev, tokens: { i: 1, o: 5, cw: 0, cr: 0 } })).toBe(true);
+    expect(addEvent(st, { ...ev, tokens: { i: 1, o: 50, cw: 0, cr: 0 } })).toBe(false);
+    expect(row(st, "2026-11-03", "codex")!.u).toEqual([{ m: "unknown", i: 1, o: 5, cw: 0, cr: 0 }]);
   });
 
   test("turns: real prompts only", () => {
