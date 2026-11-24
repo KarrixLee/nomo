@@ -203,6 +203,10 @@ export function antigravitySurface(path: unknown): "cli" | "app" | undefined {
 export function replyRoute(
   record: SessionRecord, resumeAlive: boolean, alive: (pid: number) => boolean,
 ): "queue" | "resume" | "reject" {
+  // OpenCode 2.x (2.5.3): the resident plugin inside the OpenCode server takes the queue (src/opencode/
+  // remote.ts) — busy or idle, `session.prompt` admits it. The record's pid IS that server: gone →
+  // nothing on this Mac can deliver it.
+  if (record.agent === "opencode") return typeof record.pid === "number" && record.pid > 1 && alive(record.pid) ? "queue" : "reject";
   const done = record.op === "done" || record.lastEvent === "done";
   if (!done || resumeAlive) return "queue";
   const surface = antigravitySurface(record.transcript);
@@ -335,7 +339,8 @@ export interface ReplyCommandDeps {
   resume?: (conv: string, cwd: string, text: string) => number | undefined;
 }
 
-/** Execute an authenticated send-message / cancel-message for an Antigravity session. Never throws. */
+/** Execute an authenticated send-message / cancel-message for an Antigravity or OpenCode session. Never
+ *  throws. */
 export async function handleReplyCommand(
   kind: "send-message" | "cancel-message", conv: string, record: SessionRecord,
   payload: { mid?: unknown; text?: unknown }, deps: ReplyCommandDeps,

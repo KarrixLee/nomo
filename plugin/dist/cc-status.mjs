@@ -105,7 +105,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.5.2";
+var PLUGIN_VERSION = "2.5.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2914,7 +2914,9 @@ var opencodeAdapter = {
   toolDetail: {},
   blobAgentFields: { agent: "opencode" },
   ambientPlan: true,
-  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps),
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".oc-interrupt"
 };
 function cursorModel(input) {
   for (const key of ["model", "model_id"]) {
@@ -3675,7 +3677,7 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride, extra) {
   const folder = folderIdentity(input.cwd, pinnedFolder);
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
@@ -3700,7 +3702,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     classifier: plan.status === "needsAttention" ? "attn" : plan.status === "working" ? "work" : "done",
     by: "h"
   }) : undefined;
-  return appendFittedPlanAndDebug(base, proposedPlan, dbg);
+  return appendFittedPlanAndDebug(extra ? { ...base, ...extra } : base, proposedPlan, dbg);
 }
 async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride, extraFields) {
   if (typeof input !== "object" || input === null)
@@ -3716,7 +3718,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride, extraFields);
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}

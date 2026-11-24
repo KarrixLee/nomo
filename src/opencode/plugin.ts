@@ -24,14 +24,16 @@
 import { execFile, spawn } from "node:child_process";
 import { accessSync, constants, readFileSync } from "node:fs";
 import { hostname } from "node:os";
+import { readReceipts } from "../core/antigravity-inbox";
 import { buildEnvelope, markDoneDelivered, trackSession } from "../core/hook";
 import {
   atomicWrite, CC_DIR, Config, ensureWatchdog, folderIdentity, FolderIdentity, fullTextForRecord,
-  lastHookPath, loadConfig, postFullText, runtimeArgs, SessionOrigin, WATCHDOG_PATH,
+  lastHookPath, loadConfig, postFullText, runtimeArgs, SessionOrigin, SESSIONS_DIR, WATCHDOG_PATH,
 } from "../core/shared";
 import {
-  ocDecisionRequest, OcDecisionRequest, ocPost, ocResolvedRequestId, ocResolveOnRelay, runOcApproval,
+  ocDecisionRequest, OcDecisionRequest, ocPost, ocResolvedRequestId, ocResolveOnRelay, ocTrace, runOcApproval,
 } from "./approvals";
+import { ocWatchRemote } from "./remote";
 import {
   newOcState, ocCloseUnattended, ocEndFrames, ocForgetStatusFrame, OcFrame, ocPromptAsked, ocPromptFrame, ocPromptHeld,
   ocPromptResolved, ocPromptsEndedBy, ocRowHeld, OcState, ocUnattendedRoots, postOcEvent, reduceOcEvent,
@@ -61,6 +63,12 @@ interface OpenCodePluginInput {
   /** OpenCode 2.x HEADLESS server only (set by `setup`) — see `isSharedServer`. Close a row parked on a
    *  prompt once no OpenCode window is attached to answer it (NOM-214). */
   watchClients?: boolean;
+  /** OpenCode 2.x only (set by `setup`): the remote controls this OpenCode can honor — any of "reply",
+   *  "interrupt", "denyNote" — sealed as the blob's `controls` on every frame and card. Its presence is
+   *  also what turns on the 2.x-only state (honest-state keys, reply receipts); 1.x never sets it. */
+  controls?: string[];
+  /** OpenCode 2.x only: handed the row-repaint the remote pump calls after it delivers a reply. */
+  onRepublish?: (republish: (sessionID: string) => void) => void;
 }
 
 interface OpenCodeHooks {
@@ -144,6 +152,24 @@ interface OcContext {
   folder: FolderIdentity;
   origin: SessionOrigin;
   state: OcState;
+  /** 2.x: see OpenCodePluginInput.controls. Undefined on 1.x, whose blobs stay byte-identical. */
+  controls?: string[];
+}
+
+/** The 2.x append-last blob keys for one frame (docs/opencode-2x-remote-contract.md), in wire order.
+ *  Undefined on 1.x. */
+async function ocExtraFields(ctx: OcContext, frame: OcFrame): Promise<Record<string, unknown> | undefined> {
+  if (!ctx.controls) return undefined;
+  const replies = await readReceipts(SESSIONS_DIR, frame.sessionId).catch(() => ({}));
+  return {
+    ...(ctx.controls.length > 0 ? { controls: ctx.controls } : {}),
+    ...(frame.phase ? { phase: frame.phase } : {}),
+    ...(frame.retryAt !== undefined ? { retryAt: frame.retryAt } : {}),
+    ...(frame.retryReason ? { retryReason: frame.retryReason } : {}),
+    ...(frame.outcome ? { outcome: frame.outcome } : {}),
+    ...(frame.bgAgents ? { bgAgents: frame.bgAgents } : {}),
+    ...(Object.keys(replies).length > 0 ? { replies } : {}),
+  };
 }
 
 /** Turn one planned frame into the same three effects a hook produces, in the same order: seal the
@@ -168,6 +194,7 @@ async function send(ctx: OcContext, frame: OcFrame): Promise<void> {
     frame.startedAt, frame.turnStartedAt, ctx.folder, frame.model,
     { op: frame.op, prio: frame.prio, status: frame.status },
     undefined, frame.plan, undefined, (plain) => { fittedPlan = plain.plan; }, frame.detail,
+    await ocExtraFields(ctx, frame),
   );
   // An unsealable frame reaches the phone exactly as little as a failed POST does — retract the skip
   // key for the same reason (see ocForgetStatusFrame).
@@ -223,7 +250,8 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
       // every session this instance reports.
       folder: folderIdentity(directory),
       origin: { hook_event_name: "opencode", ...(directory ? { cwd: directory } : {}), ppid: process.ppid },
-      state: newOcState(),
+      state: newOcState(input?.controls !== undefined),
+      ...(input?.controls !== undefined ? { controls: input.controls } : {}),
     };
 
     // Serialize every send. Frames for one session must reach the worker in order, and OpenCode
@@ -298,6 +326,7 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
         serverUrl,
         cwd: ctx.folder.cwd,
         requestId,
+        ...(ctx.controls && ctx.controls.length > 0 ? { cardExtra: { controls: ctx.controls } } : {}),
         // The local no-hold escape hatch: report the session as blocked on the user and let OpenCode's
         // own dialog take it, exactly like the hooks' fire-and-forget delegate.
         delegate: async () => {
@@ -339,6 +368,11 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
       holds.delete(opencodeId);
       void ocResolveOnRelay(ctx.config, requestId);
     };
+
+    // 2.x: a phone reply was delivered (or refused) — repaint the row so its receipt reaches the phone.
+    // Whatever the registry says the row shows now (working / attention); an idle row gets the receipt
+    // on the turn the reply itself starts, and a held card keeps the card (its next frame carries it).
+    input?.onRepublish?.((sessionID) => void repaint(sessionID));
 
     /** NOM-214: on the shared 2.x server, close every row parked on a prompt with no window left to
      *  answer it. Decided inside the chain, at send time, like repaint. */
@@ -394,9 +428,18 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
  *  four members this plugin touches. */
 interface OpenCodeV2Context {
   location?: { directory?: unknown };
-  session?: { get?: (input: { sessionID: string }) => Promise<unknown> };
+  session?: {
+    get?: (input: { sessionID: string }) => Promise<unknown>;
+    /** v2.x `SessionDomain.prompt` — admits a user message; `delivery:"steer"` reaches the model before
+     *  its next call (and wakes an idle session); a repeated `id` is reconciled, never added twice. */
+    prompt?: (input: { sessionID: string; text: string; delivery: "steer"; id: string }) => Promise<unknown>;
+    /** v2.x `SessionDomain.interrupt` → `{interrupted}` (false = nothing was running). */
+    interrupt?: (input: { sessionID: string }) => Promise<unknown>;
+  };
   event?: { subscribe?: (options: { types: readonly string[]; signal: AbortSignal }) => AsyncIterable<unknown> };
-  permission?: { reply?: (input: { sessionID: string; requestID: string; decision: string }) => Promise<unknown> };
+  permission?: {
+    reply?: (input: { sessionID: string; requestID: string; decision: string; message?: string }) => Promise<unknown>;
+  };
 }
 
 /** OpenCode 2.x entry. Runs `server()` with the 2.x reply seam dressed as a 1.x client, then pumps the
@@ -417,6 +460,15 @@ const setup = async (ctx: OpenCodeV2Context): Promise<(() => Promise<void>) | un
     const known = new Set<string>();
     const foreign = new Set<string>();
     const getSession = ctx.session?.get;
+    const prompt = ctx.session?.prompt;
+    const interrupt = ctx.session?.interrupt;
+    // What THIS OpenCode can honor from the phone — only what its context really exposes.
+    const controls = [
+      ...(typeof prompt === "function" ? ["reply"] : []),
+      ...(typeof interrupt === "function" ? ["interrupt"] : []),
+      ...(typeof reply === "function" ? ["denyNote"] : []),
+    ];
+    let republish: (sessionID: string) => void = () => {};
     const hooks = await server({
       directory,
       client: typeof reply === "function"
@@ -424,6 +476,8 @@ const setup = async (ctx: OpenCodeV2Context): Promise<(() => Promise<void>) | un
         : undefined,
       questionsOnComputer: true,
       watchClients: isSharedServer(),
+      controls,
+      onRepublish: (fn) => { republish = fn; },
     });
     const onEvent = hooks.event;
     if (!onEvent) return undefined; // not paired — no subscription, nothing to clean up
@@ -469,6 +523,17 @@ const setup = async (ctx: OpenCodeV2Context): Promise<(() => Promise<void>) | un
       // synchronously and orders its sends on its own chain, and a slow reader overflows the 2.x stream.
       for (const translated of ocV1Events(event)) void onEvent({ event: translated });
     };
+    // Phone Reply / Interrupt, left on disk by the watchdog (see remote.ts). Ownership is this plugin
+    // instance's location — a session never seen here is looked up once, like any event's.
+    const stopRemote = ocWatchRemote({
+      dir: SESSIONS_DIR,
+      owns: async (sessionID) => known.has(sessionID)
+        || (!foreign.has(sessionID) && await adopt({ type: "remote", data: { sessionID } }, sessionID)),
+      prompt: typeof prompt === "function" ? (i) => prompt.call(ctx.session, i) : undefined,
+      interrupt: typeof interrupt === "function" ? (i) => interrupt.call(ctx.session, i) : undefined,
+      published: (sessionID) => republish(sessionID),
+      trace: ocTrace,
+    });
     void (async () => {
       // A failed stream (overflow, reload) is resubscribed; the events in between are lost, which the
       // reducer already tolerates (it adopts sessions it first sees mid-flight).
@@ -483,6 +548,7 @@ const setup = async (ctx: OpenCodeV2Context): Promise<(() => Promise<void>) | un
     })();
     return async () => {
       abort.abort();
+      stopRemote();
       await hooks.dispose?.();
     };
   } catch {

@@ -16,16 +16,23 @@
 //   - sessions        v2: what `ctx.session.get` returns per sessionID (the bare Info, as 2.4.1 does);
 //                     absent ids throw NotFound
 //   - answer          the phone's decision verb, served on the hold's first poll (default: none, pending)
+//   - answerMessage   the deny note sealed with `answer`
+//   - logKeys         also log `keys <op> <json>` per event: the 2.x append-last blob keys it carried
+//   v2 steps also take { write: {name, content} } (a file in the sessions dir, as the watchdog leaves
+//   it) and { sleep: ms }; `ctx.session.prompt` / `.interrupt` are logged as `prompt <sid> <text>
+//   <delivery> <id>` / `interrupt <sid>`.
 
 import { mkdir, writeFile } from "node:fs/promises";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
 import plugin from "../opencode/plugin";
 
-type Step = { ev: unknown } | { waitFor: string; count: number } | { release: true };
+type Step = { ev: unknown } | { waitFor: string; count: number } | { release: true }
+  | { write: { name: string; content: string } } | { sleep: number };
 const scenario = JSON.parse(process.argv[2] ?? "{}") as {
-  hold?: boolean; gateFirstEvent?: boolean; steps: Step[]; v2?: boolean; answer?: string;
-  sessions?: Record<string, unknown>;
+  hold?: boolean; gateFirstEvent?: boolean; steps: Step[]; v2?: boolean; answer?: string; answerMessage?: string;
+  sessions?: Record<string, unknown>; logKeys?: boolean;
 };
+const EXTRA_KEYS = ["controls", "phase", "retryAt", "retryReason", "outcome", "bgAgents", "replies"];
 
 const key = new Uint8Array(32).fill(7) as Bytes;
 const log: string[] = [];
@@ -41,16 +48,22 @@ const server = Bun.serve({
     const path = new URL(req.url).pathname;
     const body = (req.method === "POST" ? await req.json().catch(() => ({})) : {}) as Record<string, unknown>;
     if (path === "/v1/cc/event") {
-      const blob = typeof body.blob === "string" ? await decryptBlob(key, body.blob) as { status?: string } : {};
-      log.push(`event ${String(body.op)} ${blob.status ?? "-"}`);
+      const blob = typeof body.blob === "string" ? await decryptBlob(key, body.blob) as Record<string, unknown> : {};
+      log.push(`event ${String(body.op)} ${String(blob.status ?? "-")}`);
+      if (scenario.logKeys) {
+        log.push(`keys ${String(body.op)} ${JSON.stringify(Object.fromEntries(EXTRA_KEYS.filter((k) => k in blob).map((k) => [k, blob[k]])))}`);
+      }
       const parked = gate;
       gate = undefined;
       await parked;
     } else if (path === "/v1/cc/decision") {
       log.push("decision");
       if (scenario.v2 && typeof body.blob === "string") {
-        const card = await decryptBlob(key, body.blob) as { permissionToolName?: string; permissionGrant?: string };
-        log.push(`card ${card.permissionToolName} grant=${JSON.stringify(card.permissionGrant)}`);
+        const card = await decryptBlob(key, body.blob) as Record<string, unknown>;
+        log.push(`card ${String(card.permissionToolName)} grant=${JSON.stringify(card.permissionGrant)}`);
+        if (scenario.logKeys) {
+          log.push(`cardkeys ${JSON.stringify({ permissionProjectGrant: card.permissionProjectGrant, controls: card.controls })}`);
+        }
       }
       return Response.json({ hold: scenario.hold === true });
     } else if (path === "/v1/cc/decision/resolve") {
@@ -59,7 +72,9 @@ const server = Bun.serve({
     } else if (path.startsWith("/v1/cc/decision/")) {
       const requestId = path.slice("/v1/cc/decision/".length);
       if (scenario.answer && !resolved.has(requestId)) {
-        return Response.json({ status: "answered", answerBlob: await encryptBlob(key, { requestId, decision: scenario.answer }) });
+        return Response.json({ status: "answered", answerBlob: await encryptBlob(key, {
+          requestId, decision: scenario.answer, ...(scenario.answerMessage ? { message: scenario.answerMessage } : {}),
+        }) });
       }
       return Response.json({ status: resolved.has(path.slice("/v1/cc/decision/".length)) ? "superseded" : "pending" });
     }
@@ -92,9 +107,13 @@ const v2Cleanup = scenario.v2 ? await plugin.setup({
       if (data === undefined) throw new Error("Session.NotFoundError");
       return data;
     },
+    prompt: async (input) => { log.push(`prompt ${input.sessionID} ${input.text} ${input.delivery} ${input.id}`); return {}; },
+    interrupt: async (input) => { log.push(`interrupt ${input.sessionID}`); return { interrupted: true }; },
   },
   permission: {
-    reply: async (input) => { log.push(`reply ${input.sessionID} ${input.requestID} ${input.decision}`); },
+    reply: async (input) => {
+      log.push(`reply ${input.sessionID} ${input.requestID} ${input.decision}${input.message ? ` ${input.message}` : ""}`);
+    },
   },
 }) : undefined;
 const hooks = scenario.v2 ? {} : await plugin.server({ directory: "/tmp/oc-driver", serverUrl: `${url}/` });
@@ -107,6 +126,10 @@ for (const step of scenario.steps) {
     await settle(20);
   } else if ("release" in step) {
     release();
+  } else if ("write" in step) {
+    await writeFile(`${ccDir}/sessions/${step.write.name}`, step.write.content);
+  } else if ("sleep" in step) {
+    await settle(step.sleep);
   } else {
     const deadline = Date.now() + 15_000;
     while (log.filter((entry) => entry.startsWith(step.waitFor)).length < step.count) {

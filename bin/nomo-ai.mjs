@@ -32,7 +32,7 @@
 //     marketplace is install-time behaviour; it has no business in an update.
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { homedir } from "node:os";
@@ -127,11 +127,11 @@ Uninstall (removes only what Nomo wrote; your phone stays paired for your other 
   ${CMD} uninstall --antigravity   the "nomo" block in ~/.gemini/config/hooks.json + plugin
   ${CMD} uninstall --devin         Nomo's hooks in ~/.config/devin/config.json + /nomo-* skills
   (the same as: node ~/.nomo/plugin/scripts/<agent>-install.mjs --uninstall)
+  ${CMD} uninstall --opencode      the plugin stub ~/.config/opencode/plugins/nomo.js + /nomo-* commands
 Not covered — each host removes its own install:
   Claude Code   claude plugin uninstall nomo-cc@nomo
   Codex         codex plugin remove nomo@nomo
-  Devin plugin  devin plugins remove nomo
-  OpenCode      delete ~/.config/opencode/plugins/nomo.js and ~/.config/opencode/commands/nomo-*.md`;
+  Devin plugin  devin plugins remove nomo`;
 
 // ── plumbing ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -524,7 +524,7 @@ const AGENTS = [
     // has to come BEFORE the restart, which is why the pair step leads the "What's left" list.
     next: () => ["Restart OpenCode (it loads Nomo only when it starts)."],
     pair: "/nomo-pair in OpenCode",
-    manualUninstall: "delete ~/.config/opencode/plugins/nomo.js and ~/.config/opencode/commands/nomo-*.md",
+    uninstall: uninstallOpencode,
     detect: () =>
       onPath("opencode") ||
       existsSync(join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode")),
@@ -1113,17 +1113,61 @@ function banner() {
 // knows exactly what it wrote); an agent whose install belongs to its host gets that host's command
 // printed instead — nothing here drives a host's uninstall.
 
+/** OpenCode's install is files opencode-install.sh generated — nothing to hand back to a host CLI and
+ *  no checkout needed to undo it (unlike the .mjs installers, whose removal edits a shared JSON file).
+ *  Removes ONLY files carrying that script's ownership proof, the same test its `claim` uses: the
+ *  stub must re-export a Nomo `dist/opencode.js`, a command file must carry the `nomo-opencode-install`
+ *  marker. The user's other plugins, commands and opencode.json are never read. Same config dir the
+ *  installer writes to: $XDG_CONFIG_HOME/opencode, else ~/.config/opencode. @returns {string | null} */
+function uninstallOpencode() {
+  const dir = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode");
+  const mine = (path, proof) => { try { return proof.test(readFileSync(path, "utf8")); } catch { return false; } };
+  const targets = [];
+  // plugins/ is today's stub; plugin/ is the pre-631f3f2 one the installer migrates away.
+  for (const sub of ["plugins", "plugin"]) {
+    const stub = join(dir, sub, "nomo.js");
+    if (mine(stub, /nomo-opencode-install|dist\/opencode\.js/)) targets.push(stub);
+  }
+  let commands = [];
+  try { commands = readdirSync(join(dir, "commands")).filter((n) => /^nomo-.*\.md$/.test(n)); } catch { /* none */ }
+  for (const name of commands) {
+    const file = join(dir, "commands", name);
+    if (mine(file, /nomo-opencode-install/)) targets.push(file);
+  }
+  if (targets.length === 0) {
+    say(`  ${dim(`nothing of Nomo's in ${dir}`)}`);
+    return null;
+  }
+  for (const file of targets) {
+    if (DRY) { say(`  ${dim("would remove:")} ${file}`); continue; }
+    try { unlinkSync(file); } catch (e) { return `could not remove ${file}: ${e.message}`; }
+    say(`  ${dim("removed")} ${file}`);
+  }
+  if (!DRY) try { rmdirSync(join(dir, "plugin")); } catch { /* not empty, or never there */ }
+  say(`  Restart OpenCode to unload it. ${dim("OpenCode 2.x background service: opencode service restart")}`);
+  return null;
+}
+
 /** @param {Set<string>} selected */
 function uninstall(selected) {
   if (selected.size === 0) {
     err("nomo-ai: --uninstall needs to know which agent — name it, e.g.:");
-    err(`  ${CMD} uninstall --devin   (or --cursor, --antigravity)`);
+    err(`  ${CMD} uninstall --devin   (or --cursor, --antigravity, --opencode)`);
     return 2;
   }
   if (DRY) say(dim("dry run — nothing will be removed\n"));
   const failures = [];
   for (const agent of AGENTS.filter((a) => selected.has(a.id))) {
     say(bold(agent.label));
+    if (agent.uninstall) {
+      const fail = agent.uninstall();
+      if (fail) {
+        failures.push(agent);
+        err(`  ${bold("FAILED")}: ${fail}`);
+      }
+      say();
+      continue;
+    }
     if (!agent.uninstallScript) {
       say(`  ${dim("not covered by nomo-ai — remove it with:")}`);
       say(`    ${bold(agent.manualUninstall)}`);

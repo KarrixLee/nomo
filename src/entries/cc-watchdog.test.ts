@@ -4333,9 +4333,23 @@ describe("drainCommands (authenticate, validate, then execute)", () => {
       await drainCommands(cfg(), {
         ...deps,
         take: () => [cmd],
-        readRecords: async () => [running({ agent: "opencode" })],
+        readRecords: async () => [running({ agent: "cursor" })],
       });
       expect(traces[0]).toMatchObject({ result: "unsupported" });
+    });
+
+    test("an OpenCode (2.x) session gets its own flag for the resident plugin to consume", async () => {
+      const { traces, deps } = harness();
+      const flagged: string[] = [];
+      const cmd = await sealed({ kind: "interrupt-session" });
+      await drainCommands(cfg(), {
+        ...deps,
+        take: () => [cmd],
+        readRecords: async () => [running({ agent: "opencode" })],
+        writeInterruptFlagFn: async (id) => { flagged.push(id); },
+      });
+      expect(traces[0]).toMatchObject({ agent: "opencode", result: "interrupt-flagged" });
+      expect(flagged.length).toBe(1);
     });
 
     test("a Cursor session is read-only: no flag is stamped and no bridge is asked", async () => {

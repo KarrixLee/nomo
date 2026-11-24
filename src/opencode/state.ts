@@ -37,6 +37,18 @@ export interface OcFrame {
   startedAt: number;
   /** Epoch SECONDS — the current turn's anchor, matching the blob's `turnStartedAt` unit. */
   turnStartedAt?: number;
+  /** OpenCode 2.x HONEST STATES (2.5.3) — optional blob keys, sealed append-last, ignored by older apps.
+   *  Each is set only on the frame it describes (see docs/opencode-2x-remote-contract.md). */
+  /** Working frames: `"compacting"` while OpenCode summarizes the context. */
+  phase?: "compacting";
+  /** Working frames with detail `"retrying"`: epoch SECONDS of the next attempt. */
+  retryAt?: number;
+  /** With `retryAt`: `"rateLimited"` when the provider said so (HTTP 429 / a rate-limit error type). */
+  retryReason?: "rateLimited";
+  /** Done frames: how the turn ended when it did not simply succeed. */
+  outcome?: "failed" | "interrupted";
+  /** Done frames: background subagents of this session still running (> 0 only). */
+  bgAgents?: number;
 }
 
 export interface OcSessionState {
@@ -87,11 +99,22 @@ export interface OcState {
   /** OpenCode request id (`per_…` / `que_…`) → the prompt still waiting on the user. READ, never
    *  inferred from the last frame sent: "is this row blocked?" is answered from here every time. */
   prompts: Map<string, OcPrompt>;
+  /** OpenCode 2.x only: subagent sessions whose execution is running right now. Since v2.3.0 a
+   *  subagent runs in the BACKGROUND by default, so its parent can go idle while it works — the done
+   *  frame says how many (`bgAgents`). Empty and unused on 1.x. */
+  running: Set<string>;
+  /** Set by the 2.x entry (`setup`). Gates the honest-state keys and `bgAgents`, so 1.x frames stay
+   *  byte-identical. */
+  v2: boolean;
 }
 
-export function newOcState(): OcState {
-  return { sessions: new Map(), children: new Map(), prompts: new Map() };
+export function newOcState(v2 = false): OcState {
+  return { sessions: new Map(), children: new Map(), prompts: new Map(), running: new Set(), v2 };
 }
+
+/** The honest-state hints v2.ts attaches to a translated 1.x event as `properties.nomo`. Read only
+ *  when `state.v2`. */
+interface OcHints { retryAt?: unknown; retryReason?: unknown; outcome?: unknown; phase?: unknown }
 
 /** The row a session's events belong to: itself, or the top of its subagent chain. */
 export function ocRootSession(state: OcState, sessionId: string): string {
@@ -230,7 +253,15 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
   }
 
   const sessionId = asString(properties.sessionID) ?? (type.startsWith("session.") ? asString(info?.id) : undefined);
+  if (sessionId && state.v2 && state.children.has(sessionId) && type === "session.status") {
+    // A subagent's own turn: tracked (for its root's `bgAgents`), never a row of its own.
+    const childStatus = statusType(properties.status);
+    if (childStatus === "idle") state.running.delete(sessionId);
+    else if (childStatus === "busy" || childStatus === "retry") state.running.add(sessionId);
+  }
+  if (sessionId && type === "session.deleted") state.running.delete(sessionId);
   if (!sessionId || state.children.has(sessionId)) return null;
+  const hints = (state.v2 ? asRecord(properties.nomo) : undefined) as OcHints | undefined;
 
   const entry = state.sessions.get(sessionId);
 
@@ -275,7 +306,7 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
       // THE SAME TURN END AS `session.idle`, which is a deprecated twin of this that a build may stop
       // sending. Checked BEFORE the adopt below: an idle status for a session we never saw must not
       // conjure an `announced` entry for the done to then "finish".
-      if (status === "idle") return finishTurn(sessionId, entry, now);
+      if (status === "idle") return finishTurn(state, sessionId, entry, now, hints);
       if (status !== "busy" && status !== "retry") return null;
       const live = entry ?? adopt(state, sessionId, now);
       // A PROMPT IS UP — the row is needsAttention, or a hold's Allow/Deny card. Busy keeps repeating
@@ -293,6 +324,11 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
       // pushes a start to the island at once, where a first-seen prio-0 update can sit out its 5 s
       // coalescing window. An adopted session is already `announced`, so it stays an `update`.
       const planned = frame(sessionId, live, live.announced ? "update" : "start", "working", now, detail);
+      if (hints?.phase === "compacting" && status === "busy") planned.phase = "compacting";
+      if (status === "retry" && typeof hints?.retryAt === "number" && Number.isFinite(hints.retryAt)) {
+        planned.retryAt = hints.retryAt;
+        if (hints.retryReason === "rateLimited") planned.retryReason = "rateLimited";
+      }
       live.announced = true;
       live.closed = undefined;
       // The identical-frame skip. `session.status {busy}` fires several times per turn with the exact
@@ -327,7 +363,7 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
     }
 
     case "session.idle":
-      return finishTurn(sessionId, entry, now);
+      return finishTurn(state, sessionId, entry, now, hints);
 
     case "session.deleted": {
       if (!entry) return null;
@@ -342,7 +378,9 @@ export function reduceOcEvent(state: OcState, event: unknown, now: number = Date
 
 /** The turn is over: `session.idle`, or `session.status {idle}` — OpenCode publishes both for one
  *  turn end, so whichever lands second must be a no-op or the phone gets two done notifications. */
-function finishTurn(sessionId: string, entry: OcSessionState | undefined, now: number): OcFrame | null {
+function finishTurn(
+  state: OcState, sessionId: string, entry: OcSessionState | undefined, now: number, hints?: OcHints,
+): OcFrame | null {
   // Never announced = never prompted (an abort on a fresh fork): there is no row to finish, and a
   // done here would CREATE one.
   if (!entry?.announced) return null;
@@ -359,6 +397,14 @@ function finishTurn(sessionId: string, entry: OcSessionState | undefined, now: n
   // window exists to stop a resumed session flashing its whole age, "40h"). So the timer simply
   // vanished on any session older than half an hour.
   const done = frame(sessionId, entry, "done", "done", now);
+  if (hints?.outcome === "failed" || hints?.outcome === "interrupted") done.outcome = hints.outcome;
+  if (state.v2) {
+    // ponytail: a snapshot at turn end. OpenCode wakes the parent when its subagents report back, and
+    // that turn's done re-counts; no separate update is sent when one finishes in between.
+    let bg = 0;
+    for (const child of state.running) if (ocRootSession(state, child) === sessionId) bg += 1;
+    if (bg > 0) done.bgAgents = bg;
+  }
   entry.turnStartedAt = undefined;
   return done;
 }
@@ -367,7 +413,8 @@ const DONE_KEY = "done";
 
 /** Everything that can change a RENDERED working frame — the identical-frame skip's key. */
 function statusKey(planned: OcFrame): string {
-  return JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
+  return JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan,
+    ...(planned.phase || planned.retryAt ? [planned.phase, planned.retryAt] : [])]);
 }
 
 /** Terminal frames for every still-live session — the `dispose()` path (OpenCode is shutting the

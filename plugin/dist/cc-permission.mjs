@@ -111,7 +111,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.5.2";
+var PLUGIN_VERSION = "2.5.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -2920,7 +2920,9 @@ var opencodeAdapter = {
   toolDetail: {},
   blobAgentFields: { agent: "opencode" },
   ambientPlan: true,
-  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps),
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".oc-interrupt"
 };
 function cursorModel(input) {
   for (const key of ["model", "model_id"]) {
@@ -3681,7 +3683,7 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride, extra) {
   const folder = folderIdentity(input.cwd, pinnedFolder);
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
@@ -3706,7 +3708,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     classifier: plan.status === "needsAttention" ? "attn" : plan.status === "working" ? "work" : "done",
     by: "h"
   }) : undefined;
-  return appendFittedPlanAndDebug(base, proposedPlan, dbg);
+  return appendFittedPlanAndDebug(extra ? { ...base, ...extra } : base, proposedPlan, dbg);
 }
 async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride, extraFields) {
   if (typeof input !== "object" || input === null)
@@ -3722,7 +3724,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride, extraFields);
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}
@@ -5355,14 +5357,15 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions 
   return { detail: shortest, omitted: all.length - lo, ...tail };
 }
 function permissionFrame(base, detail, omitted, questions = [], tail = {}) {
-  const { permissionGrant, ...rest } = base;
+  const { permissionGrant, cardTail, ...rest } = base;
   return {
     ...rest,
     ...detail.length > 0 ? { permissionDetail: detail } : {},
     ...omitted > 0 ? { permissionDetailOmitted: omitted } : {},
     ...questions.length > 0 ? { permissionQuestions: questions } : {},
     ...tail,
-    ...typeof permissionGrant === "string" ? { permissionGrant } : {}
+    ...typeof permissionGrant === "string" ? { permissionGrant } : {},
+    ...typeof cardTail === "object" && cardTail !== null ? cardTail : {}
   };
 }
 function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
@@ -5687,7 +5690,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionSummary: summary,
       permissionRequestId: requestId,
       permissionToolName: toolName,
-      ...grant !== undefined ? { permissionGrant: grant } : {}
+      ...grant !== undefined ? { permissionGrant: grant } : {},
+      ...deps.cardExtra && Object.keys(deps.cardExtra).length > 0 ? { cardTail: deps.cardExtra } : {}
     };
     const diffFiles = buildPermissionDiff(toolName, toolInput);
     const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput, diffFiles);

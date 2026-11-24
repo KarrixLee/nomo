@@ -3,10 +3,17 @@ import { execFile as execFile3, spawn as spawn2 } from "node:child_process";
 import { accessSync, constants, readFileSync as readFileSync3 } from "node:fs";
 import { hostname as hostname3 } from "node:os";
 
-// src/core/hook.ts
-import { readdir as readdir3, readFile as readFile4, unlink as unlink2 } from "node:fs/promises";
-import { hostname } from "node:os";
-import { basename as basename3 } from "node:path";
+// src/core/antigravity-inbox.ts
+import { readdir as readdir2, readFile as readFile2, rename as rename2, stat as stat2, unlink as unlink2 } from "node:fs/promises";
+import { delimiter, isAbsolute as isAbsolute2, join as join2 } from "node:path";
+
+// src/core/shared.ts
+import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
+import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 
 // src/core/crypto.ts
 var textEncoder = new TextEncoder;
@@ -66,22 +73,8 @@ async function decryptBlob(key, blob) {
   return JSON.parse(textDecoder.decode(plaintext));
 }
 
-// src/core/adapter.ts
-import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
-import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
-import { readdir as readdir2, readFile as readFile2, stat as stat2 } from "node:fs/promises";
-import { devNull, tmpdir } from "node:os";
-import { promisify as promisify2 } from "node:util";
-import { basename as basename2, isAbsolute as isAbsolute2, join as join2, resolve as resolve2 } from "node:path";
-
 // src/core/shared.ts
-import { access, chmod, open, readdir, readFile, rename, stat, mkdir, unlink, writeFile } from "node:fs/promises";
-import { appendFileSync, existsSync, readFileSync, statSync, truncateSync } from "node:fs";
-import { execFileSync, spawn } from "node:child_process";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { createHash } from "node:crypto";
-import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.5.2";
+var PLUGIN_VERSION = "2.5.3";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -804,6 +797,112 @@ function codexCompanionBrokerEvidence(pid, ancestorsOf = pidAncestors, commandOf
   return null;
 }
 
+// src/core/antigravity-inbox.ts
+var ANTIGRAVITY_INBOX_SUFFIX = ".agy-inbox";
+var ANTIGRAVITY_RECEIPT_SUFFIX = ".agy-reply";
+var REPLY_TEXT_MAX_CHARS = 4000;
+var REPLY_RECEIPTS_MAX = 16;
+var REPLY_PHONE_GIVE_UP_MS = 60 * 60000;
+var REPLY_INBOX_MAX_AGE_MS = 24 * 60 * 60000;
+var MID = /^[A-Za-z0-9_-]{8,64}$/;
+function replyText(v) {
+  if (typeof v !== "string" || v.trim().length === 0 || v.length > REPLY_TEXT_MAX_CHARS)
+    return;
+  return /[\u0000-\u0009\u000B-\u001F\u007F]/.test(v) ? undefined : v;
+}
+var fileFor = (dir, conv, mid, suffix) => join2(dir, `${conv}.${mid}${suffix}`);
+async function midsOf(dir, conv, suffix) {
+  let names = [];
+  try {
+    names = await readdir2(dir);
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const n of names) {
+    if (!n.startsWith(`${conv}.`) || !n.endsWith(suffix))
+      continue;
+    const mid = n.slice(conv.length + 1, -suffix.length);
+    if (MID.test(mid))
+      out.push(mid);
+  }
+  return out;
+}
+async function writeReceipt(dir, conv, mid, state) {
+  await atomicWrite(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX), state, 384).catch(() => {});
+}
+async function receiptOf(dir, conv, mid) {
+  try {
+    const s = (await readFile2(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX), "utf8")).trim();
+    return /^[qwdrcx]$/.test(s) ? s : undefined;
+  } catch {
+    return;
+  }
+}
+async function readReceipts(dir, conv, now = Date.now()) {
+  const rows = [];
+  for (const mid of await midsOf(dir, conv, ANTIGRAVITY_RECEIPT_SUFFIX)) {
+    try {
+      rows.push({ mid, at: (await stat2(fileFor(dir, conv, mid, ANTIGRAVITY_RECEIPT_SUFFIX))).mtimeMs });
+    } catch {}
+  }
+  rows.sort((a, b) => a.at - b.at);
+  const evictable = new Set;
+  for (const old of rows.slice(0, Math.max(0, rows.length - REPLY_RECEIPTS_MAX))) {
+    const s = await receiptOf(dir, conv, old.mid);
+    if (s && s !== "q" && s !== "w" && now - old.at > REPLY_PHONE_GIVE_UP_MS) {
+      await unlink2(fileFor(dir, conv, old.mid, ANTIGRAVITY_RECEIPT_SUFFIX)).catch(() => {});
+      evictable.add(old.mid);
+    }
+  }
+  const out = {};
+  for (const r of rows) {
+    if (evictable.has(r.mid))
+      continue;
+    const s = await receiptOf(dir, conv, r.mid);
+    if (s)
+      out[r.mid] = s;
+  }
+  return out;
+}
+async function takeReplies(dir, conv) {
+  const out = [];
+  for (const mid of await midsOf(dir, conv, ANTIGRAVITY_INBOX_SUFFIX)) {
+    const path = fileFor(dir, conv, mid, ANTIGRAVITY_INBOX_SUFFIX);
+    const claimed = `${path}.${process.pid}.take`;
+    try {
+      await rename2(path, claimed);
+    } catch {
+      continue;
+    }
+    try {
+      const r = JSON.parse(await readFile2(claimed, "utf8"));
+      const text = replyText(r.text);
+      if (!text)
+        throw new Error("bad message");
+      out.push({ mid, text, ts: typeof r.ts === "number" ? r.ts : 0 });
+    } catch {
+      await writeReceipt(dir, conv, mid, "x");
+    }
+    await unlink2(claimed).catch(() => {});
+  }
+  return out.sort((a, b) => a.ts - b.ts || a.mid.localeCompare(b.mid));
+}
+var resumingNow = new Set;
+
+// src/core/hook.ts
+import { readdir as readdir4, readFile as readFile5, unlink as unlink3 } from "node:fs/promises";
+import { hostname } from "node:os";
+import { basename as basename3 } from "node:path";
+
+// src/core/adapter.ts
+import { execFile as execFile2, execFileSync as execFileSync2 } from "node:child_process";
+import { copyFileSync, existsSync as existsSync2, mkdtempSync, rmSync, statSync as statSync2 } from "node:fs";
+import { readdir as readdir3, readFile as readFile3, stat as stat3 } from "node:fs/promises";
+import { devNull, tmpdir } from "node:os";
+import { promisify as promisify2 } from "node:util";
+import { basename as basename2, isAbsolute as isAbsolute3, join as join3, resolve as resolve2 } from "node:path";
+
 // src/core/terminal-focus.ts
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -1000,7 +1099,7 @@ function codexThreadName(indexContent, sessionId) {
 var INDEX_SCAN_BYTES = 128 * 1024;
 async function codexIndexTitle(sessionId, home = codexHome()) {
   try {
-    const content = await readSuffix(join2(home, "session_index.jsonl"), INDEX_SCAN_BYTES);
+    const content = await readSuffix(join3(home, "session_index.jsonl"), INDEX_SCAN_BYTES);
     return codexThreadName(content, sessionId);
   } catch {
     return;
@@ -1223,7 +1322,7 @@ async function codexSessionModel(input, prefix, transcriptPath, home = codexHome
       return m;
   }
   try {
-    return codexConfigModel(await readFile2(join2(home, "config.toml"), "utf8"));
+    return codexConfigModel(await readFile3(join3(home, "config.toml"), "utf8"));
   } catch {
     return;
   }
@@ -1650,32 +1749,32 @@ var ROLLOUT_SCAN_MAX_HEADS = 40;
 var ROLLOUT_META_HEAD_BYTES = 64 * 1024;
 async function listNumericDirsDesc(path) {
   try {
-    return (await readdir2(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
+    return (await readdir3(path)).filter((n) => /^\d+$/.test(n)).sort((a, b) => b.localeCompare(a));
   } catch {
     return [];
   }
 }
 async function codexNewestRolloutForCwd(cwd, home = codexHome()) {
-  const sessions = join2(home, "sessions");
+  const sessions = join3(home, "sessions");
   const candidates = [];
   let days = 0;
   outer:
     for (const y of await listNumericDirsDesc(sessions)) {
-      for (const m of await listNumericDirsDesc(join2(sessions, y))) {
-        for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
-          const dir = join2(sessions, y, m, d);
+      for (const m of await listNumericDirsDesc(join3(sessions, y))) {
+        for (const d of await listNumericDirsDesc(join3(sessions, y, m))) {
+          const dir = join3(sessions, y, m, d);
           let names;
           try {
-            names = await readdir2(dir);
+            names = await readdir3(dir);
           } catch {
             continue;
           }
           for (const n of names) {
             if (!n.startsWith("rollout-") || !n.endsWith(".jsonl"))
               continue;
-            const path = join2(dir, n);
+            const path = join3(dir, n);
             try {
-              candidates.push({ path, mtime: (await stat2(path)).mtimeMs });
+              candidates.push({ path, mtime: (await stat3(path)).mtimeMs });
             } catch {}
           }
           if (++days >= ROLLOUT_SCAN_MAX_DAYS)
@@ -1707,7 +1806,7 @@ async function codexPidTurnActive(pid, deps = {}) {
     if (!rollout)
       return false;
     const tail = await (deps.readTail ?? readSuffix)(rollout, TURN_STATE_TAIL_BYTES);
-    const mtime = await (deps.mtimeOf ?? (async (p) => (await stat2(p)).mtimeMs))(rollout);
+    const mtime = await (deps.mtimeOf ?? (async (p) => (await stat3(p)).mtimeMs))(rollout);
     return codexTurnActiveFromTail(tail, (deps.now ?? Date.now)() - mtime);
   } catch {
     return false;
@@ -2038,14 +2137,14 @@ function codexChildSessionGhost(sessionId, transcriptPrefix, hookPid, tracked) {
 async function codexRolloutExistsForSession(sessionId, home = codexHome()) {
   if (sessionId.length === 0)
     return false;
-  const sessions = join2(home, "sessions");
+  const sessions = join3(home, "sessions");
   let days = 0;
   for (const y of await listNumericDirsDesc(sessions)) {
-    for (const m of await listNumericDirsDesc(join2(sessions, y))) {
-      for (const d of await listNumericDirsDesc(join2(sessions, y, m))) {
+    for (const m of await listNumericDirsDesc(join3(sessions, y))) {
+      for (const d of await listNumericDirsDesc(join3(sessions, y, m))) {
         let names;
         try {
-          names = await readdir2(join2(sessions, y, m, d));
+          names = await readdir3(join3(sessions, y, m, d));
         } catch {
           names = [];
         }
@@ -2118,7 +2217,7 @@ async function codexSessionCreationSuppression(sessionId, transcriptPrefix, tran
     return null;
   if (transcriptPath.length > 0) {
     try {
-      await (deps.statOf ?? stat2)(transcriptPath);
+      await (deps.statOf ?? stat3)(transcriptPath);
       return null;
     } catch {}
   }
@@ -2296,7 +2395,9 @@ var opencodeAdapter = {
   toolDetail: {},
   blobAgentFields: { agent: "opencode" },
   ambientPlan: true,
-  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps)
+  locateTuiPid: (ctx, deps) => opencodeLocateTuiPid(ctx, deps),
+  interrupt: "hook-flag",
+  interruptFlagSuffix: ".oc-interrupt"
 };
 function cursorModel(input) {
   for (const key of ["model", "model_id"]) {
@@ -2334,12 +2435,12 @@ function sqliteOne(db, sql, env = process.env, copyFallback = false) {
     } catch (e) {
       if (!copyFallback)
         throw e;
-      const tmp = mkdtempSync(join2(tmpdir(), "nomo-sql-"));
+      const tmp = mkdtempSync(join3(tmpdir(), "nomo-sql-"));
       try {
         for (const ext of ["", "-wal"])
           if (existsSync2(db + ext))
-            copyFileSync(db + ext, join2(tmp, `c.db${ext}`));
-        out = run(join2(tmp, "c.db"), false);
+            copyFileSync(db + ext, join3(tmp, `c.db${ext}`));
+        out = run(join3(tmp, "c.db"), false);
       } catch {
         out = run(`file:${db.split("/").map(encodeURIComponent).join("/")}?immutable=1`);
       } finally {
@@ -2377,7 +2478,7 @@ function antigravityDataDirs() {
   return [`${home}/.gemini/antigravity`, `${home}/.gemini/antigravity-cli`];
 }
 function antigravityDataDirFor(transcriptPath) {
-  if (!transcriptPath || !isAbsolute2(transcriptPath))
+  if (!transcriptPath || !isAbsolute3(transcriptPath))
     return;
   const normalized = resolve2(transcriptPath);
   const i = normalized.indexOf("/brain/");
@@ -2508,7 +2609,7 @@ function adapterFor(agent) {
 }
 
 // src/core/notify-wire.ts
-import { readFile as readFile3, stat as stat3 } from "node:fs/promises";
+import { readFile as readFile4, stat as stat4 } from "node:fs/promises";
 var NOMO_NOTIFY_ENTRY = "codex-notify";
 function nomoNotifyProgram(home) {
   return `${home}/.config/cc-status/hook-shim.sh`;
@@ -2622,7 +2723,7 @@ async function repairNotifyWiring(deps = {}) {
     const tomlPath = deps.tomlPath ?? `${codexHome()}/config.toml`;
     let toml;
     try {
-      toml = await readFile3(tomlPath, "utf8");
+      toml = await readFile4(tomlPath, "utf8");
     } catch {
       return "unchanged";
     }
@@ -2636,10 +2737,10 @@ async function repairNotifyWiring(deps = {}) {
     const next = wireNotifyArray(parsed.value, program);
     if (sameCommand(next, parsed.value))
       return "unchanged";
-    const mode = ((await stat3(tomlPath).catch(() => null))?.mode ?? 384) & 511;
+    const mode = ((await stat4(tomlPath).catch(() => null))?.mode ?? 384) & 511;
     const bak = `${tomlPath}.bak-nomo`;
     try {
-      await readFile3(bak);
+      await readFile4(bak);
     } catch {
       await atomicWrite(bak, toml, mode);
     }
@@ -2816,7 +2917,7 @@ function transcriptStartMs(prefix) {
   }
   return;
 }
-function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride) {
+function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt, pinnedFolder, model, at, proposedPlan, dbgOverride, detailOverride, extra) {
   const folder = folderIdentity(input.cwd, pinnedFolder);
   const { label, folderKey } = folder;
   const branch = sessionBranch(folder);
@@ -2841,7 +2942,7 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     classifier: plan.status === "needsAttention" ? "attn" : plan.status === "working" ? "work" : "done",
     by: "h"
   }) : undefined;
-  return appendFittedPlanAndDebug(base, proposedPlan, dbg);
+  return appendFittedPlanAndDebug(extra ? { ...base, ...extra } : base, proposedPlan, dbg);
 }
 async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent = "claude", startedAt, turnStartedAt, pinnedFolder, model, planOverride, attentionKindOverride, proposedPlan, dbg, onBlobPlaintext, detailOverride, extraFields) {
   if (typeof input !== "object" || input === null)
@@ -2857,7 +2958,7 @@ async function buildEnvelope(input, machine, now, title, e2eKey, sentDone, agent
   if (typeof startedAt === "number" && Number.isFinite(startedAt))
     base.startedAt = startedAt;
   const at = Math.floor(now / 1000);
-  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride, extraFields);
   try {
     onBlobPlaintext?.(plaintext);
   } catch {}
@@ -2898,9 +2999,9 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
   try {
     const path = `${sessionsDir}/${sessionId}.json`;
     if (op === "end") {
-      await unlink2(path).catch(() => {});
-      await unlink2(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
-      await unlink2(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
+      await unlink3(path).catch(() => {});
+      await unlink3(`${sessionsDir}/${decisionHoldFileName(sessionId)}`).catch(() => {});
+      await unlink3(`${sessionsDir}/${interruptFlagFileName(sessionId)}`).catch(() => {});
       return;
     }
     const recordedAt = Date.now();
@@ -2965,7 +3066,7 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
   try {
     const stamp = async (path) => {
       try {
-        return Number.parseInt((await readFile4(path, "utf8")).trim(), 10) || 0;
+        return Number.parseInt((await readFile5(path, "utf8")).trim(), 10) || 0;
       } catch {
         return 0;
       }
@@ -2982,14 +3083,14 @@ async function traceSendFailure(event, failPath = SEND_FAIL_PATH, lastSendPath =
 }
 async function reconcileProvisional(config, hookPid) {
   try {
-    const files = await readdir3(SESSIONS_DIR).catch(() => []);
+    const files = await readdir4(SESSIONS_DIR).catch(() => []);
     const provisionals = [];
     for (const f of files) {
       if (!f.endsWith(".json"))
         continue;
       let r;
       try {
-        r = JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8"));
+        r = JSON.parse(await readFile5(`${SESSIONS_DIR}/${f}`, "utf8"));
       } catch {
         continue;
       }
@@ -3022,17 +3123,17 @@ async function reconcileProvisional(config, hookPid) {
       }
     traceSession({ event: "provisional-end", sessionId: sentinel, by: "hook", hookPid, delivered, status, error, ms: Date.now() - started });
     if (delivered)
-      await unlink2(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
+      await unlink3(`${SESSIONS_DIR}/${sentinel}.json`).catch(() => {});
   } catch {}
 }
 async function readTrackedSessions() {
-  const files = await readdir3(SESSIONS_DIR).catch(() => []);
+  const files = await readdir4(SESSIONS_DIR).catch(() => []);
   const out = [];
   for (const f of files) {
     if (!f.endsWith(".json"))
       continue;
     try {
-      const r = JSON.parse(await readFile4(`${SESSIONS_DIR}/${f}`, "utf8"));
+      const r = JSON.parse(await readFile5(`${SESSIONS_DIR}/${f}`, "utf8"));
       out.push({ sessionId: basename3(f, ".json"), pid: r.pid, provisional: r.provisional, agent: r.agent, ts: r.ts });
     } catch {}
   }
@@ -3056,7 +3157,7 @@ async function retireLineageSession(config, sessionId, agent, input, reason) {
       });
       delivered = res.ok;
     } catch {}
-  await unlink2(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
+  await unlink3(`${SESSIONS_DIR}/${sessionId}.json`).catch(() => {});
   traceSession({
     event: "retire",
     sessionId,
@@ -3413,10 +3514,10 @@ async function runHook(agent) {
 import { appendFileSync as appendFileSync3, statSync as statSync4, truncateSync as truncateSync3 } from "node:fs";
 
 // src/core/permission.ts
-import { readFile as readFile5, realpath, unlink as unlink3 } from "node:fs/promises";
+import { readFile as readFile6, realpath, unlink as unlink4 } from "node:fs/promises";
 import { appendFileSync as appendFileSync2, closeSync, constants as fsConstants, fstatSync, openSync, readFileSync as readFileSync2, statSync as statSync3, truncateSync as truncateSync2 } from "node:fs";
 import { homedir, hostname as hostname2 } from "node:os";
-import { basename as basename4, isAbsolute as isAbsolute3, relative, resolve as resolve3 } from "node:path";
+import { basename as basename4, isAbsolute as isAbsolute4, relative, resolve as resolve3 } from "node:path";
 
 // src/core/decision-poll.ts
 var POLL_INTERVAL_MS = 3000;
@@ -3577,7 +3678,7 @@ async function loadCodexTurnPolicy(transcriptPath, turnId, sessionId, home = cod
     const sessionsRoot = await realpath(resolve3(home, "sessions"));
     const rollout = await realpath(transcriptPath);
     const rel = relative(sessionsRoot, rollout);
-    if (rel === "" || rel.startsWith("..") || isAbsolute3(rel))
+    if (rel === "" || rel.startsWith("..") || isAbsolute4(rel))
       return null;
     const head = await readPrefix(rollout, CODEX_ROLLOUT_HEAD_BYTES);
     if (codexRolloutSessionId(head) !== sessionId)
@@ -3604,7 +3705,7 @@ var CODEX_REQUIREMENTS_PATH = "/etc/codex/requirements.toml";
 async function codexPromptUserRuleMatches(command, path = CODEX_REQUIREMENTS_PATH) {
   let text;
   try {
-    text = await readFile5(path, "utf8");
+    text = await readFile6(path, "utf8");
   } catch {
     return false;
   }
@@ -4442,14 +4543,15 @@ function fitPermissionDetail(base, detail, maxChars = BLOB_FIT_CHARS, questions 
   return { detail: shortest, omitted: all.length - lo, ...tail };
 }
 function permissionFrame(base, detail, omitted, questions = [], tail = {}) {
-  const { permissionGrant, ...rest } = base;
+  const { permissionGrant, cardTail, ...rest } = base;
   return {
     ...rest,
     ...detail.length > 0 ? { permissionDetail: detail } : {},
     ...omitted > 0 ? { permissionDetailOmitted: omitted } : {},
     ...questions.length > 0 ? { permissionQuestions: questions } : {},
     ...tail,
-    ...typeof permissionGrant === "string" ? { permissionGrant } : {}
+    ...typeof permissionGrant === "string" ? { permissionGrant } : {},
+    ...typeof cardTail === "object" && cardTail !== null ? cardTail : {}
   };
 }
 function emitDecision(agent, answer, toolName, toolInput, suggestions, emit, trace) {
@@ -4537,7 +4639,7 @@ function createLoopbackAnswerPoller(config, requestId, deps) {
     if (deps.statePath === undefined)
       return;
     try {
-      return parseLanState(await readFile5(deps.statePath, "utf8"))?.port;
+      return parseLanState(await readFile6(deps.statePath, "utf8"))?.port;
     } catch {
       return;
     }
@@ -4774,7 +4876,8 @@ async function runPermissionHook(deps = {}, agent = "claude") {
       permissionSummary: summary,
       permissionRequestId: requestId,
       permissionToolName: toolName,
-      ...grant !== undefined ? { permissionGrant: grant } : {}
+      ...grant !== undefined ? { permissionGrant: grant } : {},
+      ...deps.cardExtra && Object.keys(deps.cardExtra).length > 0 ? { cardTail: deps.cardExtra } : {}
     };
     const diffFiles = buildPermissionDiff(toolName, toolInput);
     const rawDetail = deps.detail ?? buildPermissionDetail(toolName, toolInput, diffFiles);
@@ -5107,6 +5210,7 @@ function ocDecisionRequest(event) {
     const mapped = PERMISSION_TOOL[permission];
     const detail = mapped ? undefined : asString(patterns.join(" ").trim());
     const always = Array.isArray(properties.always) ? properties.always.filter((p) => typeof p === "string" && p.length > 0) : [];
+    const save = Array.isArray(properties.save) ? properties.save.filter((p) => typeof p === "string" && p.length > 0) : undefined;
     return {
       kind: "permission",
       id,
@@ -5114,7 +5218,8 @@ function ocDecisionRequest(event) {
       toolName: mapped?.name ?? permission,
       toolInput: mapped ? mapped.input({ metadata, patterns }) : {},
       ...detail ? { detail } : {},
-      grant: ocGrantText(permission, always)
+      grant: ocGrantText(permission, always),
+      ...save ? { projectGrant: ocGrantText(permission, save), v2: true } : {}
     };
   }
   if (type === "question.asked") {
@@ -5171,6 +5276,7 @@ function ocAnswers(questions, map) {
     return pieces.length > 0 ? pieces : [picked];
   });
 }
+var OC_PLAIN_DENY_MESSAGE = "Denied from phone";
 function ocReplyFor(request, line) {
   if (line === undefined)
     return null;
@@ -5192,8 +5298,10 @@ function ocReplyFor(request, line) {
     }
     return null;
   }
-  if (decision.behavior === "deny")
-    return { path: `permission/${request.id}/reply`, body: { reply: "reject" } };
+  if (decision.behavior === "deny") {
+    const note = typeof decision.message === "string" ? decision.message.trim() : "";
+    return request.v2 && note.length > 0 && note !== OC_PLAIN_DENY_MESSAGE ? { path: `permission/${request.id}/reply`, body: { reply: "reject", message: note } } : { path: `permission/${request.id}/reply`, body: { reply: "reject" } };
+  }
   if (decision.behavior !== "allow")
     return null;
   const always = Array.isArray(decision.updatedPermissions) && decision.updatedPermissions.length > 0;
@@ -5242,6 +5350,10 @@ function ocTrace(event) {
 `, { mode: 384 });
   } catch {}
 }
+function ocCardExtra(request, extra) {
+  const out = { ...request.projectGrant ? { permissionProjectGrant: request.projectGrant } : {}, ...extra };
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 async function runOcApproval(request, o) {
   const trace = o.trace ?? ocTrace;
   let granted = false;
@@ -5268,6 +5380,7 @@ async function runOcApproval(request, o) {
       },
       detail: request.detail,
       grant: request.grant,
+      cardExtra: ocCardExtra(request, o.cardExtra),
       trace,
       fetchFn: o.fetchFn,
       delegate: o.delegate,
@@ -5320,9 +5433,96 @@ async function ocResolveOnRelay(config, requestId, fetchFn = fetch) {
   } catch {}
 }
 
+// src/opencode/remote.ts
+import { readdir as readdir5, readFile as readFile7, unlink as unlink5 } from "node:fs/promises";
+import { join as join4 } from "node:path";
+var OC_INTERRUPT_SUFFIX = ".oc-interrupt";
+var OC_INTERRUPT_MAX_AGE_MS = 120000;
+var ocMessageId = (mid) => `msg_nomo_${mid}`;
+var isOcSession = (id) => id.startsWith("ses");
+async function ocRemoteTick(d) {
+  let names;
+  try {
+    names = await readdir5(d.dir);
+  } catch {
+    return;
+  }
+  const now = (d.now ?? Date.now)();
+  const flags = new Set;
+  const inboxes = new Set;
+  for (const n of names) {
+    if (n.endsWith(OC_INTERRUPT_SUFFIX))
+      flags.add(n.slice(0, -OC_INTERRUPT_SUFFIX.length));
+    else if (n.endsWith(ANTIGRAVITY_INBOX_SUFFIX))
+      inboxes.add(n.slice(0, n.indexOf(".")));
+  }
+  for (const sessionID of flags) {
+    if (!isOcSession(sessionID) || !await d.owns(sessionID))
+      continue;
+    const path = join4(d.dir, `${sessionID}${OC_INTERRUPT_SUFFIX}`);
+    let at = 0;
+    try {
+      at = Number(JSON.parse(await readFile7(path, "utf8")).at);
+    } catch {}
+    try {
+      await unlink5(path);
+    } catch {
+      continue;
+    }
+    if (!(now - at <= OC_INTERRUPT_MAX_AGE_MS) || !d.interrupt) {
+      d.trace({ event: "oc-interrupt", sessionId: sessionID, result: d.interrupt ? "stale" : "unsupported" });
+      continue;
+    }
+    try {
+      const out = await d.interrupt({ sessionID });
+      d.trace({ event: "oc-interrupt", sessionId: sessionID, result: out?.interrupted === true ? "interrupted" : "not-running" });
+    } catch (e) {
+      d.trace({ event: "oc-interrupt", sessionId: sessionID, result: "failed", error: e?.name ?? "Error" });
+    }
+  }
+  for (const sessionID of inboxes) {
+    if (!isOcSession(sessionID) || !await d.owns(sessionID))
+      continue;
+    const replies = await takeReplies(d.dir, sessionID);
+    if (replies.length === 0)
+      continue;
+    for (const r of replies) {
+      let receipt = "x";
+      if (d.prompt) {
+        try {
+          await d.prompt({ sessionID, text: r.text, delivery: "steer", id: ocMessageId(r.mid) });
+          receipt = "d";
+        } catch (e) {
+          const name = String(e?._tag ?? e?.name ?? "");
+          if (/Conflict/.test(name))
+            receipt = "d";
+          d.trace({ event: "reply", sessionId: sessionID, agent: "opencode", result: receipt === "d" ? "duplicate" : "failed", error: name || "Error" });
+        }
+      }
+      await writeReceipt(d.dir, sessionID, r.mid, receipt);
+      if (receipt === "d")
+        d.trace({ event: "reply", sessionId: sessionID, agent: "opencode", result: "delivered", mid: r.mid });
+    }
+    d.published(sessionID);
+  }
+}
+function ocWatchRemote(d, intervalMs = 1000) {
+  let running = false;
+  const timer = setInterval(() => {
+    if (running)
+      return;
+    running = true;
+    ocRemoteTick(d).catch(() => {}).finally(() => {
+      running = false;
+    });
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
 // src/opencode/state.ts
-function newOcState() {
-  return { sessions: new Map, children: new Map, prompts: new Map };
+function newOcState(v2 = false) {
+  return { sessions: new Map, children: new Map, prompts: new Map, running: new Set, v2 };
 }
 function ocRootSession(state, sessionId) {
   let id = sessionId;
@@ -5406,8 +5606,18 @@ function reduceOcEvent(state, event, now = Date.now()) {
       state.children.set(id, parentID);
   }
   const sessionId = asString2(properties.sessionID) ?? (type.startsWith("session.") ? asString2(info?.id) : undefined);
+  if (sessionId && state.v2 && state.children.has(sessionId) && type === "session.status") {
+    const childStatus = statusType(properties.status);
+    if (childStatus === "idle")
+      state.running.delete(sessionId);
+    else if (childStatus === "busy" || childStatus === "retry")
+      state.running.add(sessionId);
+  }
+  if (sessionId && type === "session.deleted")
+    state.running.delete(sessionId);
   if (!sessionId || state.children.has(sessionId))
     return null;
+  const hints = state.v2 ? asRecord2(properties.nomo) : undefined;
   const entry = state.sessions.get(sessionId);
   switch (type) {
     case "session.created": {
@@ -5442,7 +5652,7 @@ function reduceOcEvent(state, event, now = Date.now()) {
     case "session.status": {
       const status = statusType(properties.status);
       if (status === "idle")
-        return finishTurn(sessionId, entry, now);
+        return finishTurn(state, sessionId, entry, now, hints);
       if (status !== "busy" && status !== "retry")
         return null;
       const live = entry ?? adopt(state, sessionId, now);
@@ -5450,6 +5660,13 @@ function reduceOcEvent(state, event, now = Date.now()) {
         return null;
       const detail = status === "retry" ? "retrying" : undefined;
       const planned = frame(sessionId, live, live.announced ? "update" : "start", "working", now, detail);
+      if (hints?.phase === "compacting" && status === "busy")
+        planned.phase = "compacting";
+      if (status === "retry" && typeof hints?.retryAt === "number" && Number.isFinite(hints.retryAt)) {
+        planned.retryAt = hints.retryAt;
+        if (hints.retryReason === "rateLimited")
+          planned.retryReason = "rateLimited";
+      }
       live.announced = true;
       live.closed = undefined;
       const key = statusKey(planned);
@@ -5472,7 +5689,7 @@ function reduceOcEvent(state, event, now = Date.now()) {
       return frame(sessionId, entry, "update", "working", now);
     }
     case "session.idle":
-      return finishTurn(sessionId, entry, now);
+      return finishTurn(state, sessionId, entry, now, hints);
     case "session.deleted": {
       if (!entry)
         return null;
@@ -5483,7 +5700,7 @@ function reduceOcEvent(state, event, now = Date.now()) {
       return null;
   }
 }
-function finishTurn(sessionId, entry, now) {
+function finishTurn(state, sessionId, entry, now, hints) {
   if (!entry?.announced)
     return null;
   if (entry.lastStatusFrame === DONE_KEY && !entry.working)
@@ -5491,12 +5708,29 @@ function finishTurn(sessionId, entry, now) {
   entry.working = false;
   entry.lastStatusFrame = DONE_KEY;
   const done = frame(sessionId, entry, "done", "done", now);
+  if (hints?.outcome === "failed" || hints?.outcome === "interrupted")
+    done.outcome = hints.outcome;
+  if (state.v2) {
+    let bg = 0;
+    for (const child of state.running)
+      if (ocRootSession(state, child) === sessionId)
+        bg += 1;
+    if (bg > 0)
+      done.bgAgents = bg;
+  }
   entry.turnStartedAt = undefined;
   return done;
 }
 var DONE_KEY = "done";
 function statusKey(planned) {
-  return JSON.stringify([planned.status, planned.detail, planned.title, planned.model, planned.plan]);
+  return JSON.stringify([
+    planned.status,
+    planned.detail,
+    planned.title,
+    planned.model,
+    planned.plan,
+    ...planned.phase || planned.retryAt ? [planned.phase, planned.retryAt] : []
+  ]);
 }
 function ocEndFrames(state, now = Date.now()) {
   const frames = [...state.sessions].filter(([, entry]) => entry.announced).map(([sessionId, entry]) => frame(sessionId, entry, "end", "done", now));
@@ -5704,7 +5938,8 @@ var OC_V2_EVENT_TYPES = [
   "permission.replied",
   "form.created",
   "form.replied",
-  "form.cancelled"
+  "form.cancelled",
+  "session.compaction.started"
 ];
 function asRecord3(value) {
   return typeof value === "object" && value !== null ? value : undefined;
@@ -5804,11 +6039,31 @@ function ocV1Events(event) {
     case "session.execution.started":
       return sessionID ? [v1("session.status", { sessionID, status: { type: "busy" } })] : [];
     case "session.execution.succeeded":
+      return sessionID ? [v1("session.status", { sessionID, status: { type: "idle" } })] : [];
     case "session.execution.failed":
     case "session.execution.interrupted":
-      return sessionID ? [v1("session.status", { sessionID, status: { type: "idle" } })] : [];
-    case "session.retry.scheduled":
-      return sessionID ? [v1("session.status", { sessionID, status: { type: "retry" } })] : [];
+      return sessionID ? [v1("session.status", {
+        sessionID,
+        status: { type: "idle" },
+        nomo: { outcome: type === "session.execution.failed" ? "failed" : "interrupted" }
+      })] : [];
+    case "session.retry.scheduled": {
+      if (!sessionID)
+        return [];
+      const at = Number(d.at);
+      const error = asRecord3(d.error);
+      const rateLimited = error?.status === 429 || /rate.?limit|too.?many.?requests/i.test(asString3(error?.type) ?? "");
+      return [v1("session.status", {
+        sessionID,
+        status: { type: "retry" },
+        nomo: {
+          ...Number.isFinite(at) && at > 0 ? { retryAt: Math.ceil(at / 1000) } : {},
+          ...rateLimited ? { retryReason: "rateLimited" } : {}
+        }
+      })];
+    }
+    case "session.compaction.started":
+      return sessionID ? [v1("session.status", { sessionID, status: { type: "busy" }, nomo: { phase: "compacting" } })] : [];
     case "session.deleted":
       return sessionID ? [v1("session.deleted", { sessionID, info: { id: sessionID } })] : [];
     case "session.tool.success":
@@ -5842,6 +6097,7 @@ function ocV1Events(event) {
         permission: v1Permission(asString3(d.action)),
         patterns: Array.isArray(d.resources) ? d.resources : [],
         always: [],
+        save: Array.isArray(d.save) ? d.save.filter((p) => typeof p === "string") : [],
         metadata: asRecord3(d.metadata) ?? {},
         ...source?.type === "tool" ? { tool: { messageID: source.messageID, callID: source.id } } : {}
       })];
@@ -5878,9 +6134,10 @@ function ocV2Client(reply, sessionOf) {
         const requestID = /^\/permission\/([^/]+)\/reply$/.exec(url)?.[1];
         const sessionID = requestID === undefined ? undefined : sessionOf(requestID);
         const decision = asString3(asRecord3(body)?.reply);
+        const message = asString3(asRecord3(body)?.message);
         if (requestID === undefined || sessionID === undefined || decision === undefined)
           return { response: { status: 404 } };
-        await reply({ sessionID, requestID, decision: decision === "always" ? "once" : decision });
+        await reply({ sessionID, requestID, decision, ...decision === "reject" && message ? { message } : {} });
         return { response: { status: 204 } };
       }
     }
@@ -5973,13 +6230,27 @@ function serverClients() {
 function isSharedServer(argv = process.argv) {
   return argv.includes("serve") && !argv.includes("--stdio");
 }
+async function ocExtraFields(ctx, frame) {
+  if (!ctx.controls)
+    return;
+  const replies = await readReceipts(SESSIONS_DIR, frame.sessionId).catch(() => ({}));
+  return {
+    ...ctx.controls.length > 0 ? { controls: ctx.controls } : {},
+    ...frame.phase ? { phase: frame.phase } : {},
+    ...frame.retryAt !== undefined ? { retryAt: frame.retryAt } : {},
+    ...frame.retryReason ? { retryReason: frame.retryReason } : {},
+    ...frame.outcome ? { outcome: frame.outcome } : {},
+    ...frame.bgAgents ? { bgAgents: frame.bgAgents } : {},
+    ...Object.keys(replies).length > 0 ? { replies } : {}
+  };
+}
 async function send(ctx, frame) {
   const now = Date.now();
   const input = { session_id: frame.sessionId, cwd: ctx.folder.cwd };
   let fittedPlan;
   const envelope = await buildEnvelope(input, ctx.machine, now, frame.title, ctx.config.e2eKey, false, "opencode", frame.startedAt, frame.turnStartedAt, ctx.folder, frame.model, { op: frame.op, prio: frame.prio, status: frame.status }, undefined, frame.plan, undefined, (plain) => {
     fittedPlan = plain.plan;
-  }, frame.detail);
+  }, frame.detail, await ocExtraFields(ctx, frame));
   if (!envelope) {
     ocForgetStatusFrame(ctx.state, frame.sessionId);
     return;
@@ -6007,7 +6278,8 @@ var server = async (input) => {
       machine: config.machineName ?? hostname3().replace(/\.local$/, ""),
       folder: folderIdentity(directory),
       origin: { hook_event_name: "opencode", ...directory ? { cwd: directory } : {}, ppid: process.ppid },
-      state: newOcState()
+      state: newOcState(input?.controls !== undefined),
+      ...input?.controls !== undefined ? { controls: input.controls } : {}
     };
     let chain = Promise.resolve();
     const enqueue = (task) => {
@@ -6046,6 +6318,7 @@ var server = async (input) => {
         serverUrl,
         cwd: ctx.folder.cwd,
         requestId,
+        ...ctx.controls && ctx.controls.length > 0 ? { cardExtra: { controls: ctx.controls } } : {},
         delegate: async () => {
           delegated = true;
           ocPromptHeld(ctx.state, request.id, false);
@@ -6071,6 +6344,7 @@ var server = async (input) => {
       holds.delete(opencodeId);
       ocResolveOnRelay(ctx.config, requestId);
     };
+    input?.onRepublish?.((sessionID) => void repaint(sessionID));
     const stopWatching = input?.watchClients === true ? ocWatchClients({
       count: serverClients,
       pending: () => ocUnattendedRoots(ctx.state).length > 0,
@@ -6132,11 +6406,23 @@ var setup = async (ctx) => {
     const known = new Set;
     const foreign = new Set;
     const getSession = ctx.session?.get;
+    const prompt = ctx.session?.prompt;
+    const interrupt = ctx.session?.interrupt;
+    const controls = [
+      ...typeof prompt === "function" ? ["reply"] : [],
+      ...typeof interrupt === "function" ? ["interrupt"] : [],
+      ...typeof reply === "function" ? ["denyNote"] : []
+    ];
+    let republish = () => {};
     const hooks = await server({
       directory,
       client: typeof reply === "function" ? ocV2Client((i) => reply.call(ctx.permission, i), (id) => sessions.get(id)) : undefined,
       questionsOnComputer: true,
-      watchClients: isSharedServer()
+      watchClients: isSharedServer(),
+      controls,
+      onRepublish: (fn) => {
+        republish = fn;
+      }
     });
     const onEvent = hooks.event;
     if (!onEvent)
@@ -6180,6 +6466,14 @@ var setup = async (ctx) => {
       for (const translated of ocV1Events(event))
         onEvent({ event: translated });
     };
+    const stopRemote = ocWatchRemote({
+      dir: SESSIONS_DIR,
+      owns: async (sessionID) => known.has(sessionID) || !foreign.has(sessionID) && await adopt({ type: "remote", data: { sessionID } }, sessionID),
+      prompt: typeof prompt === "function" ? (i) => prompt.call(ctx.session, i) : undefined,
+      interrupt: typeof interrupt === "function" ? (i) => interrupt.call(ctx.session, i) : undefined,
+      published: (sessionID) => republish(sessionID),
+      trace: ocTrace
+    });
     (async () => {
       while (!abort.signal.aborted) {
         try {
@@ -6195,6 +6489,7 @@ var setup = async (ctx) => {
     })();
     return async () => {
       abort.abort();
+      stopRemote();
       await hooks.dispose?.();
     };
   } catch {

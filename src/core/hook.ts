@@ -370,7 +370,11 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
    *  — its frames come off a resident event firehose, and a `session.status {retry}` message is free
    *  text no tool name can encode. Undefined for EVERY Claude/Codex caller, which leaves detailForHook
    *  as the only source and keeps their blobs byte-identical. */
-  detailOverride?: string): {
+  detailOverride?: string,
+  /** APPEND-LAST. Optional keys sealed after every base key but BEFORE the plan is fitted, so the
+   *  plan gets only the room these leave under the sealed ceiling (Antigravity's `surface`/`replies`,
+   *  OpenCode 2.x's `controls`/`replies`/honest-state keys). Undefined → byte-identical blob. */
+  extra?: Record<string, unknown>): {
   status: CCStatus; detail?: string; title: string; machine: string; label: string; agent?: AgentKind; turnStartedAt?: number; model?: string; at?: number; folderKey?: string; branch?: string; sid?: string; plan?: string; dbg?: string;
 } {
   const folder = folderIdentity(input.cwd, pinnedFolder);
@@ -435,7 +439,7 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
       by: "h",
     })
     : undefined;
-  return appendFittedPlanAndDebug(base, proposedPlan, dbg);
+  return appendFittedPlanAndDebug(extra ? { ...base, ...extra } : base, proposedPlan, dbg);
 }
 
 /** The wire envelope for one hook event: the blind v2 shape
@@ -461,8 +465,9 @@ export async function buildEnvelope(
   /** APPEND-LAST. Threaded straight through to buildBlob's own append-last `detailOverride` — see
    *  there. Undefined for every Claude/Codex caller. */
   detailOverride?: string,
-  /** APPEND-LAST. Keys sealed AFTER every buildBlob key (Antigravity's `surface` and reply receipts
-   *  `replies`). Undefined for every other caller, whose blobs stay byte-identical. */
+  /** APPEND-LAST. Keys sealed after every buildBlob base key and before the fitted plan (Antigravity's
+   *  `surface` and reply receipts `replies`; OpenCode 2.x's remote-control keys). Undefined for every
+   *  other caller, whose blobs stay byte-identical. */
   extraFields?: Record<string, unknown>,
 ): Promise<Record<string, unknown> | null> {
   if (typeof input !== "object" || input === null) return null;
@@ -480,7 +485,7 @@ export async function buildEnvelope(
   // `at` is the real event time (`now`) in epoch SECONDS — the phone's honest sort/age key, frozen here
   // and re-sent verbatim by every watchdog heartbeat so an idle-but-heartbeated session ages out.
   const at = Math.floor(now / 1000);
-  const plaintext = { ...buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride), ...extraFields };
+  const plaintext = buildBlob(i, machine, title, plan, agent, turnStartedAt, pinnedFolder, model, at, proposedPlan, dbg, detailOverride, extraFields);
   try { onBlobPlaintext?.(plaintext); } catch { /* a tee must never break an envelope */ }
   const blob = await encryptBlob(e2eKey, plaintext);
   const attentionKind = attentionKindOverride ?? (
