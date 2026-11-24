@@ -81,7 +81,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.5.1";
+var PLUGIN_VERSION = "2.5.2";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -5662,6 +5662,182 @@ async function postOcEvent(config, envelope) {
   }
 }
 
+// src/opencode/v2.ts
+var OC_V2_EVENT_TYPES = [
+  "session.created",
+  "session.renamed",
+  "session.agent.selected",
+  "session.step.started",
+  "session.execution.started",
+  "session.execution.succeeded",
+  "session.execution.failed",
+  "session.execution.interrupted",
+  "session.retry.scheduled",
+  "session.deleted",
+  "session.tool.success",
+  "session.tool.failed",
+  "permission.asked",
+  "permission.replied",
+  "form.created",
+  "form.replied",
+  "form.cancelled"
+];
+function asRecord3(value) {
+  return typeof value === "object" && value !== null ? value : undefined;
+}
+function asString3(value) {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+var v1 = (type, properties) => ({ type, properties });
+function ocV2InScope(event, directory, known) {
+  const e = asRecord3(event);
+  const d = asRecord3(e?.data);
+  const sessionID = asString3(d?.sessionID) ?? asString3(asRecord3(d?.form)?.sessionID);
+  const at = asString3(asRecord3(e?.location)?.directory);
+  if (at !== undefined && directory !== undefined && at !== directory)
+    return false;
+  if (sessionID === undefined)
+    return true;
+  if (at === undefined && directory !== undefined && !known.has(sessionID))
+    return false;
+  if (e?.type === "session.deleted")
+    known.delete(sessionID);
+  else
+    known.add(sessionID);
+  return true;
+}
+function assistantMessage(sessionID, model, agent) {
+  const m = asRecord3(model);
+  return v1("message.updated", {
+    sessionID,
+    info: { role: "assistant", sessionID, providerID: m?.providerID, modelID: m?.id, agent }
+  });
+}
+function v1Permission(action) {
+  if (action === "shell")
+    return "bash";
+  if (action === "question")
+    return "question_permission";
+  return action ?? "permission";
+}
+function ocV1Events(event) {
+  const e = asRecord3(event);
+  const type = asString3(e?.type);
+  const d = asRecord3(e?.data);
+  if (!type || !d)
+    return [];
+  const sessionID = asString3(d.sessionID);
+  switch (type) {
+    case "session.created": {
+      if (!sessionID)
+        return [];
+      const created = Number(e?.created);
+      const out = [v1("session.created", {
+        sessionID,
+        info: {
+          id: sessionID,
+          parentID: d.parentID,
+          title: d.title,
+          agent: d.agent,
+          ...Number.isFinite(created) && created > 0 ? { time: { created } } : {}
+        }
+      })];
+      if (asRecord3(d.model))
+        out.push(assistantMessage(sessionID, d.model, undefined));
+      return out;
+    }
+    case "session.renamed":
+      return sessionID ? [v1("session.updated", { sessionID, info: { id: sessionID, title: d.title } })] : [];
+    case "session.agent.selected":
+      return sessionID ? [v1("session.updated", { sessionID, info: { id: sessionID, agent: d.agent } })] : [];
+    case "session.step.started":
+      return sessionID ? [assistantMessage(sessionID, d.model, d.agent), v1("session.status", { sessionID, status: { type: "busy" } })] : [];
+    case "session.execution.started":
+      return sessionID ? [v1("session.status", { sessionID, status: { type: "busy" } })] : [];
+    case "session.execution.succeeded":
+    case "session.execution.failed":
+    case "session.execution.interrupted":
+      return sessionID ? [v1("session.status", { sessionID, status: { type: "idle" } })] : [];
+    case "session.retry.scheduled":
+      return sessionID ? [v1("session.status", { sessionID, status: { type: "retry" } })] : [];
+    case "session.deleted":
+      return sessionID ? [v1("session.deleted", { sessionID, info: { id: sessionID } })] : [];
+    case "session.tool.success":
+    case "session.tool.failed": {
+      const callID = asString3(d.id);
+      if (!sessionID || !callID)
+        return [];
+      const out = [v1("message.part.updated", {
+        sessionID,
+        part: {
+          type: "tool",
+          sessionID,
+          messageID: d.assistantMessageID,
+          callID,
+          state: { status: type === "session.tool.success" ? "completed" : "error" }
+        }
+      })];
+      const todos = asRecord3(d.metadata)?.todos;
+      if (type === "session.tool.success" && Array.isArray(todos))
+        out.push(v1("todo.updated", { sessionID, todos }));
+      return out;
+    }
+    case "permission.asked": {
+      const id = asString3(d.id);
+      if (!id || !sessionID)
+        return [];
+      const source = asRecord3(d.source);
+      return [v1("permission.asked", {
+        id,
+        sessionID,
+        permission: v1Permission(asString3(d.action)),
+        patterns: Array.isArray(d.resources) ? d.resources : [],
+        always: [],
+        metadata: asRecord3(d.metadata) ?? {},
+        ...source?.type === "tool" ? { tool: { messageID: source.messageID, callID: source.id } } : {}
+      })];
+    }
+    case "permission.replied":
+      return asString3(d.requestID) ? [v1("permission.replied", { sessionID, requestID: d.requestID, reply: d.reply })] : [];
+    case "form.created": {
+      const form = asRecord3(d.form);
+      const id = asString3(form?.id);
+      const formSession = asString3(form?.sessionID);
+      const fields = Array.isArray(form?.fields) ? form.fields : [];
+      if (!id || !formSession || fields.length === 0)
+        return [];
+      const tool = asRecord3(asRecord3(form?.metadata)?.tool);
+      return [v1("question.asked", {
+        id,
+        sessionID: formSession,
+        questions: fields,
+        ...tool ? { tool: { messageID: tool.messageID, callID: tool.id } } : {}
+      })];
+    }
+    case "form.replied":
+      return asString3(d.id) ? [v1("question.replied", { sessionID, requestID: d.id })] : [];
+    case "form.cancelled":
+      return asString3(d.id) ? [v1("question.rejected", { sessionID, requestID: d.id })] : [];
+    default:
+      return [];
+  }
+}
+function ocV2Client(reply, sessionOf) {
+  return {
+    _client: {
+      post: async ({ url, body }) => {
+        const requestID = /^\/permission\/([^/]+)\/reply$/.exec(url)?.[1];
+        const sessionID = requestID === undefined ? undefined : sessionOf(requestID);
+        const decision = asString3(asRecord3(body)?.reply);
+        if (requestID === undefined || sessionID === undefined || decision === undefined)
+          return { response: { status: 404 } };
+        await reply({ sessionID, requestID, decision: decision === "always" ? "once" : decision });
+        return { response: { status: 204 } };
+      }
+    }
+  };
+}
+
 // src/opencode/plugin.ts
 function resolveRuntime() {
   const env = process.env.NOMO_RUNTIME;
@@ -5754,7 +5930,7 @@ var server = async (input) => {
     const hold = (request) => {
       if (holds.has(request.id))
         return;
-      if (!canReply || ctx.state.children.has(request.sessionID)) {
+      if (!canReply || request.kind === "question" && input?.questionsOnComputer === true || ctx.state.children.has(request.sessionID)) {
         repaint(request.sessionID);
         return;
       }
@@ -5834,7 +6010,58 @@ var server = async (input) => {
     return {};
   }
 };
-var plugin_default = { id: "nomo", server };
+var setup = async (ctx) => {
+  try {
+    const subscribe = ctx?.event?.subscribe;
+    const reply = ctx?.permission?.reply;
+    if (typeof subscribe !== "function")
+      return;
+    const directory = typeof ctx.location?.directory === "string" && ctx.location.directory.length > 0 ? ctx.location.directory : undefined;
+    const sessions = new Map;
+    const known = new Set;
+    const hooks = await server({
+      directory,
+      client: typeof reply === "function" ? ocV2Client((i) => reply.call(ctx.permission, i), (id) => sessions.get(id)) : undefined,
+      questionsOnComputer: true
+    });
+    const onEvent = hooks.event;
+    if (!onEvent)
+      return;
+    const abort = new AbortController;
+    const dispatch = (event) => {
+      if (!ocV2InScope(event, directory, known))
+        return;
+      const e = event;
+      if (e.type === "permission.asked" && typeof e.data?.id === "string" && typeof e.data.sessionID === "string") {
+        sessions.set(e.data.id, e.data.sessionID);
+      } else if (e.type === "permission.replied" && typeof e.data?.requestID === "string") {
+        sessions.delete(e.data.requestID);
+      }
+      for (const translated of ocV1Events(event))
+        onEvent({ event: translated });
+    };
+    (async () => {
+      while (!abort.signal.aborted) {
+        try {
+          for await (const event of subscribe.call(ctx.event, { types: OC_V2_EVENT_TYPES, signal: abort.signal })) {
+            try {
+              dispatch(event);
+            } catch {}
+          }
+        } catch {}
+        if (!abort.signal.aborted)
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+    })();
+    return async () => {
+      abort.abort();
+      await hooks.dispose?.();
+    };
+  } catch {
+    return;
+  }
+};
+var plugin_default = { id: "nomo", server, setup };
 export {
   plugin_default as default
 };
