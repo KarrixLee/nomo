@@ -1,5 +1,5 @@
 // src/opencode/plugin.ts
-import { spawn as spawn2 } from "node:child_process";
+import { execFile as execFile3, spawn as spawn2 } from "node:child_process";
 import { accessSync, constants, readFileSync as readFileSync3 } from "node:fs";
 import { hostname as hostname3 } from "node:os";
 
@@ -5451,6 +5451,7 @@ function reduceOcEvent(state, event, now = Date.now()) {
       const detail = status === "retry" ? "retrying" : undefined;
       const planned = frame(sessionId, live, live.announced ? "update" : "start", "working", now, detail);
       live.announced = true;
+      live.closed = undefined;
       const key = statusKey(planned);
       if (live.lastStatusFrame === key)
         return null;
@@ -5514,7 +5515,30 @@ function ocAttentionFrame(state, sessionId, detail, now = Date.now()) {
     return null;
   entry.announced = true;
   entry.lastStatusFrame = undefined;
-  return frame(rootId, entry, "update", "needsAttention", now, detail, 1);
+  const op = entry.closed ? "start" : "update";
+  entry.closed = undefined;
+  return frame(rootId, entry, op, "needsAttention", now, detail, 1);
+}
+function ocUnattendedRoots(state) {
+  const roots = new Set;
+  for (const prompt of state.prompts.values()) {
+    const root = ocRootSession(state, prompt.sessionID);
+    if (state.sessions.get(root)?.announced && !ocRowHeld(state, root))
+      roots.add(root);
+  }
+  return [...roots];
+}
+function ocCloseUnattended(state, now = Date.now()) {
+  return ocUnattendedRoots(state).map((root) => {
+    const entry = state.sessions.get(root);
+    const closing = frame(root, entry, "end", "done", now);
+    entry.announced = false;
+    entry.closed = true;
+    entry.working = false;
+    entry.lastStatusFrame = undefined;
+    entry.turnStartedAt = undefined;
+    return closing;
+  });
 }
 function ocPromptAsked(state, event) {
   const properties = asRecord2(asRecord2(event)?.properties);
@@ -5862,6 +5886,47 @@ function ocV2Client(reply, sessionOf) {
     }
   };
 }
+function ocClientCount(lsofFields) {
+  const sockets = [];
+  for (const line of lsofFields.split(`
+`)) {
+    if (line.startsWith("n"))
+      sockets.push({ name: line.slice(1) });
+    else if (line.startsWith("TST=") && sockets.length > 0)
+      sockets[sockets.length - 1].state = line.slice(4);
+  }
+  const port = (address) => address.slice(address.lastIndexOf(":") + 1);
+  const listening = new Set(sockets.filter((s) => s.state === "LISTEN").map((s) => port(s.name)));
+  if (listening.size === 0)
+    return;
+  return sockets.filter((s) => s.state === "ESTABLISHED" && listening.has(port(s.name.split("->")[0]))).length;
+}
+function ocWatchClients(o) {
+  let misses = 0;
+  let polling = false;
+  const timer = setInterval(() => {
+    if (polling)
+      return;
+    if (!o.pending()) {
+      misses = 0;
+      return;
+    }
+    polling = true;
+    o.count().then((n) => {
+      misses = n === 0 ? misses + 1 : 0;
+      if (misses >= 2) {
+        misses = 0;
+        o.close();
+      }
+    }).catch(() => {
+      misses = 0;
+    }).finally(() => {
+      polling = false;
+    });
+  }, o.intervalMs ?? 1e4);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
 
 // src/opencode/plugin.ts
 function resolveRuntime() {
@@ -5895,6 +5960,18 @@ function ensureWatchdogCached(now) {
   if (now < watchdogTrustedUntil)
     return;
   watchdogTrustedUntil = ensureWatchdog({ spawnWatchdog }) ? now + WATCHDOG_TRUST_MS : 0;
+}
+function serverClients() {
+  return new Promise((resolve) => {
+    try {
+      execFile3("lsof", ["-nP", "-a", "-p", String(process.pid), "-iTCP", "-FnT"], { timeout: 2000 }, (_error, stdout) => resolve(ocClientCount(String(stdout ?? ""))));
+    } catch {
+      resolve(undefined);
+    }
+  });
+}
+function isSharedServer(argv = process.argv) {
+  return argv.includes("serve") && !argv.includes("--stdio");
 }
 async function send(ctx, frame) {
   const now = Date.now();
@@ -5994,6 +6071,14 @@ var server = async (input) => {
       holds.delete(opencodeId);
       ocResolveOnRelay(ctx.config, requestId);
     };
+    const stopWatching = input?.watchClients === true ? ocWatchClients({
+      count: serverClients,
+      pending: () => ocUnattendedRoots(ctx.state).length > 0,
+      close: () => void enqueue(async () => {
+        for (const frame of ocCloseUnattended(ctx.state))
+          await send(ctx, frame);
+      })
+    }) : undefined;
     return {
       event: async ({ event }) => {
         try {
@@ -6021,6 +6106,7 @@ var server = async (input) => {
       },
       dispose: async () => {
         try {
+          stopWatching?.();
           for (const opencodeId of [...holds.keys()])
             retire(opencodeId);
           const frames = ocEndFrames(ctx.state);
@@ -6049,7 +6135,8 @@ var setup = async (ctx) => {
     const hooks = await server({
       directory,
       client: typeof reply === "function" ? ocV2Client((i) => reply.call(ctx.permission, i), (id) => sessions.get(id)) : undefined,
-      questionsOnComputer: true
+      questionsOnComputer: true,
+      watchClients: isSharedServer()
     });
     const onEvent = hooks.event;
     if (!onEvent)

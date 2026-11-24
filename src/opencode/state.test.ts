@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { PLAN_BLOB_TEXT_MAX_CHARS } from "../core/shared";
 import {
   isDefaultOcTitle, newOcState, ocAttentionFrame, ocEndFrames, ocForgetStatusFrame, ocModelFromMessage,
-  ocPromptAsked, ocPromptFrame, ocPromptHeld, ocPromptResolved, ocPromptsEndedBy,
-  ocTodoMarkdown, reduceOcEvent,
+  ocCloseUnattended, ocPromptAsked, ocPromptFrame, ocPromptHeld, ocPromptResolved, ocPromptsEndedBy,
+  ocTodoMarkdown, ocUnattendedRoots, reduceOcEvent,
 } from "./state";
 import type { OcState } from "./state";
 
@@ -752,5 +752,59 @@ describe("turn end", () => {
     expect(reduceOcEvent(state, idle(ROOT), 9_000)).toMatchObject({ op: "done" });
     expect(reduceOcEvent(state, todos(ROOT, THREE), 9_100)).toMatchObject({ status: "working" });
     expect(reduceOcEvent(state, status(ROOT, { type: "idle" }), 9_200)).toMatchObject({ op: "done" });
+  });
+});
+
+// -------------------------------------------------------------------------------------------------
+// NOM-214. OpenCode 2.x keeps every session in ONE shared server, so closing the window that showed a
+// prompt kills no process: the pid reap never fires and the yellow row stayed up forever. The plugin
+// closes such a row once no OpenCode window is attached (v2.ts ocWatchClients decides when).
+// -------------------------------------------------------------------------------------------------
+
+describe("closing rows nobody can answer (no OpenCode window attached)", () => {
+  test("only a row parked on a prompt with no phone card is unattended — a held card stays answerable", () => {
+    const state = workingRoot();
+    expect(ocUnattendedRoots(state)).toEqual([]);
+    ocPromptAsked(state, asked(GRANDCHILD, "per_1"));
+    expect(ocUnattendedRoots(state)).toEqual([ROOT]); // a subagent's prompt parks the ROOT row
+    ocPromptAsked(state, asked(ROOT, "per_2", "call_2"));
+    ocPromptHeld(state, "per_2", true);
+    expect(ocUnattendedRoots(state)).toEqual([]); // the phone can still Allow/Deny it
+    ocPromptHeld(state, "per_2", false);
+    expect(ocUnattendedRoots(state)).toEqual([ROOT]);
+  });
+
+  test("it is closed with a blob-bearing end (a closed row, no Task finished buzz), once", () => {
+    const state = workingRoot();
+    ocPromptAsked(state, asked(ROOT, "per_1"));
+    expect(ocCloseUnattended(state, 5_000)).toEqual([
+      expect.objectContaining({ sessionId: ROOT, op: "end", prio: 0, status: "done", title: "Explore codebase structure", turnStartedAt: 2 }),
+    ]);
+    expect(ocUnattendedRoots(state)).toEqual([]);
+    expect(ocCloseUnattended(state, 5_100)).toEqual([]);
+    // The prompt is still pending in OpenCode, so it stays registered — and nothing else posts to the
+    // closed row: no done for its turn end, no end on dispose.
+    expect(state.prompts.has("per_1")).toBe(true);
+    expect(reduceOcEvent(state, idle(ROOT), 5_200)).toBeNull();
+    expect(ocEndFrames(state, 5_300)).toEqual([]);
+  });
+
+  test("reopened and answered at the Mac, the next step reopens the row with a start", () => {
+    const state = workingRoot();
+    ocPromptAsked(state, asked(ROOT, "per_1"));
+    ocCloseUnattended(state, 5_000);
+    expect(ocPromptResolved(state, "per_1")).toBe(ROOT);
+    expect(ocPromptFrame(state, ROOT, 6_000)).toBeNull(); // the row is closed; nothing to repaint
+    expect(reduceOcEvent(state, status(ROOT, { type: "busy" }), 6_100)).toMatchObject({ op: "start", status: "working", turnStartedAt: 6 });
+    expect(reduceOcEvent(state, idle(ROOT), 6_200)).toMatchObject({ op: "done" });
+  });
+
+  test("a new prompt on a closed row reopens it with a start (an update would be dropped as ended)", () => {
+    const state = workingRoot();
+    ocPromptAsked(state, asked(CHILD, "per_1"));
+    ocCloseUnattended(state, 5_000);
+    ocPromptAsked(state, asked(CHILD, "per_2", "call_2"));
+    expect(ocPromptFrame(state, CHILD, 6_000)).toMatchObject({ sessionId: ROOT, op: "start", status: "needsAttention" });
+    expect(ocPromptFrame(state, CHILD, 6_100)).toMatchObject({ op: "update", status: "needsAttention" });
   });
 });

@@ -3,7 +3,7 @@ import { ocDecisionRequest, ocResolvedRequestId } from "./approvals";
 import plugin from "./plugin";
 import { newOcState, ocPromptAsked, ocPromptsEndedBy, reduceOcEvent } from "./state";
 import type { OcFrame, OcState } from "./state";
-import { OC_V2_EVENT_TYPES, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope } from "./v2";
+import { OC_V2_EVENT_TYPES, ocClientCount, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope, ocWatchClients } from "./v2";
 
 // -------------------------------------------------------------------------------------------------
 // THE FIXTURES ARE REAL. Each `data` below is a capture from a live OpenCode 2.4.1 TUI (`--standalone`,
@@ -318,5 +318,72 @@ describe("ocV2Client — the 2.x reply seam behind the 1.x client shape", () => 
   test("a failing reply throws, so the hold traces it as lost", async () => {
     const failing = ocV2Client(async () => { throw new Error("NotFound"); }, () => S);
     await expect(failing._client.post({ url: "/permission/per_1/reply", body: { reply: "once" } })).rejects.toThrow("NotFound");
+  });
+});
+
+// NOM-214. `lsof -nP -a -p <server pid> -iTCP -FnT`, captured off a live `opencode serve --service`
+// (2.4.0): the listener, outbound provider connections on :443, and — once a TUI attaches — its
+// connection INTO the listener. Only the last kind is a window.
+const LSOF_NO_WINDOW = [
+  "p42681", "f7", "n127.0.0.1:49374", "TST=LISTEN", "TQR=0", "TQS=0",
+  "f13", "n[fdfe:dcba:9876::1]:56043->[2001:2::df]:443", "TST=ESTABLISHED", "TQR=0", "TQS=0",
+  "f19", "n198.18.0.1:55093->198.18.1.141:443", "TST=ESTABLISHED", "TQR=0", "TQS=0",
+].join("\n");
+const lsofWindows = (...ports: number[]) => LSOF_NO_WINDOW + ports.map((port, i) =>
+  `\nf${30 + i}\nn127.0.0.1:49374->127.0.0.1:${port}\nTST=ESTABLISHED\nTQR=0\nTQS=0`).join("");
+
+describe("ocClientCount — how many OpenCode windows are attached to this server", () => {
+  test("connections INTO the listener are windows; outbound ones are not", () => {
+    expect(ocClientCount(LSOF_NO_WINDOW)).toBe(0);
+    expect(ocClientCount(lsofWindows(61234))).toBe(1);
+    expect(ocClientCount(lsofWindows(61234, 61240))).toBe(2);
+  });
+  test("IPv6 listeners count the same way", () => {
+    expect(ocClientCount("p1\nf7\nn[::1]:4096\nTST=LISTEN\nf8\nn[::1]:4096->[::1]:5000\nTST=ESTABLISHED")).toBe(1);
+  });
+  test("no listener (or no output: lsof missing, failed) is unknown, never zero", () => {
+    expect(ocClientCount("")).toBeUndefined();
+    expect(ocClientCount("p1\nf13\nn10.0.0.2:5000->1.1.1.1:443\nTST=ESTABLISHED")).toBeUndefined();
+  });
+});
+
+describe("ocWatchClients — close what only a window could answer, once no window is left", () => {
+  const tick = (ms = 40) => new Promise((resolve) => setTimeout(resolve, ms));
+  function watch(counts: (number | undefined)[], pending = () => true) {
+    const closed: number[] = [];
+    let polls = 0;
+    const stop = ocWatchClients({
+      count: async () => counts[Math.min(polls++, counts.length - 1)],
+      pending,
+      close: () => { closed.push(polls); },
+      intervalMs: 5,
+    });
+    return { closed, stop, polls: () => polls };
+  }
+
+  test("two windowless polls in a row close it; a window coming back resets the count", async () => {
+    const w = watch([1, 0, 1, 0, 0, 1]);
+    await tick(80);
+    w.stop();
+    expect(w.closed).toEqual([5]); // polls 2 and 4 were single blips (a TUI reconnecting)
+  });
+  test("unknown (no listener, lsof failed) never closes anything", async () => {
+    const w = watch([undefined]);
+    await tick();
+    w.stop();
+    expect(w.closed).toEqual([]);
+  });
+  test("with nothing parked it never even looks", async () => {
+    const w = watch([0], () => false);
+    await tick();
+    w.stop();
+    expect(w.polls()).toBe(0);
+    expect(w.closed).toEqual([]);
+  });
+  test("stop() ends it", async () => {
+    const w = watch([0]);
+    w.stop();
+    await tick();
+    expect(w.polls()).toBe(0);
   });
 });
