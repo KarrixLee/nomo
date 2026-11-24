@@ -251,3 +251,49 @@ export function ocV2Client(
     },
   };
 }
+
+/** NOM-214: how many OpenCode WINDOWS are attached to this server, from `lsof -nP -a -p <own pid> -iTCP
+ *  -FnT` (field output: `n<name>` then `TST=<state>` per socket). A window — the TUI, the web UI, the
+ *  desktop app on the shared service — holds an SSE stream (`/api/event`) open into the server's
+ *  listener for as long as it is open, so the connections whose LOCAL end is a listening port are the
+ *  windows; outbound ones (the provider's :443) are not. Undefined — "can't tell", never zero — when
+ *  there is no listener at all (or no output: lsof missing or failed).
+ *
+ *  OpenCode 2.x has no presence signal of its own (verified on v2.4.1: no client/detach event, the event
+ *  feed's subscriber set is private, `session.viewed` is a read receipt), so the socket table is it. */
+export function ocClientCount(lsofFields: string): number | undefined {
+  const sockets: { name: string; state?: string }[] = [];
+  for (const line of lsofFields.split("\n")) {
+    if (line.startsWith("n")) sockets.push({ name: line.slice(1) });
+    else if (line.startsWith("TST=") && sockets.length > 0) sockets[sockets.length - 1].state = line.slice(4);
+  }
+  const port = (address: string) => address.slice(address.lastIndexOf(":") + 1);
+  const listening = new Set(sockets.filter((s) => s.state === "LISTEN").map((s) => port(s.name)));
+  if (listening.size === 0) return undefined;
+  return sockets.filter((s) => s.state === "ESTABLISHED" && listening.has(port(s.name.split("->")[0]))).length;
+}
+
+/** NOM-214: while a row is parked on a prompt only a window can answer (`pending`), poll how many
+ *  windows are attached (`count`) and `close` those rows once NONE has been for two polls in a row —
+ *  one windowless poll can be a TUI reconnecting its stream. Unknown (undefined) never closes anything.
+ *  At the default 10 s, a closed window settles its row in 10–20 s. Returns `stop`. */
+export function ocWatchClients(o: {
+  count: () => Promise<number | undefined>;
+  pending: () => boolean;
+  close: () => void;
+  intervalMs?: number;
+}): () => void {
+  let misses = 0;
+  let polling = false;
+  const timer = setInterval(() => {
+    if (polling) return;
+    if (!o.pending()) { misses = 0; return; }
+    polling = true;
+    void o.count().then((n) => {
+      misses = n === 0 ? misses + 1 : 0;
+      if (misses >= 2) { misses = 0; o.close(); }
+    }).catch(() => { misses = 0; }).finally(() => { polling = false; }); // never throws into OpenCode
+  }, o.intervalMs ?? 10_000);
+  (timer as { unref?: () => void }).unref?.();
+  return () => clearInterval(timer);
+}

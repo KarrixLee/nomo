@@ -565,8 +565,14 @@ process. Codex has no plugin update verb: with a `local` marketplace (`source_ty
   already handles (`src/opencode/v2.ts`), so the phone sees the same records either way. The stream is
   server-wide, so events for other folders are dropped. By default 2.x runs plugins in its background
   service, not the TUI, so the row's liveness is that service: closing the TUI leaves a finished row,
-  ended when the service stops. A background subagent can still be running after the parent's turn
-  shows done.
+  ended when the service stops. A row waiting on a question or a permission the phone cannot answer is
+  closed (`end`, no "finished" alert) about 10–20 s after the last OpenCode window detaches from that
+  service (or from a plain `opencode serve`): the plugin counts the connections into the server's own
+  listening port (`lsof`), since 2.x has no client-presence event. OpenCode keeps the prompt pending; answer
+  it in a reopened window and the row comes back. An Allow/Deny card on the phone is never closed this
+  way, and a running turn is left alone. A background subagent can still be running after the parent's
+  turn shows done. 2.x only produces todos when its `todo` flag is on (`OPENCODE_FLAGS=todo` or
+  `experimental.todo: true`).
 
 ### Cursor integration
 
@@ -701,6 +707,12 @@ OpenCode has no manifest; its checkout is its version. `bun build.ts` refuses to
 disagree. `package.json` carries the version only so `bunx nomo-ai --version` is quotable in a bug
 report. The npm publish is manual — `npm pack --dry-run` first: the tarball is `bin/` plus
 `package.json`, `README.md` and `LICENSE`, nothing else.
+
+## Contributors
+
+Thank you to everyone who helped make Nomo better:
+
+- [@tecandrew](https://github.com/tecandrew): worked out the OpenCode 2.x plugin migration and shared a working adapter, which became OpenCode 2.x support in plugin 2.5.2.
 
 ## License — MIT
 

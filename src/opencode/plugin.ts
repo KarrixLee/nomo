@@ -21,7 +21,7 @@
  *  Pairing is shared across agents — pair once from Claude Code or Codex and this plugin is paired.
  */
 
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { accessSync, constants, readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { buildEnvelope, markDoneDelivered, trackSession } from "../core/hook";
@@ -33,10 +33,12 @@ import {
   ocDecisionRequest, OcDecisionRequest, ocPost, ocResolvedRequestId, ocResolveOnRelay, runOcApproval,
 } from "./approvals";
 import {
-  newOcState, ocEndFrames, ocForgetStatusFrame, OcFrame, ocPromptAsked, ocPromptFrame, ocPromptHeld,
-  ocPromptResolved, ocPromptsEndedBy, ocRowHeld, OcState, postOcEvent, reduceOcEvent,
+  newOcState, ocCloseUnattended, ocEndFrames, ocForgetStatusFrame, OcFrame, ocPromptAsked, ocPromptFrame, ocPromptHeld,
+  ocPromptResolved, ocPromptsEndedBy, ocRowHeld, OcState, ocUnattendedRoots, postOcEvent, reduceOcEvent,
 } from "./state";
-import { OC_V2_EVENT_TYPES, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope } from "./v2";
+import {
+  OC_V2_EVENT_TYPES, ocClientCount, ocV1Backfill, ocV1Events, ocV2Client, ocV2Scope, ocWatchClients,
+} from "./v2";
 
 /** The verified-live shape of OpenCode's `PluginInput` (1.18.15). Declared structurally rather than
  *  imported from `@opencode-ai/plugin`, which is not a dependency of this repo (the plugin ships as a
@@ -56,6 +58,9 @@ interface OpenCodePluginInput {
   /** OpenCode 2.x only (set by `setup`): its questions are forms, which no plugin route can answer, so a
    *  question is shown as "answer at your Mac" and never held. Absent on 1.x, which keeps holding. */
   questionsOnComputer?: boolean;
+  /** OpenCode 2.x HEADLESS server only (set by `setup`) — see `isSharedServer`. Close a row parked on a
+   *  prompt once no OpenCode window is attached to answer it (NOM-214). */
+  watchClients?: boolean;
 }
 
 interface OpenCodeHooks {
@@ -110,6 +115,27 @@ let watchdogTrustedUntil = 0;
 function ensureWatchdogCached(now: number): void {
   if (now < watchdogTrustedUntil) return;
   watchdogTrustedUntil = ensureWatchdog({ spawnWatchdog }) ? now + WATCHDOG_TRUST_MS : 0;
+}
+
+/** How many OpenCode windows are attached to THIS server process — see ocClientCount. Async and
+ *  bounded (~30 ms, 2 s cap): it runs inside OpenCode's own server and must never block it. */
+function serverClients(): Promise<number | undefined> {
+  return new Promise((resolve) => {
+    try {
+      execFile("lsof", ["-nP", "-a", "-p", String(process.pid), "-iTCP", "-FnT"], { timeout: 2000 },
+        (_error, stdout) => resolve(ocClientCount(String(stdout ?? ""))));
+    } catch { resolve(undefined); }
+  });
+}
+
+/** Is this the 2.x server every window SHARES — `opencode serve --service` (the default background
+ *  service) or a plain `opencode serve`? There, closing a window kills no process, so the watchdog's
+ *  pid reap never fires (NOM-214), and every window reaches it over TCP, so the socket table can tell
+ *  whether one is still attached. NOT `--standalone`, which is a private `serve --stdio` child that
+ *  talks to its one TUI over stdio (it listens too, so its TCP table would read "no window" while the
+ *  TUI is open) and exits with it, where the pid reap already works. */
+function isSharedServer(argv: readonly string[] = process.argv): boolean {
+  return argv.includes("serve") && !argv.includes("--stdio");
 }
 
 interface OcContext {
@@ -314,6 +340,16 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
       void ocResolveOnRelay(ctx.config, requestId);
     };
 
+    /** NOM-214: on the shared 2.x server, close every row parked on a prompt with no window left to
+     *  answer it. Decided inside the chain, at send time, like repaint. */
+    const stopWatching = input?.watchClients === true
+      ? ocWatchClients({
+        count: serverClients,
+        pending: () => ocUnattendedRoots(ctx.state).length > 0,
+        close: () => void enqueue(async () => { for (const frame of ocCloseUnattended(ctx.state)) await send(ctx, frame); }),
+      })
+      : undefined;
+
     return {
       event: async ({ event }) => {
         try {
@@ -339,6 +375,7 @@ const server = async (input: OpenCodePluginInput): Promise<OpenCodeHooks> => {
       },
       dispose: async () => {
         try {
+          stopWatching?.();
           // Every pending question/permission is auto-rejected by OpenCode's own service finalizer at
           // shutdown, and it publishes no event for that — so the cards have to be retired from here or
           // they outlive the server that could have answered them.
@@ -386,6 +423,7 @@ const setup = async (ctx: OpenCodeV2Context): Promise<(() => Promise<void>) | un
         ? ocV2Client((i) => reply.call(ctx.permission, i), (id) => sessions.get(id))
         : undefined,
       questionsOnComputer: true,
+      watchClients: isSharedServer(),
     });
     const onEvent = hooks.event;
     if (!onEvent) return undefined; // not paired — no subscription, nothing to clean up
