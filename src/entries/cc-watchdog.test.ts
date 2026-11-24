@@ -5013,3 +5013,18 @@ describe("free mode in the watchdog", () => {
     expect(seen).toEqual(["https://relay.test/v1/cc/full"]);
   });
 });
+
+// 2.5.3: per-agent plugin versions. A watchdog rebuilding a session's blob restates the version the
+// session's OWN integration stamped on its record — never its own (docs/plugin-versions-contract.md).
+describe("rebuilt blobs carry the session's own integration version", () => {
+  const base = { pid: 1, machine: "m", label: "l", ts: 1, title: "t" } as SessionRecord;
+  test("done / needsAttention restate record.pluginVersion; a record from an older integration has none", async () => {
+    const withV = { ...base, agent: "opencode", pluginVersion: "2.4.0" } as SessionRecord;
+    const done = await buildDoneEnvelope("ses_1", withV, 1, KEY, "opencode") as { blob: string };
+    expect((await decryptBlob(KEY, done.blob) as Record<string, unknown>).pluginVersion).toBe("2.4.0");
+    const attn = await buildNeedsAttentionEnvelope("ses_1", withV, 1, KEY, "opencode") as { blob: string };
+    expect((await decryptBlob(KEY, attn.blob) as Record<string, unknown>).pluginVersion).toBe("2.4.0");
+    const old = await buildDoneEnvelope("s2", base, 1, KEY) as { blob: string };
+    expect(await decryptBlob(KEY, old.blob)).not.toHaveProperty("pluginVersion");
+  });
+});

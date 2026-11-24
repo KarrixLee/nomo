@@ -249,6 +249,10 @@ function runtimeArgs(runtime, args) {
 function sidField(sessionId) {
   return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
 }
+function recordVersionField(record) {
+  const v = record?.pluginVersion;
+  return typeof v === "string" && v.length > 0 ? { pluginVersion: v } : {};
+}
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withPlan = appendFittedPlan(base, plan);
   if (typeof dbg !== "string" || dbg.length === 0)
@@ -3465,7 +3469,8 @@ function buildStatePlaintext(record, status, at, titleFallback, sessionId) {
     at: Math.floor(at / 1000),
     ...filled(record.folderKey) ? { folderKey: record.folderKey } : {},
     ...branch ? { branch } : {},
-    ...sidField(sessionId)
+    ...sidField(sessionId),
+    ...recordVersionField(record)
   };
   const dbg = agent === "codex" ? formatPlanPickerDebug({
     event: status === "done" ? "done" : "working",
@@ -3711,7 +3716,8 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...folderKey ? { folderKey } : {},
     ...branch ? { branch } : {},
-    ...sidField(input.session_id)
+    ...sidField(input.session_id),
+    pluginVersion: PLUGIN_VERSION
   };
   const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
     event: hookName || "event",
@@ -3798,6 +3804,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       prio,
       ...blob ? { blob } : {},
       ...agent === "claude" ? {} : { agent },
+      pluginVersion: PLUGIN_VERSION,
       ...typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {},
       ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
       ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},

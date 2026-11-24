@@ -1,6 +1,6 @@
 // src/opencode/plugin.ts
 import { execFile as execFile3, spawn as spawn2 } from "node:child_process";
-import { accessSync, constants, readFileSync as readFileSync3 } from "node:fs";
+import { readFileSync as readFileSync4 } from "node:fs";
 import { hostname as hostname3 } from "node:os";
 
 // src/core/antigravity-inbox.ts
@@ -2935,7 +2935,8 @@ function buildBlob(input, machine, title, plan, agent = "claude", turnStartedAt,
     ...typeof at === "number" && Number.isFinite(at) ? { at } : {},
     ...folderKey ? { folderKey } : {},
     ...branch ? { branch } : {},
-    ...sidField(input.session_id)
+    ...sidField(input.session_id),
+    pluginVersion: PLUGIN_VERSION
   };
   const dbg = agent === "codex" ? dbgOverride ?? formatPlanPickerDebug({
     event: hookName || "event",
@@ -3022,6 +3023,7 @@ async function trackSessionAt(sessionsDir, sessionId, op, prio, status, blob, ma
       prio,
       ...blob ? { blob } : {},
       ...agent === "claude" ? {} : { agent },
+      pluginVersion: PLUGIN_VERSION,
       ...typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {},
       ...typeof turnStartedAt === "number" && Number.isFinite(turnStartedAt) ? { turnStartedAt } : {},
       ...typeof turnId === "string" && turnId.length > 0 ? { turnId } : {},
@@ -5921,6 +5923,8 @@ async function postOcEvent(config, envelope) {
 }
 
 // src/opencode/v2.ts
+import { accessSync, constants, readFileSync as readFileSync3 } from "node:fs";
+import { delimiter as delimiter2, isAbsolute as isAbsolute5, join as join5 } from "node:path";
 var OC_V2_EVENT_TYPES = [
   "session.created",
   "session.renamed",
@@ -6184,17 +6188,36 @@ function ocWatchClients(o) {
   timer.unref?.();
   return () => clearInterval(timer);
 }
-
-// src/opencode/plugin.ts
-function resolveRuntime() {
-  const env = process.env.NOMO_RUNTIME;
-  if (env && env.length > 0 && isExecutable(env))
-    return env;
+function ocWatchdogServesUs(raw, alive = pidAlive, version = PLUGIN_VERSION) {
+  const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
+  return !!holder && alive(holder.pid) && !watchdogVersionOutranks(version, holder.version);
+}
+function resolveRuntime(env = process.env, ccDir = CC_DIR) {
+  const forced = env.NOMO_RUNTIME;
+  if (forced && forced.length > 0 && isExecutable(forced))
+    return forced;
   try {
-    const cached = readFileSync3(`${CC_DIR}/runtime`, "utf8").trim();
+    const cached = readFileSync3(`${ccDir}/runtime`, "utf8").trim();
     if (cached.length > 0 && !cached.startsWith("NONE:") && isExecutable(cached))
       return cached;
   } catch {}
+  const dirs = (env.PATH ?? "").split(delimiter2).filter((d) => isAbsolute5(d));
+  for (const name of ["bun", "node"]) {
+    for (const d of dirs)
+      if (isExecutable(join5(d, name)))
+        return join5(d, name);
+  }
+  const home = env.HOME ?? "";
+  for (const candidate of [
+    ...home ? [`${home}/.bun/bin/bun`] : [],
+    "/opt/homebrew/bin/bun",
+    "/usr/local/bin/bun",
+    "/opt/homebrew/bin/node",
+    "/usr/local/bin/node",
+    "/usr/bin/node"
+  ])
+    if (isExecutable(candidate))
+      return candidate;
   return;
 }
 function isExecutable(path) {
@@ -6205,6 +6228,8 @@ function isExecutable(path) {
     return false;
   }
 }
+
+// src/opencode/plugin.ts
 function spawnWatchdog() {
   const runtime = resolveRuntime();
   if (!runtime)
@@ -6216,7 +6241,26 @@ var watchdogTrustedUntil = 0;
 function ensureWatchdogCached(now) {
   if (now < watchdogTrustedUntil)
     return;
-  watchdogTrustedUntil = ensureWatchdog({ spawnWatchdog }) ? now + WATCHDOG_TRUST_MS : 0;
+  watchdogTrustedUntil = ensureWatchdogIfSpawnable() ? now + WATCHDOG_TRUST_MS : 0;
+}
+function ensureWatchdogIfSpawnable() {
+  return resolveRuntime() !== undefined && ensureWatchdog({ spawnWatchdog });
+}
+var WATCHDOG_GUARD_MS = 15000;
+function guardWatchdog() {
+  const timer = setInterval(() => {
+    try {
+      let raw;
+      try {
+        raw = readFileSync4(WATCHDOG_PID_PATH, "utf8");
+      } catch {}
+      if (ocWatchdogServesUs(raw))
+        return;
+      watchdogTrustedUntil = ensureWatchdogIfSpawnable() ? Date.now() + WATCHDOG_TRUST_MS : 0;
+    } catch {}
+  }, WATCHDOG_GUARD_MS);
+  timer.unref?.();
+  return () => clearInterval(timer);
 }
 function serverClients() {
   return new Promise((resolve) => {
@@ -6353,6 +6397,7 @@ var server = async (input) => {
           await send(ctx, frame);
       })
     }) : undefined;
+    const stopGuard = ctx.controls ? guardWatchdog() : undefined;
     return {
       event: async ({ event }) => {
         try {
@@ -6381,6 +6426,7 @@ var server = async (input) => {
       dispose: async () => {
         try {
           stopWatching?.();
+          stopGuard?.();
           for (const opencodeId of [...holds.keys()])
             retire(opencodeId);
           const frames = ocEndFrames(ctx.state);

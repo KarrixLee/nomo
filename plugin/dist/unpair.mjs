@@ -241,6 +241,10 @@ function runtimeArgs(runtime, args) {
 function sidField(sessionId) {
   return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
 }
+function recordVersionField(record) {
+  const v = record?.pluginVersion;
+  return typeof v === "string" && v.length > 0 ? { pluginVersion: v } : {};
+}
 function appendFittedPlanAndDebug(base, plan, dbg) {
   const withPlan = appendFittedPlan(base, plan);
   if (typeof dbg !== "string" || dbg.length === 0)

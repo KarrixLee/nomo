@@ -510,6 +510,19 @@ describe("watchdog: send-message / cancel-message through drainCommands' gates",
     expect(r.published).toEqual([OC, OC, OC]);
   });
 
+  test("a send this daemon cannot deliver (agent with no reply route) gets an honest x receipt, once", async () => {
+    const r = await drain([
+      await seal({ sessionId: "claude-1", mid: "mid-aaaaaaaa" }),
+      await seal({ sessionId: "claude-1", mid: "mid-aaaaaaaa", text: "again" }),
+      await seal({ kind: "cancel-message", sessionId: "claude-1", mid: "mid-bbbbbbbb" }),
+    ], [{ sessionId: "claude-1", rec: rec({ agent: "claude" }) }]);
+    expect(r.traces.map((t) => t.result)).toEqual(["unsupported", "duplicate", "unsupported"]);
+    expect(await receiptOf(r.dir, "claude-1", "mid-aaaaaaaa")).toBe("x");
+    expect(await receiptOf(r.dir, "claude-1", "mid-bbbbbbbb")).toBeUndefined();
+    expect(r.published).toEqual(["claude-1"]); // a cancel of nothing publishes nothing
+    expect(await hasQueuedReplies(r.dir, "claude-1")).toBe(false);
+  });
+
   test("malformed text / mid never reach the inbox and publish nothing", async () => {
     const r = await drain([await seal({ text: "a\u0000b" }), await seal({ mid: "../x" })], [{ sessionId: CONV, rec: rec() }]);
     expect(r.traces.map((t) => t.result)).toEqual(["malformed", "malformed"]);

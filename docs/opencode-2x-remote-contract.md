@@ -30,7 +30,8 @@ App gates to flip, for `agent == .opencode`:
 | Always allow | `permissionProjectGrant` is non-empty (section 4) |
 
 The per-computer plugin version gate for these is **2.5.3**, but `controls` alone is enough: no
-older plugin sends it.
+older plugin sends it. Versions are per agent (`plugin-versions-contract.md`): gate on the session's own
+`pluginVersion`, never on the watchdog's.
 
 ## 2. Reply
 
@@ -51,6 +52,10 @@ Exactly the Antigravity wire (NOM-96):
   receipt arrives, as today; a repeated `mid` is delivered once.
 - While a permission card is held, the `d` receipt arrives with the session's next frame (after the
   card is answered).
+- A watchdog that can't route a message (2.5.3+) answers `x` at once. A watchdog from an older plugin
+  (one that lacks this feature) drops it silently. The resident OpenCode plugin replaces such a watchdog
+  within about 15 s, even while idle, and the phone's re-send (same `mid`) then gets through. So keep
+  re-sending until a receipt arrives, as today.
 
 ## 3. Interrupt
 

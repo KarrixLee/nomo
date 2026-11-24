@@ -34,6 +34,10 @@
  *  core emits them), so turn start/end come from `session.execution.*`.
  */
 
+import { accessSync, constants, readFileSync } from "node:fs";
+import { delimiter, isAbsolute, join } from "node:path";
+import { CC_DIR, parseWatchdogPidfile, pidAlive, PLUGIN_VERSION, watchdogVersionOutranks } from "../core/shared";
+
 /** Every 2.x type the translator reads — the subscription filter, so OpenCode never encodes the rest. */
 export const OC_V2_EVENT_TYPES = [
   "session.created", "session.renamed", "session.agent.selected", "session.step.started",
@@ -328,4 +332,47 @@ export function ocWatchClients(o: {
   }, o.intervalMs ?? 10_000);
   (timer as { unref?: () => void }).unref?.();
   return () => clearInterval(timer);
+}
+
+/** The CHEAP half of the idle watchdog guard (2.5.3): is the live daemon one that can serve this
+ *  plugin's commands — this version or a newer one? One small pidfile read and a `kill(pid, 0)`: no
+ *  `ps` fork, no bundle hash. Anything else (no daemon, a dead pid, an OLDER version) → false, and the
+ *  caller runs the full ensureWatchdog, which verifies identity and evicts the older one. Pure but for `alive`. */
+export function ocWatchdogServesUs(
+  raw: string | undefined, alive: (pid: number) => boolean = pidAlive, version: string = PLUGIN_VERSION,
+): boolean {
+  const holder = typeof raw === "string" ? parseWatchdogPidfile(raw) : null;
+  return !!holder && alive(holder.pid) && !watchdogVersionOutranks(version, holder.version);
+}
+
+/** A real JS runtime for the watchdog (plugin.ts spawnWatchdog — see its landmine note): $NOMO_RUNTIME,
+ *  else run.sh's runtime cache, else run.sh's own fast path. */
+export function resolveRuntime(env: NodeJS.ProcessEnv = process.env, ccDir: string = CC_DIR): string | undefined {
+  const forced = env.NOMO_RUNTIME;
+  if (forced && forced.length > 0 && isExecutable(forced)) return forced;
+  try {
+    const cached = readFileSync(`${ccDir}/runtime`, "utf8").trim();
+    // run.sh writes a `NONE:<epoch>` sentinel when it found no runtime at all — that is a negative
+    // cache, not a path.
+    if (cached.length > 0 && !cached.startsWith("NONE:") && isExecutable(cached)) return cached;
+  } catch { /* no cache — the usual case, see below */ }
+  // run.sh writes that cache ONLY on its slow login-shell path. When bun/node sits on PATH or in a
+  // standard spot (~/.bun/bin — most machines) it never writes one, so stopping at the cache meant this
+  // plugin could never start a watchdog (2.5.3 field bug: its eviction killed an older daemon and
+  // started nothing). So run.sh's own fast path, in its order: bun then node on PATH (absolute entries
+  // only), then its fixed candidates. Fork-free: a few access() calls.
+  const dirs = (env.PATH ?? "").split(delimiter).filter((d) => isAbsolute(d));
+  for (const name of ["bun", "node"]) {
+    for (const d of dirs) if (isExecutable(join(d, name))) return join(d, name);
+  }
+  const home = env.HOME ?? "";
+  for (const candidate of [
+    ...(home ? [`${home}/.bun/bin/bun`] : []), "/opt/homebrew/bin/bun", "/usr/local/bin/bun",
+    "/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node",
+  ]) if (isExecutable(candidate)) return candidate;
+  return undefined;
+}
+
+function isExecutable(path: string): boolean {
+  try { accessSync(path, constants.X_OK); return true; } catch { return false; }
 }

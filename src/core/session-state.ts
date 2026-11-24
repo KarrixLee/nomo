@@ -22,7 +22,7 @@
 // the decay, i.e. two numbers about the transport and nothing about the status.
 
 import { adapterFor } from "./adapter";
-import { appendFittedPlanAndDebug, formatPlanPickerDebug, sessionBranch, sidField } from "./shared";
+import { appendFittedPlanAndDebug, formatPlanPickerDebug, sessionBranch, recordVersionField, sidField } from "./shared";
 import type { AgentKindWire, CCStatus, DecisionHold, SessionRecord } from "./shared";
 
 /** The 24 h abandonment cap — cc-watchdog's SESSION_STALE_MS, mirrored (an entry module must not be
@@ -363,6 +363,7 @@ export function buildStatePlaintext(
     ...(filled(record.folderKey) ? { folderKey: record.folderKey } : {}),
     ...(branch ? { branch } : {}),
     ...sidField(sessionId),
+    ...recordVersionField(record),
   };
   const dbg = agent === "codex"
     ? formatPlanPickerDebug({

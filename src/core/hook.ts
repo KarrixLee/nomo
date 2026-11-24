@@ -431,6 +431,9 @@ export function buildBlob(input: Record<string, unknown>, machine: string, title
     ...(folderKey ? { folderKey } : {}),
     ...(branch ? { branch } : {}),
     ...sidField(input.session_id), // NOM-125, the last base key in EVERY producer (see sidField)
+    // 2.5.3, APPEND-LAST: the version of the integration sealing this blob (this hook / resident plugin)
+    // — the app gates per-agent features on it, never on the watchdog's or the computer's version.
+    pluginVersion: PLUGIN_VERSION,
   };
   const dbg = agent === "codex"
     ? dbgOverride ?? formatPlanPickerDebug({
@@ -625,6 +628,10 @@ export async function trackSessionAt(
       // Same omit-for-claude rule as the blob's key above: absent MEANS claude on every reader
       // (recordAgent/`record.agent ?? "claude"`), and any other kind is stored as its own literal.
       ...(agent === "claude" ? {} : { agent }),
+      // 2.5.3: the version of the INTEGRATION writing this record (this hook / resident plugin), so a
+      // watchdog of another version rebuilding the session's blob states the session's own version, never
+      // its own (docs/plugin-versions-contract.md).
+      pluginVersion: PLUGIN_VERSION,
       // Cache the parsed start so the next hook and the watchdog re-send it without re-reading the
       // transcript (and so it survives the transcript later going away). Omitted when unknown.
       ...(typeof sessionStartedAt === "number" && Number.isFinite(sessionStartedAt) ? { sessionStartedAt } : {}),

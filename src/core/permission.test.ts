@@ -1163,9 +1163,9 @@ describe("runPermissionHook — hold state machine", () => {
     // the permission keys is untouched. `folderKey` (the phone's folder-grouping identity) closes the
     // base after `at`, the same slot every other producer of this shape puts it in.
     const keys = Object.keys(blob);
-    expect(keys.slice(keys.indexOf("permissionSummary") - 3, keys.indexOf("permissionSummary")))
-      .toEqual(["at", "folderKey", "sid"]);
-    expect(Object.keys(fb).slice(-3)).toEqual(["at", "folderKey", "sid"]);
+    expect(keys.slice(keys.indexOf("permissionSummary") - 4, keys.indexOf("permissionSummary")))
+      .toEqual(["at", "folderKey", "sid", "pluginVersion"]);
+    expect(Object.keys(fb).slice(-4)).toEqual(["at", "folderKey", "sid", "pluginVersion"]);
   });
 
   // The held frames get `branch` for free: runPermissionHook hands buildBlob the WHOLE record, so the
@@ -1186,9 +1186,9 @@ describe("runPermissionHook — hold state machine", () => {
       expect(blob.branch).toBe("feat/hybrid-lan");
       expect(fb.branch).toBe("feat/hybrid-lan");
       const keys = Object.keys(blob);
-      expect(keys.slice(keys.indexOf("permissionSummary") - 4, keys.indexOf("permissionSummary")))
-        .toEqual(["at", "folderKey", "branch", "sid"]);
-      expect(Object.keys(fb).slice(-4)).toEqual(["at", "folderKey", "branch", "sid"]);
+      expect(keys.slice(keys.indexOf("permissionSummary") - 5, keys.indexOf("permissionSummary")))
+        .toEqual(["at", "folderKey", "branch", "sid", "pluginVersion"]);
+      expect(Object.keys(fb).slice(-5)).toEqual(["at", "folderKey", "branch", "sid", "pluginVersion"]);
       // The absolute path itself never crosses the wire — only the digest and the branch name.
       expect(JSON.stringify(blob)).not.toContain(repo);
     } finally {
@@ -2227,8 +2227,9 @@ describe("runPermissionHook — decision blob detail fields", () => {
   test("Bash: a long description never crowds out the command", async () => {
     for (const description of ["d".repeat(2000), "\u0001".repeat(2000)]) {
       const { body, blob } = await postedBlob({
-        // 1920, not 1950: the base now also carries `permissionGrant` (~33 sealed chars).
-        readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(1920), ts: 1000, model: "claude-opus-5" }),
+        // 1880, not 1950: the base now also carries `permissionGrant` (~33 sealed chars) and, since
+        // 2.5.3, `pluginVersion` (~37).
+        readRecordFn: async () => ({ pid: 1, machine: "m", label: "api-status", title: "y".repeat(1880), ts: 1000, model: "claude-opus-5" }),
         readInput: async () => inputWith({ tool_input: { command: "rm -rf build", description } }),
       });
       expect(body.blob.length).toBeLessThanOrEqual(BLOB_FIT_CHARS);

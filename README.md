@@ -212,7 +212,7 @@ computer twice — a UUID made once and kept in `~/.config/cc-status/machine-id`
 derived from serial, MAC, hostname or user name; delete the file for a new one.
 
 **Presence — two fields, every pairing.** About once a minute while the watchdog runs (an agent session
-is open), and as soon as the answer changes (never more than once per ~27 s), the plugin POSTs `/v1/cc/presence` with exactly `{ "coding": [agent ids], "waiting": true|false }`:
+is open), and as soon as the answer changes (never more than once per ~27 s), the plugin POSTs `/v1/cc/presence` with `{ "coding": [agent ids], "waiting": true|false }` plus one `"agent"` + `"pluginVersion"` pair (each agent's own Nomo integration version, one agent per POST in turn; left off against a relay that does not take them yet):
 which agents (`claude`, `codex`, …) have a turn open, and whether any session is waiting for an
 approval. No session id, title, folder, command or text. It is not sealed (the relay keeps it about 3
 minutes so the phone can show "Claude is coding"), and the reply tells the plugin whether the pairing is
@@ -355,6 +355,10 @@ real installs never set it, and anything that can set your agent's environment c
   Interrupt needs the local link, like every agent's; Reply also works over the relay. The plugin
   advertises what this OpenCode can do in the sealed blob (`controls`), and OpenCode 1.x never does,
   so the phone offers neither there. Nothing is executed as a shell command, and no process is started.
+  Only a watchdog of this version or newer can route these commands, so while OpenCode runs the
+  plugin checks every 15 s (one pidfile read and a `kill(pid, 0)`) and, when an older plugin's
+  watchdog holds the queue, replaces it through the usual highest-version-wins handoff. It never stops
+  a watchdog it could not replace. A message a watchdog cannot route gets an `x` (refused) receipt.
 - `/nomo-update` acts only on Nomo's own checkout: the stub's target must be an absolute
   `<checkout>/plugin/dist/opencode.js` and the checkout's `origin` must be this repo on github.com
   (`https://`, `ssh://` or `git@github.com:`), or it refuses before running anything there.

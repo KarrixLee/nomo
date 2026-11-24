@@ -335,6 +335,14 @@ export function sidField(sessionId: unknown): { sid?: string } {
   return typeof sessionId === "string" && sessionId.length > 0 ? { sid: sessionId } : {};
 }
 
+/** 2.5.3: the session's OWN integration version, restated by a blob a watchdog rebuilds from the record
+ *  (right after `sid`, the slot buildBlob seals `pluginVersion` in). Omitted for a record an older
+ *  integration wrote — never the rebuilding watchdog's version (docs/plugin-versions-contract.md). */
+export function recordVersionField(record: { pluginVersion?: unknown } | null | undefined): { pluginVersion?: string } {
+  const v = record?.pluginVersion;
+  return typeof v === "string" && v.length > 0 ? { pluginVersion: v } : {};
+}
+
 /** Append optional `plan`, then optional `dbg` LAST. Budget precedence is intentional: build the
  *  best-fitting plan first, try the capped debug string on that complete shape, and drop `dbg` whole
  *  if it would overflow. Thus `dbg` is always the FIRST sacrifice; only then may plan be truncated or
@@ -1073,6 +1081,8 @@ export interface SessionOrigin {
 export interface SessionRecord {
   /** The session's `claude` process — process.ppid at hook time (see hook.ts header). */
   pid: number;
+  /** 2.5.3: PLUGIN_VERSION of the integration that last wrote this record (see recordVersionField). */
+  pluginVersion?: string;
   machine: string;
   label: string;
   /** The PINNED grouping key for `label`'s folder (see `folderIdentity`). Written together with
