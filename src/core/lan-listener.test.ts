@@ -891,6 +891,38 @@ describe("sealed host-hint publisher", () => {
     expect(await createLanHintPublisher({ address: () => address, hosts: () => [] }).take(cfg)).toBeUndefined();
   });
 
+  // 2.5.4: a restarted watchdog that made no POST never published its new lid (22 h stale on a real Mac),
+  // and a 2.5.3 phone holding a dead lid resets its LAN cursor on every poll. `due` is what makes the sweep
+  // send one greet beat for the hint to ride on.
+  test("due: a fresh listener lid is due with no session event, until a POST actually delivers it", async () => {
+    const cfg = config();
+    let current = { port: 51234, lid: "lid-1" };
+    let hosts = ["192.168.1.42"];
+    const publisher = createLanHintPublisher({ address: () => current, hosts: () => hosts, now: () => 1_000_000 });
+    expect(publisher.due(cfg)).toBe(true);                  // bound, never POSTed → due
+    expect(typeof await publisher.take(cfg)).toBe("string");
+    publisher.settle(false);                                // the beat failed → still due, retried next sweep
+    expect(publisher.due(cfg)).toBe(true);
+    await publisher.take(cfg);
+    publisher.settle(true);
+    expect(publisher.due(cfg)).toBe(false);                 // delivered → no more beats
+    hosts = ["10.0.0.7"];
+    expect(publisher.due(cfg)).toBe(false);                 // a host change rides the next POST, never forces one
+    current = { port: 51234, lid: "lid-2" };                // same port, new instance (the restart case)
+    expect(publisher.due(cfg)).toBe(true);
+    expect(publisher.due(null)).toBe(false);                // unpaired / free-mode → never
+    expect(createLanHintPublisher({ address: () => null, hosts: () => hosts }).due(cfg)).toBe(false);
+    expect(createLanHintPublisher({ address: () => current, hosts: () => [] }).due(cfg)).toBe(false);
+  });
+
+  test("due: a hint that cannot be sealed never asks for a beat every sweep", async () => {
+    const cfg = config({ e2eKey: new Uint8Array(3) }); // a key encryptBlob refuses
+    const publisher = createLanHintPublisher({ address: () => address, hosts: () => ["192.168.1.42"] });
+    expect(publisher.due(cfg)).toBe(true);
+    expect(await publisher.take(cfg)).toBeUndefined();
+    expect(publisher.due(cfg)).toBe(false);
+  });
+
   test("a many-homed machine's host list is trimmed until the sealed hint fits the ceiling", async () => {
     const cfg = config();
     const many = Array.from({ length: 400 }, (_, i) => `2001:db8:${i.toString(16)}::dead:beef:cafe:${i}`);

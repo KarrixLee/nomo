@@ -74,7 +74,7 @@ async function decryptBlob(key, blob) {
 }
 
 // src/core/shared.ts
-var PLUGIN_VERSION = "2.5.3";
+var PLUGIN_VERSION = "2.5.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")

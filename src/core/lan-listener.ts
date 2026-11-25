@@ -788,7 +788,8 @@ export function createLanListener(deps: LanListenerDeps = {}): LanListener {
 // design) and the worker is a BLIND relay. So the watchdog publishes a hint — the LAN addresses, the
 // port and the listener id — SEALED UNDER THE PAIRING e2eKey (not K_lan: the phone must be able to open
 // it from the worker echo BEFORE it has ever reached this listener). It rides along on /cc/event POSTs
-// the daemon already makes; no new request is ever issued for it.
+// the daemon already makes. The one exception (2.5.4): a listener instance the worker has never heard of
+// (`due`) gets the sweep's existing greet beat to ride on, once per restart or Free→Pro flip.
 //
 // The addresses are never a plaintext field. A LAN IP fingerprints a household — that is network
 // identity, not a build string — and the worker-blindness line says nothing new crosses in the clear.
@@ -869,6 +870,13 @@ export interface LanHintPublisher {
    *  encryptBlob draws a fresh IV every call — so a retry re-attaches the identical bytes (no KV write)
    *  rather than a resealed copy of the same content. */
   settle(delivered: boolean): void;
+  /** True while THIS listener instance (pairing|port|lid) has never been delivered to the worker. The
+   *  hint has no request of its own, so a watchdog that makes no POST (restarted while the sessions
+   *  are quiet, or started while the pairing was Free) would otherwise never tell the phone its new lid —
+   *  and a 2.5.3 phone holding the dead lid resets its LAN cursor on every poll. The sweep asks this and,
+   *  when true, sends one greet beat for the hint to ride on (2.5.4). Pass the LAN-gated config: null
+   *  (unpaired / any free-mode marker) is never due. Pure; never throws. */
+  due(config: Config | null): boolean;
 }
 
 /** Seal the hint, trimming the host list until it fits the ceiling. Returns undefined when even a
@@ -913,6 +921,9 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
    *  silent for up to LAN_HINT_REFRESH_MS. Observed 2026-08-23; it escaped notice only because a
    *  re-pair left lastSentAt at 0, which holds the refresh window open by accident. */
   let pending: { at: number; state: string; sealed: string; trace: object } | null = null;
+  /** A state `take` could not seal. Impossible in practice (a hint is ~150 bytes), but without it `due`
+   *  would ask for a beat every sweep that never carries a hint. */
+  let unsealable: string | undefined;
 
   const hosts = (t: number): string[] => {
     if (t - cachedAt < LAN_HOSTS_CACHE_MS && cachedAt !== 0) return cachedHosts;
@@ -923,6 +934,7 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
 
   return {
     async take(config: Config | null): Promise<string | undefined> {
+      let state: string | undefined;
       try {
         if (!config) return undefined;
         const addr = deps.address();
@@ -930,7 +942,7 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
         const t = now();
         const list = hosts(t);
         if (list.length === 0) return undefined; // nothing reachable to advertise
-        const state = `${config.pairingId}|${addr.port}|${addr.lid}|${list.join(",")}`;
+        state = `${config.pairingId}|${addr.port}|${addr.lid}|${list.join(",")}`;
         if (state === lastState) {
           if (t - lastSentAt < LAN_HINT_REFRESH_MS) return undefined;
           if (lastSealed) {
@@ -939,7 +951,7 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
           }
         }
         const sealed = await sealHint(config.e2eKey, list, addr.port, addr.lid, t);
-        if (!sealed) return undefined;
+        if (!sealed) { unsealable = state; return undefined; }
         // NOTHING is committed here — see the `pending` note. A retry after a failed POST reseals under
         // a fresh IV, which is correct: the worker never received the earlier bytes, so there is no
         // string-compare to preserve and no extra KV write to avoid.
@@ -947,7 +959,20 @@ export function createLanHintPublisher(deps: LanHintPublisherDeps): LanHintPubli
         return sealed;
       } catch {
         pending = null;
+        unsealable = state;
         return undefined; // a hint is an optimization; never let it break a status POST
+      }
+    },
+    due(config: Config | null): boolean {
+      try {
+        if (!config) return false;
+        const addr = deps.address();
+        if (!addr || hosts(now()).length === 0) return false; // take would attach nothing
+        // Port and lid only: a host-set change still republishes on the next POST, but never costs one.
+        const key = `${config.pairingId}|${addr.port}|${addr.lid}|`;
+        return !lastState?.startsWith(key) && !unsealable?.startsWith(key);
+      } catch {
+        return false;
       }
     },
     settle(delivered: boolean): void {

@@ -104,7 +104,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
-var PLUGIN_VERSION = "2.5.3";
+var PLUGIN_VERSION = "2.5.4";
 var DBG_BLOB_TEXT_MAX_CHARS = 200;
 function debugToken(value) {
   if (value === "-")
@@ -7138,6 +7138,7 @@ function createLanHintPublisher(deps) {
   let cachedHosts = [];
   let cachedAt = 0;
   let pending = null;
+  let unsealable;
   const hosts = (t) => {
     if (t - cachedAt < LAN_HOSTS_CACHE_MS && cachedAt !== 0)
       return cachedHosts;
@@ -7151,6 +7152,7 @@ function createLanHintPublisher(deps) {
   };
   return {
     async take(config) {
+      let state;
       try {
         if (!config)
           return;
@@ -7161,7 +7163,7 @@ function createLanHintPublisher(deps) {
         const list = hosts(t);
         if (list.length === 0)
           return;
-        const state = `${config.pairingId}|${addr.port}|${addr.lid}|${list.join(",")}`;
+        state = `${config.pairingId}|${addr.port}|${addr.lid}|${list.join(",")}`;
         if (state === lastState) {
           if (t - lastSentAt < LAN_HINT_REFRESH_MS)
             return;
@@ -7171,13 +7173,29 @@ function createLanHintPublisher(deps) {
           }
         }
         const sealed = await sealHint(config.e2eKey, list, addr.port, addr.lid, t);
-        if (!sealed)
+        if (!sealed) {
+          unsealable = state;
           return;
+        }
         pending = { at: t, state, sealed, trace: { result: "hint", why: "changed", port: addr.port, lid: addr.lid, hosts: list.length } };
         return sealed;
       } catch {
         pending = null;
+        unsealable = state;
         return;
+      }
+    },
+    due(config) {
+      try {
+        if (!config)
+          return false;
+        const addr = deps.address();
+        if (!addr || hosts(now()).length === 0)
+          return false;
+        const key = `${config.pairingId}|${addr.port}|${addr.lid}|`;
+        return !lastState?.startsWith(key) && !unsealable?.startsWith(key);
+      } catch {
+        return false;
       }
     },
     settle(delivered) {
@@ -11153,7 +11171,7 @@ async function postEvent(config, body, opts = {}) {
     return "delivered";
   const started = Date.now();
   const detail = opts.detail;
-  const lanHint = await lanHintPublisher.take(config);
+  const lanHint = await lanHintPublisher.take(lanConfigFor(config, opts.freeModePath));
   try {
     const payload = lanHint ? { ...body, lanHint } : body;
     const res = await fetch(`${config.url}/v1/cc/event`, {
@@ -12561,6 +12579,7 @@ async function sweep(config, deps = {}) {
   let delivered = false;
   const pairingIsNew = config !== null && config.pairingId !== greetedPairingId;
   let greetDelivered = false;
+  const lanConfig = lanConfigFor(config);
   for (const file of files) {
     if (!file.endsWith(".json"))
       continue;
@@ -12694,7 +12713,8 @@ async function sweep(config, deps = {}) {
             delivered = true;
           resent = pendingUpdate === "corrected" || pendingUpdate === "pending";
         }
-        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, netOwned || resent, pairingIsNew);
+        const greet = pairingIsNew || lanHintPublisher.due(lanConfig);
+        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, netOwned || resent, greet);
         const slow = beatKind === "stale";
         if (beatKind !== "none" && !(slow && !resendAllowed(now))) {
           const beat = buildHeartbeatEnvelope(sessionId, record, Date.now(), config.pairingId);

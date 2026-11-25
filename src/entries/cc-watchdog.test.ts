@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Bytes, decryptBlob, encryptBlob } from "../core/crypto";
-import { createLanAnswerStore } from "../core/lan-listener";
+import { createLanAnswerStore, createLanHintPublisher } from "../core/lan-listener";
 import type { DecisionHold, PlanPickerTraceDecision, SessionRecord } from "../core/shared";
 import { GONE_STRIKE_LIMIT, isFreeMode, markFreeMode, readGoneStrikes, recordGoneStrike, removeRevokedConfig, resetGoneStrikes, tracePlanPickerDecision } from "../core/shared";
 import { addEvent, emptyState, maybeUpload } from "../core/activity";
@@ -4987,6 +4987,20 @@ describe("free mode in the watchdog", () => {
     stubFetch(200, "{}");
     expect(await postEvent(CONFIG, buildEndEnvelope("s1", Date.now(), rec()), { freeModePath })).toBe("delivered");
     expect(lanConfigFor(CONFIG, freeModePath)).toBe(CONFIG);
+  });
+
+  // 2.5.4: a pairing that was Free sent no events, so nothing published the LAN hint after the flip.
+  test("Free→Pro flip: the lid becomes due the moment the marker clears; never while any marker exists", async () => {
+    const freeModePath = join(dir, "free-mode");
+    const publisher = createLanHintPublisher({ address: () => ({ port: 51234, lid: "lid-1" }), hosts: () => ["192.168.1.42"] });
+    await markFreeMode(freeModePath);
+    expect(publisher.due(lanConfigFor(CONFIG, freeModePath))).toBe(false); // Free: no forced beat
+    expect(await publisher.take(lanConfigFor(CONFIG, freeModePath))).toBeUndefined(); // …and no hint
+    await writeFile(freeModePath, String(Date.now() - 16 * 60_000)); // expired: events flow, LAN does not
+    expect(publisher.due(lanConfigFor(CONFIG, freeModePath))).toBe(false);
+    expect(await publisher.take(lanConfigFor(CONFIG, freeModePath))).toBeUndefined();
+    await rm(freeModePath); // presence (or a 2xx) answered "pro"
+    expect(publisher.due(lanConfigFor(CONFIG, freeModePath))).toBe(true);
   });
 
   // 409 {"error":"pairing not claimed"}: the server refuses a still-pending pairing on session routes (the

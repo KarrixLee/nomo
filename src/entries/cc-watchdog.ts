@@ -1080,7 +1080,8 @@ export async function postEvent(
   // changed or its 5-minute refresh came due (so the overwhelming majority of POSTs are untouched).
   // Hoisted out of the try so the catch below can settle it: a hint on a POST that threw is NOT
   // published, and must be re-attached to the next one.
-  const lanHint = await lanHintPublisher.take(config);
+  // LAN-gated: no hint while any free-mode marker exists, even an expired one that lets this POST out.
+  const lanHint = await lanHintPublisher.take(lanConfigFor(config, opts.freeModePath));
   try {
     const payload = lanHint ? { ...body, lanHint } : body;
     const res = await fetch(`${config.url}/v1/cc/event`, {
@@ -3670,6 +3671,8 @@ export function shouldWaitingHeartbeat(
 //   - the LAN hint travels ONLY as a passenger on /cc/event (createLanHintPublisher in
 //     core/lan-listener.ts attaches it, it has no request of its own), so the greet beat is also
 //     what gets the Mac's address to a freshly paired phone without waiting out the 5 min cadence.
+//     Since 2.5.4 it also fires whenever the current listener's lid has never been delivered
+//     (LanHintPublisher.due): a restart that bound before any POST, or a pairing that was Free.
 //
 // SCOPE — "new" means new TO THIS PROCESS, not new in wall-clock: Config carries no createdAt, and a
 // pairing age is not worth persisting for this. The cost of that approximation is exactly one extra
@@ -3823,6 +3826,9 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
   // a wifi flap at pair time is exactly the case this exists to cover.
   const pairingIsNew = config !== null && config.pairingId !== greetedPairingId;
   let greetDelivered = false;
+  // 2.5.4: the greet also carries a LAN hint the worker has never received for this listener instance (a
+  // restart's fresh lid, or a Free→Pro flip). Re-asked per session, so it costs one POST, not one each.
+  const lanConfig = lanConfigFor(config);
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
     const path = `${SESSIONS_DIR}/${file}`;
@@ -3975,7 +3981,8 @@ async function sweep(config: Config | null, deps: SweepDeps = {}): Promise<Sweep
           if (pendingUpdate === "corrected") delivered = true;
           resent = pendingUpdate === "corrected" || pendingUpdate === "pending";
         }
-        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, netOwned || resent, pairingIsNew);
+        const greet = pairingIsNew || lanHintPublisher.due(lanConfig);
+        const beatKind = heartbeatKind(record, now, heartbeatAt.get(sessionId), waitingBeatAt, netOwned || resent, greet);
         // The staleness beat is the ONLY thing keeping a hook-quiet session's stale-date armed, so it gets
         // the long budget (the default 2 s loses to a relay that answers in 2–3 s) and, in exchange,
         // shares the debt net's back-off so an offline Mac is not charged 5 s per quiet session per sweep.
